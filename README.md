@@ -1,0 +1,75 @@
+# Swarmscope
+
+A live terminal dashboard for a Claude Code session where Sonnet writes the code, Opus sits on call as advisor, and subagents dig through the repo.
+
+![Swarmscope on a real Claude Code session](docs/preview.png)
+
+*Real session: Sonnet 5.5 lead, Opus 5.5 advisor, two read-only subagents. 91 s, 7 tests passing.*
+
+## What it shows
+
+- **agents**: one row per agent with state, activity over time, tool calls, duration and what it's doing right now
+- **advisor checkpoints**: whether Sonnet called the advisor before the plan, after the same error twice, and before calling it done
+- **timeline**: who worked when, with errors (`✕`) and advisor calls (`◆`) marked
+- **live code**: the last edit, typed out with syntax highlighting
+- **session log**: tool calls, errors, subagent hand-backs, advisor checkpoints
+
+## Where the data comes from
+
+- **Claude Code hooks** for tool calls, errors, edits and subagents (`hook.py` appends one JSON line per event).
+- **The session transcript** for advisor calls. Hooks never see the advisor: it runs server-side.
+
+Things it can't do:
+
+- **Read the advice itself.** Claude Code stores it encrypted in the transcript (`advisor_redacted_result`). Swarmscope shows when the advisor was called, how long it took and what Sonnet wrote right after. Read the advice in Claude Code with Ctrl+O.
+- **Enforce the checkpoints.** They are observations. Sonnet decides when to call the advisor.
+- **Show real progress.** Activity bars count tool calls over time.
+
+Tested on macOS with Claude Code 2.1.319 and 2.1.322.
+
+## Install
+
+Needs Python 3 and, for the side-by-side launcher, tmux.
+
+```bash
+git clone https://github.com/THEIAORGANON/swarmscope && cd swarmscope
+./install.sh --dry-run   # shows the ~/.claude/settings.json diff, changes nothing
+./install.sh             # backs up settings.json, adds hooks + statusLine, installs agents
+```
+
+`install.sh` copies the scripts to `~/.claude/swarmscope`, creates a venv with `rich`, merges the hooks into `~/.claude/settings.json` (your existing hooks stay) and replaces `statusLine`. The agents `search`, `grep` and `docs` (`model: haiku`, read-only tools) go to `~/.claude/agents/` unless files with those names already exist.
+
+## Run
+
+```bash
+swarmscope                      # tmux: claude --model sonnet --advisor opus | dashboard
+```
+
+Or by hand, in two windows:
+
+```bash
+~/.claude/swarmscope/.venv/bin/python ~/.claude/swarmscope/dashboard.py   # dashboard, follows the newest session
+claude --model sonnet --advisor opus                                      # your session
+```
+
+A terminal of about 80×53 fits everything.
+
+`dashboard.py --demo` plays a scripted session, no Claude Code needed.
+
+Useful flags: `--title`, `--window N` (timeline seconds), `--layout classic`.
+
+## Prompting the advisor
+
+Sonnet chooses when to call the advisor. This line in `CLAUDE.md` makes the three checkpoints more likely:
+
+```md
+Consult the advisor before locking a plan, after the same error shows up twice, and before calling a task done.
+```
+
+## Uninstall
+
+Delete `~/.claude/swarmscope` and the three agent files, and restore `~/.claude/settings.json` from the `.bak` next to it.
+
+## License
+
+MIT

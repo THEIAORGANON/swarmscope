@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# swarmscope — Claude Code (Sonnet lead + Opus advisor) on the left, live dashboard on the right.
+#   swarmscope [any extra claude args]
+#   SWARMSCOPE_MODEL=sonnet SWARMSCOPE_ADVISOR=opus SWARMSCOPE_SPLIT=45 swarmscope
+set -euo pipefail
+DIR="${SWARMSCOPE_DIR:-$HOME/.claude/swarmscope}"
+MODEL="${SWARMSCOPE_MODEL:-sonnet}"
+ADVISOR="${SWARMSCOPE_ADVISOR:-opus}"
+SPLIT="${SWARMSCOPE_SPLIT:-45}"
+PY="$DIR/.venv/bin/python"; [ -x "$PY" ] || PY=python3
+SESSION="swarmscope-$$"
+
+CLAUDE_CMD="SWARMSCOPE_ADVISOR=$ADVISOR claude --model $MODEL --advisor $ADVISOR"
+for a in "$@"; do CLAUDE_CMD+=" $(printf '%q' "$a")"; done
+DASH_CMD="SWARMSCOPE_ADVISOR=$ADVISOR $PY $DIR/dashboard.py"
+
+command -v tmux >/dev/null || { echo "tmux not found: brew install tmux"; exit 1; }
+
+if [ -n "${TMUX:-}" ]; then
+  tmux split-window -h -l "${SPLIT}%" -c "$PWD" "$DASH_CMD"
+  tmux select-pane -L
+  exec bash -c "$CLAUDE_CMD"
+else
+  tmux new-session -d -s "$SESSION" -c "$PWD" "$CLAUDE_CMD"
+  tmux set-option -t "$SESSION" status off
+  tmux set-option -t "$SESSION" pane-border-style "fg=#3d434d"
+  tmux set-option -t "$SESSION" pane-active-border-style "fg=#e8925a"
+  tmux split-window -h -l "${SPLIT}%" -t "$SESSION" -c "$PWD" "$DASH_CMD"
+  tmux select-pane -t "$SESSION" -L
+  exec tmux attach -t "$SESSION"
+fi
