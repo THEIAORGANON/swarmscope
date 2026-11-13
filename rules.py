@@ -31,7 +31,7 @@ import os
 import re
 import time
 
-POLICY_VERSION = "b-2"
+POLICY_VERSION = "b-3"
 
 DEFAULTS = {
     "mode": "observe",                 # observe | advise | enforce
@@ -130,10 +130,17 @@ def classify_test_run(e, pol):
     cmd = e.get("cmd") or e.get("arg") or ""
     if e.get("err"):
         return {"result": "failed", "why": "command failed"}
-    if _FAILED_IN_OUTPUT.search(e.get("out") or ""):
+    out = e.get("out") or ""
+    if _FAILED_IN_OUTPUT.search(out):
         return {"result": "failed", "why": "output reports failures"}
     if _MASK.search(cmd):
-        return {"result": "unknown", "why": "exit code masked by the shell (|| true, pipe)"}
+        # `pytest | tail -15` is the common case (seen live): the exit code is lost, but the runner's own
+        # summary survives. grep can drop the failure lines, so it stays unknown.
+        if re.search(r"\|\s*grep\b", cmd):
+            return {"result": "unknown", "why": "exit code masked and output filtered by grep"}
+        if e.get("event") == "PostToolUse" and _PASSED_IN_OUTPUT.search(out):
+            return {"result": "passed", "why": "runner summary (exit code masked by the shell)"}
+        return {"result": "unknown", "why": "exit code masked by the shell and no runner summary"}
     if e.get("interrupted"):
         return {"result": "unknown", "why": "interrupted"}
     if e.get("event") != "PostToolUse":

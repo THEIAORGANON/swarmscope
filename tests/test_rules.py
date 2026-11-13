@@ -208,6 +208,17 @@ def test_bad_or_unknown_test_runs_trigger_r1(test_event, expected):
     assert r1["signals"]["observed_test_result"] == expected
 
 
+@pytest.mark.parametrize("cmd,out,expected", [
+    ("uv run python -m pytest -q 2>&1 | tail -15", "Installed 10 packages\n.....\n19 passed in 0.05s", "passed"),
+    ("pytest -q || true", "5 passed in 0.1s", "passed"),
+    ("pytest -q | grep passed", "19 passed", "unknown"),            # grep may have dropped failures
+    ("pytest -q | head -3", "....", "unknown"),                     # summary cut off
+])
+def test_masked_exit_falls_back_to_runner_summary(cmd, out, expected):
+    """Live run 13.11: Sonnet ran `pytest | tail -15`, output said 19 passed, b-2 called it unknown."""
+    assert rules.classify_test_run(bash(10, cmd, out=out), POL)["result"] == expected
+
+
 def test_passed_needs_a_success_event():
     e = dict(bash(10, "pytest -q", out="5 passed"), event="PreToolUse")
     assert rules.classify_test_run(e, POL)["result"] == "unknown"
