@@ -47,9 +47,16 @@ def files(*specs):
     return [{"path": p, "added": a, "deleted": d, "binary": False} for p, a, d in specs]
 
 
-def run(events, diff, p=None, adv=(), log=(), stop=None, has_tests=True, now=100.0):
-    return rules.gate(events, stop or {}, p or pol(), diff, list(adv), list(log), has_tests, "sess1234", now=now,
-                      baseline_ts=0)
+def run(events, diff, p=None, adv=(), log=(), stop=None, has_tests=True, now=100.0, times=None, since=None):
+    """diff: baseline→now files (None = no git). times: when source changed; by default the edit events."""
+    if diff is None:
+        change = {"files": None, "src_times": None, "since_advisor": None}
+    else:
+        if times is None:
+            times = [e["ts"] for e in events if e.get("tool_name") == "Edit"] if any(
+                not rules._match(d["path"], POL["ignore"]) for d in diff) else []
+        change = {"files": diff, "src_times": times, "since_advisor": since}
+    return rules.gate(events, stop or {}, p or pol(), change, list(adv), list(log), has_tests, "sess1234", now=now)
 
 
 def by_rule(records, rule):
@@ -72,10 +79,15 @@ def repo(tmp_path):
     return tmp_path, git
 
 
-def test_snapshot_sees_untracked_staged_committed_and_bash_changes(repo):
+def objects_in_repo(root):
+    return sorted(str(p) for p in (root / ".git" / "objects").rglob("*") if p.is_file())
+
+
+def test_snapshot_sees_untracked_staged_committed_and_bash_changes(repo, tmp_path_factory):
     root, git = repo
+    store = str(tmp_path_factory.mktemp("store"))
     (root / "a.py").write_text("a\npre-existing\n")          # dirty before the session: not ours
-    base = repostate.snapshot(str(root))
+    base = repostate.snapshot(str(root), store)
     (root / "new.py").write_text("x = 1\ny = 2\n")            # untracked
     (root / "s.py").write_text("s\n")
     git("add", "s.py")                                        # staged
@@ -85,31 +97,72 @@ def test_snapshot_sees_untracked_staged_committed_and_bash_changes(repo):
     subprocess.run("echo bash >> a.py", shell=True, cwd=root)  # changed by Bash
     (root / "x.log").write_text("ignored")
     index_before = (root / ".git" / "index").read_bytes()
-    cur = repostate.snapshot(str(root))
-    d = {f["path"]: f for f in repostate.diff(cur["root"], base["tree"], cur["tree"])}
+    cur = repostate.snapshot(str(root), store)
+    d = {f["path"]: f for f in repostate.diff(cur["root"], store, base["tree"], cur["tree"])}
     assert set(d) == {"a.py", "new.py", "s.py", "c.py"}
     assert d["a.py"]["added"] == 1                            # only the Bash line, not the pre-existing one
     assert (root / ".git" / "index").read_bytes() == index_before
 
 
-def test_reverted_change_nets_out(repo):
+def test_snapshot_writes_nothing_into_the_repo(repo, tmp_path_factory):
     root, _ = repo
-    base = repostate.snapshot(str(root))
+    store = str(tmp_path_factory.mktemp("store"))
+    before = objects_in_repo(root)
+    (root / "new_module.py").write_text("print('new')\n")
+    repostate.snapshot(str(root), store)
+    assert objects_in_repo(root) == before
+
+
+def test_snapshot_skips_secrets_big_files_and_own_folders(repo, tmp_path_factory):
+    root, _ = repo
+    store = str(tmp_path_factory.mktemp("store"))
+    base = repostate.snapshot(str(root), store)
+    (root / ".env").write_text("API_KEY=secret\n")
+    (root / "prod.pem").write_text("-----BEGIN-----\n")
+    (root / "dump.bin").write_bytes(b"0" * (repostate.MAX_FILE_BYTES + 1))
+    (root / ".swarmscope").mkdir()
+    (root / ".swarmscope" / "events.jsonl").write_text("{}\n")
+    (root / "custom_state").mkdir()
+    (root / "custom_state" / "x.json").write_text("{}\n")
+    (root / "ok.py").write_text("ok\n")
+    cur = repostate.snapshot(str(root), store, exclude=["custom_state"])
+    paths = {f["path"] for f in repostate.diff(cur["root"], store, base["tree"], cur["tree"])}
+    assert paths == {"ok.py"}
+    assert {".env", "prod.pem", "dump.bin"} <= set(cur["skipped"])
+
+
+def test_reverted_change_nets_out(repo, tmp_path_factory):
+    root, _ = repo
+    store = str(tmp_path_factory.mktemp("store"))
+    base = repostate.snapshot(str(root), store)
     (root / "a.py").write_text("changed\n")
     (root / "a.py").write_text("a\n")
-    cur = repostate.snapshot(str(root))
-    assert repostate.diff(cur["root"], base["tree"], cur["tree"]) == []
+    cur = repostate.snapshot(str(root), store)
+    assert repostate.diff(cur["root"], store, base["tree"], cur["tree"]) == []
 
 
 def test_not_a_repo(tmp_path):
-    assert repostate.snapshot(str(tmp_path))["git"] is False
+    assert repostate.snapshot(str(tmp_path), str(tmp_path / "store"))["git"] is False
 
 
-def test_bash_only_change_dates_last_change_by_bash():
+def test_change_after_passing_tests_triggers_r1():
     ev = [prompt(1), bash(5, "pytest -q", out="3 passed"), bash(8, "sed -i s/a/b/ src/app.py")]
-    recs, _ = run(ev, files(("src/app.py", 1, 1)))
+    recs, _ = run(ev, files(("src/app.py", 1, 1)), times=[8])
     r1 = by_rule(recs, "R1_tests")
     assert r1["state"] == "triggered" and r1["signals"]["last_change"] == 8
+
+
+def test_git_status_after_passing_tests_is_not_a_change():
+    """Regression: a read-only Bash command after a passing run must not demand another run."""
+    ev = [prompt(1), bash(4, "sed -i s/a/b/ src/app.py"), bash(5, "pytest -q", out="3 passed"),
+          bash(6, "git status")]
+    assert by_rule(run(ev, files(("src/app.py", 1, 1)), times=[4])[0], "R1_tests")["state"] == "pass"
+
+
+def test_no_snapshots_means_skipped_not_pass():
+    recs, _ = run([prompt(1), edit(5), bash(6, "pytest -q", out="1 passed")], None)
+    assert by_rule(recs, "R1_tests")["state"] == "skipped"
+    assert by_rule(recs, "R3_high_risk")["state"] == "skipped"
 
 
 # --- 2. failed tests are never counted as passed ------------------------------------------
@@ -120,12 +173,21 @@ def test_bash_only_change_dates_last_change_by_bash():
     (bash(10, "pytest -q || true"), "unknown"),
     (bash(10, "pytest -q | tail -5", out="all good"), "unknown"),
     (bash(10, "npm test", out="Tests: 1 failed, 9 passed"), "failed"),
+    (bash(10, "pytest -q", out="done"), "unknown"),            # clean exit, no runner summary
+    (bash(10, "pytest -q"), "unknown"),                        # no output captured at all
 ])
+
 def test_bad_or_unknown_test_runs_trigger_r1(test_event, expected):
     recs, _ = run([prompt(1), edit(5), test_event], files(("src/app.py", 3, 1)))
     r1 = by_rule(recs, "R1_tests")
     assert r1["state"] == "triggered"
     assert r1["signals"]["observed_test_result"] == expected
+
+
+def test_passed_needs_a_success_event():
+    e = dict(bash(10, "pytest -q", out="5 passed"), event="PreToolUse")
+    assert rules.classify_test_run(e, POL)["result"] == "unknown"
+    assert rules.classify_test_run(dict(e, event="PostToolUse"), POL)["result"] == "passed"
 
 
 def test_test_before_last_edit_does_not_count():
@@ -207,14 +269,30 @@ def test_small_routine_change_left_to_sonnet():
     assert by_rule(run([prompt(1), edit(5)], files(("src/a.py", 3, 1)))[0], "R3_high_risk")["state"] == "pass"
 
 
-def test_advisor_before_first_edit_does_not_satisfy_r3_but_after_does():
+def test_advisor_before_first_change_does_not_satisfy_r3_but_after_does():
     d = files(("src/a.py", 60, 0))
     assert by_rule(run([prompt(1), edit(5)], d, adv=[3])[0], "R3_high_risk")["state"] == "triggered"
-    assert by_rule(run([prompt(1), edit(5)], d, adv=[7])[0], "R3_high_risk")["state"] == "pass"
+    assert by_rule(run([prompt(1), edit(5)], d, adv=[7], since=[])[0], "R3_high_risk")["state"] == "pass"
 
 
-def test_no_git_skips_r3():
-    assert by_rule(run([prompt(1), edit(5)], None)[0], "R3_high_risk")["state"] == "skipped"
+def test_advisor_before_bash_only_change_does_not_count():
+    """Regression: no Edit events, the change came from Bash at t=8; an advisor call at t=3 is not a review."""
+    d = files(("src/a.py", 60, 0))
+    r3 = by_rule(run([prompt(1), bash(8, "python gen.py")], d, adv=[3], times=[8])[0], "R3_high_risk")
+    assert r3["state"] == "triggered"
+
+
+def test_big_changes_after_the_last_consult_need_another():
+    d = files(("src/a.py", 60, 0), ("src/b.py", 40, 0))
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/b.py", 40, 20)))[0], "R3_high_risk")
+    assert r3["state"] == "triggered" and "after the last advisor call" in r3["reason"]
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/b.py", 2, 1)))[0], "R3_high_risk")
+    assert r3["state"] == "pass"
+
+
+def test_unknown_tree_at_consult_is_skipped_not_pass():
+    d = files(("src/a.py", 60, 0))
+    assert by_rule(run([prompt(1)], d, adv=[6], times=[5], since=None)[0], "R3_high_risk")["state"] == "skipped"
 
 
 # --- 3. no endless Stop loops; modes ------------------------------------------------------------
@@ -280,18 +358,29 @@ def test_outcomes_observed_and_not_observed():
     assert oc["R3_high_risk"]["outcome"] == "not_observed" and "cause" not in oc["R3_high_risk"]
 
 
-def test_limited_decision_gets_cause_not_blamed_on_sonnet():
+def test_limited_decision_is_a_followup_with_cause():
     p = pol(mode="enforce", max_blocks_per_turn=0)
     log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
     recs, _ = run([prompt(1), edit(5)], BIG, p=p, log=log, now=20.0)
-    oc = [r for r in recs if r.get("kind") == "outcome"][0]
-    assert oc["outcome"] == "not_observed" and "block limit" in oc["cause"]
+    assert not [r for r in recs if r.get("kind") == "outcome"]
+    fu = [r for r in recs if r.get("kind") == "followup" and r["rule"] == "R3_high_risk"][0]
+    assert fu["outcome"] == "not_observed" and "block limit" in fu["cause"]
+
+
+@pytest.mark.parametrize("mode", ["observe", "advise"])
+def test_unenforced_decisions_never_become_compliance_outcomes(mode):
+    """Regression: a decision Sonnet was never told about gets a followup, not an outcome."""
+    log, _ = run([prompt(1), edit(5)], BIG, p=pol(mode=mode), now=10.0)
+    recs, _ = run([prompt(1), edit(5)], BIG, p=pol(mode=mode), log=log, now=20.0)
+    assert not [r for r in recs if r.get("kind") == "outcome"]
+    assert {r["rule"] for r in recs if r.get("kind") == "followup"} == {"R1_tests", "R3_high_risk"}
 
 
 def test_unverified_without_transcript():
     p = pol(mode="enforce")
     log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
-    recs, _ = rules.gate([prompt(1), edit(5)], {}, p, BIG, [], log, True, "sess1234", now=20.0, transcript_ok=False)
+    change = {"files": BIG, "src_times": [5], "since_advisor": None}
+    recs, _ = rules.gate([prompt(1), edit(5)], {}, p, change, [], log, True, "sess1234", now=20.0, transcript_ok=False)
     oc = {o["rule"]: o for o in recs if o.get("kind") == "outcome"}
     assert oc["R3_high_risk"]["outcome"] == "unverified"
 
@@ -345,3 +434,29 @@ def test_hook_fails_open_on_broken_policy_and_is_off_without_one(repo, tmp_path_
     (root / ".claude" / "swarmscope-policy.json").write_text("{not json")
     (root / "big.py").write_text("x\n" * 99)
     assert hook(dict(common, hook_event_name="Stop"), env) is None                   # observe default, no crash
+
+
+def test_hook_end_to_end_timeline(repo, tmp_path_factory):
+    """Bash edit → passing tests → git status → Stop: nothing to require. Then an external change that no
+    tool event reported → Stop: R1 must notice it."""
+    root, _ = repo
+    (root / ".claude").mkdir()
+    (root / ".claude" / "swarmscope-policy.json").write_text(json.dumps({"mode": "enforce"}))
+    (root / "tests").mkdir()
+    env = dict(os.environ, SWARMSCOPE_DIR=str(root / ".swarmscope"))     # inside the repo, like test2
+    env.pop("SWARMSCOPE_POLICY", None)
+    c = {"session_id": "tl-sess", "cwd": str(root)}
+    hook(dict(c, hook_event_name="UserPromptSubmit", prompt="go"), env)
+    subprocess.run("echo 'b = 2' >> a.py", shell=True, cwd=root)
+    hook(dict(c, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": "echo 'b = 2' >> a.py"},
+              tool_response={"stdout": ""}), env)
+    hook(dict(c, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": "pytest -q"},
+              tool_response={"stdout": "....\n4 passed in 0.03s", "stderr": ""}), env)
+    hook(dict(c, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": "git status"},
+              tool_response={"stdout": " M a.py"}), env)
+    assert hook(dict(c, hook_event_name="Stop"), env) is None
+    log = rules.load_log(str(root / ".swarmscope" / "decisions" / "tl-sess.jsonl"))
+    assert {r["rule"]: r["state"] for r in log if r.get("kind") == "decision"}["R1_tests"] == "pass"
+    subprocess.run("echo 'c = 3' >> a.py", shell=True, cwd=root)           # external, no tool event
+    out = hook(dict(c, hook_event_name="Stop"), env)
+    assert out and "tests" in out["reason"]

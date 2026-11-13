@@ -65,11 +65,13 @@ Useful flags: `--title`, `--window N` (timeline seconds), `--layout classic`.
 
 `rules.py` checks three rules at every Stop and writes each decision to `decisions/<session>.jsonl`. Decisions show up in the session log with `⚑`.
 
-- **R1 tests**: code changed, so a test run has to pass after the last change. A run whose exit code is masked (`|| true`, a pipe) counts as unknown. So does an interrupted run. If the output reports failures, the run counts as failed.
+- **R1 tests**: code changed, so a test run has to pass after the last change. "Passed" needs a success event plus a recognizable runner summary (`5 passed`, `OK`, `test result: ok`…). A clean exit without a summary, a masked exit code (`|| true`, a pipe) or an interrupted run is "unknown". If the output reports failures, the run counts as failed.
 - **R2 repeat error**: the same normalised error showed up twice, the action never succeeded in between, and the advisor was not called.
-- **R3 high risk**: 3+ source files, 50+ changed lines, or a critical path (auth, security, migrations…), and no advisor call after the code changed. Docs and test data don't count.
+- **R3 high risk**: 3+ source files, 50+ changed lines, or a critical path (auth, security, migrations…). It needs an advisor call after the code changed. If the change since the last call is high-risk on its own, it needs another one. Docs and test data don't count.
 
-The changes come from the repo itself, not from tool calls. The engine snapshots the working tree when the session starts and diffs it at Stop, so new, staged, committed and Bash-made changes are all counted. Edits that were there before the session are not.
+The changes come from the repo itself, not from tool calls. The engine snapshots the working tree when the session starts, after every tool call that can change files, and at Stop. New, staged, committed and Bash-made changes are all counted, along with when each one happened. Edits that were there before the session are not. Snapshots go to Swarmscope's own object store, so nothing is written into your repo. Untracked files that look like secrets (`.env`, keys, credentials) or are over 1 MB are never read. Without git, R1 and R3 say "skipped" instead of guessing.
+
+Decisions that were put to Sonnet (enforce) get an `outcome`: observed, not_observed or unverified. All other decisions get a `followup`, which records what happened anyway and never counts as compliance.
 
 Turn it on per project with `.claude/swarmscope-policy.json`:
 
@@ -81,7 +83,7 @@ Turn it on per project with `.claude/swarmscope-policy.json`:
 - `advise` also shows them to you, not to the model.
 - `enforce` sends Sonnet back to work with the reason.
 
-Enforce blocks at most twice per turn and waits while background subagents run. If anything inside the engine fails, Claude stops normally. Run the checks with `python -m pytest tests`.
+Enforce blocks at most twice per turn and waits while background subagents run. If anything inside the engine fails, Claude stops normally. To see what a project will report before a live run, use `python rules.py --check <project>`: it shows the registered hook events, the policy mode, whether snapshots work and whether tests were found. Run the checks with `python -m pytest tests`.
 
 ## Prompting the advisor
 

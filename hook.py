@@ -54,12 +54,16 @@ def main():
     if d.get("tool_name") == "Bash" and isinstance(ti, dict) and ti.get("command"):
         ev["cmd"] = str(ti["command"])[:400]
     tr0 = d.get("tool_response")
+    if d.get("tool_name") == "Bash" and tr0 is not None and not isinstance(tr0, dict):
+        ev["resp_type"] = type(tr0).__name__
+        ev["out"] = str(tr0)[-600:]
     if d.get("tool_name") == "Bash" and isinstance(tr0, dict):
         out = (str(tr0.get("stdout") or "") + "\n" + str(tr0.get("stderr") or "")).strip()
         if out:
-            ev["out"] = out[-400:]
+            ev["out"] = out[-600:]
         if tr0.get("interrupted"):
             ev["interrupted"] = True
+        ev["resp_keys"] = sorted(tr0.keys())[:12]
     if d.get("hook_event_name") == "Stop":
         ev["stop_hook_active"] = bool(d.get("stop_hook_active"))
         if isinstance(d.get("background_tasks"), list):
@@ -88,8 +92,12 @@ def main():
         pass                                    # fail-open: the policy engine never breaks a session
 
 
+MUTATING = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"}
+
+
 def policy(d, sid, ev):
-    """Rules Engine: baseline snapshot at the session's first event, gate at Stop."""
+    """Rules Engine: baseline snapshot at the session's first event, a timeline snapshot after every tool
+    call that can change files, the gate at Stop."""
     from common import BASE, advisor_activity, load_events
     import repostate
     import rules
@@ -97,30 +105,77 @@ def policy(d, sid, ev):
     pol = rules.load_policy(cwd)
     if not pol:
         return
-    bfile = BASE / "baseline" / f"{sid}.json"
-    if not bfile.exists():
-        snap = repostate.snapshot(cwd)
-        snap["ts"] = ev["ts"]
-        bfile.parent.mkdir(parents=True, exist_ok=True)
-        bfile.write_text(json.dumps(snap))
+    store = str(BASE / "gitobj" / sid)
+    tl_file = BASE / "baseline" / f"{sid}.timeline.jsonl"
+    tl_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def excludes(root):
+        try:
+            rel = os.path.relpath(str(BASE.resolve()), os.path.realpath(root))
+            return [] if rel.startswith("..") else [rel]
+        except Exception:
+            return []
+
+    def snap():
+        root = cwd
+        try:
+            import subprocess
+            root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True,
+                                  text=True, timeout=5).stdout.strip() or cwd
+        except Exception:
+            pass
+        return repostate.snapshot(cwd, store, excludes(root))
+
+    timeline = rules.load_log(str(tl_file))
+    if not timeline:
+        b = snap()
+        timeline = [dict(b, ts=ev["ts"], src=False, kind="baseline")]
+        rules.append_log(str(tl_file), timeline)
+
+    base = timeline[0]
+    tool_done = ev["event"] in ("PostToolUse", "PostToolUseFailure") and ev.get("tool_name") in MUTATING
+    if not base.get("git") or not (tool_done or ev["event"] == "Stop"):
+        if ev["event"] == "Stop" and not base.get("git"):
+            run_gate(d, sid, ev, pol, {}, BASE, advisor_activity, load_events, rules, cwd, base)
+        return
+
+    cur = snap()
+    if not cur.get("git"):
+        return
+    last = timeline[-1]
+    if cur["tree"] != last["tree"]:
+        step = repostate.diff(cur["root"], store, last["tree"], cur["tree"])
+        entry = {"kind": "change", "ts": ev["ts"], "tree": cur["tree"], "git": True,
+                 "src": bool(rules.source_changes(step, pol)), "by": ev.get("tool_name") or ev["event"]}
+        rules.append_log(str(tl_file), [entry])
+        timeline.append(entry)
     if ev["event"] != "Stop":
         return
-    base = json.loads(bfile.read_text())
-    diff_files = None
-    if base.get("git"):
-        cur = repostate.snapshot(cwd)
-        if cur.get("git"):
-            diff_files = repostate.diff(cur["root"], base["tree"], cur["tree"])
+
+    tp = d.get("transcript_path")
+    adv = advisor_activity(tp) if tp else {"times": []}
+    times = adv.get("times") or []
+    since = None
+    if times:
+        t_a = max(times)
+        at = [e for e in timeline if e["ts"] <= t_a] or [base]
+        since = repostate.diff(cur["root"], store, at[-1]["tree"], cur["tree"])
+    change = {"files": repostate.diff(cur["root"], store, base["tree"], cur["tree"]),
+              "src_times": [e["ts"] for e in timeline if e.get("src")], "since_advisor": since,
+              "skipped": cur.get("skipped") or []}
+    run_gate(d, sid, ev, pol, change, BASE, lambda _: adv, load_events, rules, cwd, base)
+
+
+def run_gate(d, sid, ev, pol, change, BASE, advisor_activity, load_events, rules, cwd, base):
     tp = d.get("transcript_path")
     adv = advisor_activity(tp) if tp else {"times": []}
     logf = str(BASE / "decisions" / f"{sid}.jsonl")
-    records, out = rules.gate(load_events(sid), d, pol, diff_files, adv.get("times") or [], rules.load_log(logf),
+    records, out = rules.gate(load_events(sid), d, pol, change, adv.get("times") or [], rules.load_log(logf),
                               rules.project_has_tests(base.get("root") or cwd, pol), sid, now=ev["ts"],
-                              baseline_ts=base.get("ts"), transcript_ok=bool(tp and os.path.exists(tp)))
+                              transcript_ok=bool(tp and os.path.exists(tp)))
     rules.append_log(logf, records)
     if out:
         sys.stdout.write(json.dumps(out))
-
 
 try:
     main()

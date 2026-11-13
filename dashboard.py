@@ -35,7 +35,7 @@ DIM, FAINT, FG, WHITE = "#7d8590", "#3d434d", "#d7dae0", "#ffffff"
 SPIN = "◐◓◑◒"
 GLYPHS = "ｱｲｳｴｵｶｷｸｹｺ#%&@$01<>/\\=+*"
 KIND_COLOR = {"lead": ORANGE, "sub": BLUE, "adv": PURPLE, "err": RED, "user": FG,
-              "gate": PURPLE, "gate_miss": RED}
+              "gate": PURPLE, "gate_miss": RED, "note": DIM}
 LEFT_W = 26
 FPS = 10
 
@@ -477,7 +477,7 @@ def log_icon(tag, text, kind):
         return "◆"
     if kind == "err":
         return "✕"
-    if kind == "gate":
+    if kind in ("gate", "note"):
         return "⚑"
     if kind == "user":
         return "›"
@@ -1015,9 +1015,14 @@ def decision_entries(sid):
                      "deferred": "deferred", "limited": "limit hit"}.get(r["state"], r["state"])
             out.append((r["ts"], "policy", f"{rule} → {ACTION_SHORT.get(r['action'], r['action'])} [{state}] · {r.get('reason', '')}",
                         "gate" if r["state"] in ("requested", "advised") else "gate_miss"))
-        elif r.get("kind") == "outcome":
+        elif r.get("kind") in ("outcome", "followup"):
             what = ACTION_SHORT.get(r.get("action"), r.get("action"))
             o = r.get("outcome")
+            if r["kind"] == "followup":         # never put to Sonnet: what happened anyway, not compliance
+                txt = {"observed": f"{rule}: {what} happened anyway", "not_observed": f"{rule}: no {what} (not required)",
+                       "unverified": f"{rule}: {what} unverified"}.get(o, o)
+                out.append((r["ts"], "policy", txt, "note"))
+                continue
             txt = {"observed": f"{rule}: {what} done" + (f" ({r['result']})" if r.get("result") else ""),
                    "not_observed": f"{rule}: {what} not seen" + (f" · {r['cause']}" if r.get("cause") else ""),
                    "unverified": f"{rule}: {what} unverified · {r.get('cause', '')}"}.get(o, f"{rule}: {o}")

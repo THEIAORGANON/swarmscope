@@ -1,35 +1,62 @@
 """What actually changed on disk during a session, independent of which tool did it.
 
-At the first event of a session we snapshot the whole working tree as a git tree object, and at Stop we
-snapshot again and diff the two trees. The snapshot uses a throw-away index (GIT_INDEX_FILE), so the
-user's index, working tree and branches are never touched; it only adds objects to .git/objects.
+The working tree is snapshotted as a git tree object:
+  * at the session's first event (baseline),
+  * after every tool call that can change files (Edit/Write/Bash/…), giving a change timeline,
+  * at Stop.
+Diffing two snapshots shows new untracked files, staged and unstaged edits, edits the agent committed,
+and edits made by Bash or any other process. Changes that existed before the session are in the
+baseline, so they are not attributed to the agent. Edits that were made and then reverted net out.
 
-Because both sides are full working-tree snapshots, the diff includes:
-  * new untracked files (git add -A respects .gitignore),
-  * staged and unstaged edits,
-  * edits the agent already committed,
-  * edits made by Bash or any other process,
-and excludes changes that existed before the session started (they are in the baseline).
-Edits that were made and then reverted net out to nothing, which is what a review of the result needs.
+Nothing is written into the user's repository:
+  * a throw-away index (GIT_INDEX_FILE) leaves the staging area alone,
+  * objects go to Swarmscope's own store (GIT_OBJECT_DIRECTORY); the repo's objects are only read
+    through GIT_ALTERNATE_OBJECT_DIRECTORIES.
+Untracked files that look sensitive (.env, keys, credentials…) or are larger than MAX_FILE_BYTES are
+never read; they are listed in "skipped" instead. Swarmscope's own folders are excluded.
 
-Projects that are not git repositories get {"git": False}; rules that need a diff then report
-"unknown" instead of guessing from mtimes.
+Projects that are not git repositories get {"git": False}; rules then report "unknown" instead of
+guessing from mtimes.
 """
+import fnmatch
 import os
 import shutil
 import subprocess
 import tempfile
 
+MAX_FILE_BYTES = 1_000_000
+SENSITIVE = [".env", ".env.*", "*.env", "*.pem", "*.key", "*.p12", "*.pfx", "*.keystore", "*.jks",
+             "id_rsa*", "id_ed25519*", "id_ecdsa*", "*secret*", "*credential*", ".netrc", ".npmrc", ".pypirc",
+             "*.sqlite", "*.sqlite3", "*.db"]
+ALWAYS_EXCLUDE = [".swarmscope", ".claude"]
 
-def _git(args, cwd, env=None, timeout=15):
-    r = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, timeout=timeout)
+
+def _git(args, cwd, env=None, timeout=15, stdin=None):
+    r = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, timeout=timeout, input=stdin)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")
     return r.stdout
 
 
-def snapshot(cwd):
-    """{"git": True, "root", "head", "tree"} or {"git": False, "why"}."""
+def _env(root, store, index=None):
+    objects = _git(["rev-parse", "--git-path", "objects"], root).decode().strip()
+    objects = objects if os.path.isabs(objects) else os.path.join(root, objects)
+    os.makedirs(store, exist_ok=True)
+    env = dict(os.environ, GIT_OBJECT_DIRECTORY=os.path.abspath(store),
+               GIT_ALTERNATE_OBJECT_DIRECTORIES=os.path.abspath(objects))
+    if index:
+        env["GIT_INDEX_FILE"] = index
+    return env
+
+
+def _sensitive(path):
+    name = os.path.basename(path)
+    return any(fnmatch.fnmatch(name, p) for p in SENSITIVE)
+
+
+def snapshot(cwd, store, exclude=()):
+    """{"git": True, "root", "tree", "skipped": [paths]} or {"git": False, "why"}.
+    store: directory for Swarmscope's own git objects. exclude: extra paths relative to the root."""
     try:
         root = _git(["rev-parse", "--show-toplevel"], cwd).decode().strip()
     except Exception as e:  # not a repo, git missing, timeout
@@ -41,25 +68,36 @@ def snapshot(cwd):
         real = real if os.path.isabs(real) else os.path.join(root, real)
         if os.path.exists(real):
             shutil.copyfile(real, idx)          # reuse the stat cache: fast on big repos
-        env = dict(os.environ, GIT_INDEX_FILE=idx)
-        _git(["add", "-A", "--", "."], root, env=env, timeout=30)
+        env = _env(root, store, idx)
+        excl = [f":(exclude){p}" for p in list(ALWAYS_EXCLUDE) + [e for e in exclude if e]]
+        _git(["add", "-u", "--", ".", *excl], root, env=env, timeout=30)       # tracked: modified/deleted
+        listed = _git(["ls-files", "-o", "--exclude-standard", "-z", "--", ".", *excl], root, env=env)
+        add, skipped = [], []
+        for p in listed.decode(errors="replace").split("\0"):
+            if not p:
+                continue
+            try:
+                big = os.path.getsize(os.path.join(root, p)) > MAX_FILE_BYTES
+            except OSError:
+                continue
+            (skipped if big or _sensitive(p) else add).append(p)
+        if add:
+            _git(["add", "--pathspec-from-file=-", "--pathspec-file-nul"], root, env=env, timeout=30,
+                 stdin="\0".join(add).encode())
         tree = _git(["write-tree"], root, env=env).decode().strip()
-        try:
-            head = _git(["rev-parse", "HEAD"], root).decode().strip()
-        except Exception:
-            head = None                         # repo without commits
-        return {"git": True, "root": root, "head": head, "tree": tree}
+        return {"git": True, "root": root, "tree": tree, "skipped": skipped[:50]}
     except Exception as e:
         return {"git": False, "why": str(e)[:120]}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def diff(root, base_tree, cur_tree):
+def diff(root, store, base_tree, cur_tree):
     """[{"path", "added", "deleted", "binary"}] between two snapshots."""
     if base_tree == cur_tree:
         return []
-    out = _git(["diff", "--numstat", "-z", "--no-renames", base_tree, cur_tree], root).decode(errors="replace")
+    out = _git(["diff", "--numstat", "-z", "--no-renames", base_tree, cur_tree], root,
+               env=_env(root, store)).decode(errors="replace")
     files = []
     for rec in out.split("\0"):
         if not rec.strip():

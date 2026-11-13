@@ -8,9 +8,17 @@ Rules, evaluated at every Stop of the main session:
   R2 repeat_error         the same normalised error happened again → consult the advisor
   R3 high_risk_change     large or critical source change → consult the advisor after changing code
 
+Change facts come from repostate snapshots (baseline, after every file-changing tool call, at Stop),
+passed in as `change`: {"files": baseline→now diff, "src_times": when source changed, "since_advisor":
+diff from the tree at the last advisor call to now}. Without git every field is None and the rules that
+need it say "skipped", never "pass".
+
 Decision life cycle (append-only log, one line per record):
-  decision: pass | skipped | triggered → requested (enforce) | advised (advise) | deferred | limited
-  outcome:  observed | not_observed (+cause when known) | unverified
+  decision: pass | skipped | triggered (observe) | advised (advise) | requested (enforce) | deferred | limited
+  outcome:  only for "requested", i.e. something Sonnet was actually told to do:
+            observed | not_observed (+cause when known) | unverified
+  followup: the same check for decisions that were never put to Sonnet (observe, advise, deferred, limited):
+            what happened anyway. Never counted as compliance or non-compliance.
 "Observed" means the action itself was seen (an advisor call in the transcript, a test run in the hooks).
 Whether Sonnet followed the advice is never claimed: the advice is encrypted.
 
@@ -23,7 +31,7 @@ import os
 import re
 import time
 
-POLICY_VERSION = "b-1"
+POLICY_VERSION = "b-2"
 
 DEFAULTS = {
     "mode": "observe",                 # observe | advise | enforce
@@ -106,6 +114,15 @@ def is_test_cmd(cmd, pol):
 
 _MASK = re.compile(r"\|\|\s*(true|:|exit 0)\b|;\s*(true|exit 0)\s*$|\|\s*(tee|head|tail|grep|less|cat)\b")
 _FAILED_IN_OUTPUT = re.compile(r"\b([1-9]\d*) (failed|errors?)\b|\bFAILED\b|\bFAIL\b")
+# explicit success summaries of common runners; without one a clean exit is only "unknown"
+_PASSED_IN_OUTPUT = re.compile(
+    r"\b\d+ passed\b"                       # pytest, jest/vitest "Tests: 5 passed"
+    r"|^OK\b(\s*\(.*\))?\s*$"                # unittest
+    r"|test result: ok\."                    # cargo
+    r"|^ok\s+\S+"                            # go test
+    r"|\b\d+ (examples?|tests?|runs?), 0 failures\b"   # rspec, minitest
+    r"|\bBUILD SUCCESS\b"                    # maven
+    r"|\bTests passed\b", re.M)
 
 
 def classify_test_run(e, pol):
@@ -119,7 +136,11 @@ def classify_test_run(e, pol):
         return {"result": "unknown", "why": "exit code masked by the shell (|| true, pipe)"}
     if e.get("interrupted"):
         return {"result": "unknown", "why": "interrupted"}
-    return {"result": "passed", "why": "exit 0"}
+    if e.get("event") != "PostToolUse":
+        return {"result": "unknown", "why": "no success event for the command"}
+    if _PASSED_IN_OUTPUT.search(e.get("out") or ""):
+        return {"result": "passed", "why": "success event + runner summary"}
+    return {"result": "unknown", "why": "exit looked clean but no recognizable test summary"}
 
 
 def test_scope(cmd, pol):
@@ -154,7 +175,8 @@ def facts(events, pol):
                 rec = {"ts": ts, "cmd": cmd, "err": e.get("err")}
                 f["bash"].append(rec)
                 if is_test_cmd(cmd, pol):
-                    f["tests"].append(dict(rec, **classify_test_run(e, pol), scope=test_scope(cmd, pol)))
+                    f["tests"].append(dict(rec, **classify_test_run(dict(e, event=ev), pol),
+                                           scope=test_scope(cmd, pol)))
             if e.get("err"):
                 f["errors"].append({"ts": ts, "tool": tool, "head": cmd_head(e.get("cmd") or e.get("arg")),
                                     "sig": normalize_error(e["err"]), "raw": e["err"][:120]})
@@ -169,43 +191,32 @@ def source_changes(diff_files, pol):
     return [d for d in diff_files if not d["binary"] and not _match(d["path"], pol["ignore"])]
 
 
-def last_change_ts(f, diff_files, pol):
-    """When source last changed. Edit tools give exact times; files changed by other means (Bash)
-    are dated by the last non-test Bash command, which is conservative (never too early)."""
-    t = max(f["edits"]) if f["edits"] else None
-    src = source_changes(diff_files, pol) or []
-    by_other = [d for d in src if d["path"] not in f["edited_paths"]]
-    if by_other:
-        nontest = [b["ts"] for b in f["bash"] if not is_test_cmd(b["cmd"], pol)]
-        if nontest:
-            t = max(t or 0, max(nontest))
-    return t
-
-
 # --- rules -----------------------------------------------------------------------------
 
-def r1_tests(f, diff_files, pol, has_tests):
-    src = source_changes(diff_files, pol)
-    if src is None and not f["edits"]:
-        return {"rule": "R1_tests", "state": "skipped", "reason": "no git diff and no edits seen"}
-    if src is not None and not src:
+def r1_tests(f, change, pol, has_tests):
+    src = source_changes(change.get("files"), pol)
+    if src is None or change.get("src_times") is None:
+        return {"rule": "R1_tests", "state": "skipped", "reason": "no git snapshots: change order unknown"}
+    if not src:
         return {"rule": "R1_tests", "state": "pass", "reason": "no source changes"}
     if not has_tests:
         return {"rule": "R1_tests", "state": "skipped", "reason": "project has no tests"}
-    t_change = last_change_ts(f, diff_files, pol)
-    after = [t for t in f["tests"] if t_change is None or t["ts"] > t_change]
-    sig = {"files_changed": len(src) if src is not None else None, "last_change": t_change}
+    t_change = max(change["src_times"]) if change["src_times"] else None
+    if t_change is None:
+        return {"rule": "R1_tests", "state": "skipped", "reason": "source changed but its time is unknown"}
+    after = [t for t in f["tests"] if t["ts"] > t_change]
+    sig = {"files_changed": len(src), "last_change": t_change, "verified_test_result": "not_run"}
     if after:
         last = after[-1]
         sig.update(observed_test_result=last["result"], test_cmd=last["cmd"][:120], test_scope=last["scope"],
-                   test_why=last["why"], test_ts=last["ts"], verified_test_result="not_run")
+                   test_why=last["why"], test_ts=last["ts"])
         if last["result"] == "passed":
             return {"rule": "R1_tests", "state": "pass", "signals": sig,
                     "reason": f"tests passed after the last change ({last['scope']}: {last['cmd'][:60]})"}
         why = {"failed": "the last test run after the change failed",
                "unknown": f"test result unknown: {last['why']}"}[last["result"]]
     else:
-        sig.update(observed_test_result="none", verified_test_result="not_run")
+        sig["observed_test_result"] = "none"
         why = "no test run after the last code change"
     return {"rule": "R1_tests", "state": "triggered", "action": "run_tests", "reason": why, "signals": sig}
 
@@ -238,14 +249,7 @@ def r2_repeat_error(f, adv_times, pol):
     return {"rule": "R2_repeat_error", "state": "pass", "reason": "repeated error, advisor already consulted"}
 
 
-def r3_high_risk(f, diff_files, adv_times, pol, baseline_ts=None):
-    src = source_changes(diff_files, pol)
-    if src is None:
-        return {"rule": "R3_high_risk", "state": "skipped", "reason": "no git diff: change size unknown"}
-    if not src:
-        docs_only = bool(diff_files)
-        return {"rule": "R3_high_risk", "state": "pass",
-                "reason": "only docs / test data changed" if docs_only else "no source changes"}
+def _risk(src, pol):
     r = pol["risk"]
     lines = sum(d["added"] + d["deleted"] for d in src)
     critical = [d["path"] for d in src if _match(d["path"], r["critical"])]
@@ -256,16 +260,43 @@ def r3_high_risk(f, diff_files, adv_times, pol, baseline_ts=None):
         hits.append(f"{lines} lines")
     if critical:
         hits.append("critical: " + ", ".join(critical[:2]))
-    sig = {"files": len(src), "lines": lines, "critical": critical[:5], "thresholds": [r["min_files"], r["min_lines"]]}
+    return hits, {"files": len(src), "lines": lines, "critical": critical[:5],
+                  "thresholds": [r["min_files"], r["min_lines"]]}
+
+
+def r3_high_risk(f, change, adv_times, pol):
+    src = source_changes(change.get("files"), pol)
+    if src is None or change.get("src_times") is None:
+        return {"rule": "R3_high_risk", "state": "skipped", "reason": "no git snapshots: change size unknown"}
+    if not src:
+        return {"rule": "R3_high_risk", "state": "pass",
+                "reason": "only docs / test data changed" if change.get("files") else "no source changes"}
+    hits, sig = _risk(src, pol)
+    if change.get("skipped"):
+        sig["unreadable_files"] = len(change["skipped"])
     if not hits:
         return {"rule": "R3_high_risk", "state": "pass", "reason": "small routine change: Sonnet decides",
                 "signals": sig}
-    t_first = min(f["edits"]) if f["edits"] else baseline_ts
-    if any(t > (t_first or 0) for t in adv_times):
-        return {"rule": "R3_high_risk", "state": "pass", "signals": sig,
-                "reason": "high-risk change, advisor consulted after code changed"}
-    return {"rule": "R3_high_risk", "state": "triggered", "action": "consult_advisor", "signals": sig,
-            "reason": "high-risk change (" + "; ".join(hits) + ") without an advisor call"}
+    if not change["src_times"]:
+        return {"rule": "R3_high_risk", "state": "skipped", "signals": sig,
+                "reason": "high-risk change but its timing is unknown"}
+    t_first = min(change["src_times"])
+    consults = [t for t in adv_times if t > t_first]
+    if not consults:
+        return {"rule": "R3_high_risk", "state": "triggered", "action": "consult_advisor", "signals": sig,
+                "reason": "high-risk change (" + "; ".join(hits) + ") without an advisor call after it"}
+    # consulted after code started changing: is what changed since the last consult itself high-risk?
+    rest = change.get("since_advisor")
+    if rest is None:
+        return {"rule": "R3_high_risk", "state": "skipped", "signals": sig,
+                "reason": "advisor consulted, but the tree at that moment is unknown"}
+    rest_hits, rest_sig = _risk(source_changes(rest, pol), pol)
+    sig["since_advisor"] = rest_sig
+    if rest_hits:
+        return {"rule": "R3_high_risk", "state": "triggered", "action": "consult_advisor", "signals": sig,
+                "reason": "high-risk changes after the last advisor call (" + "; ".join(rest_hits) + ")"}
+    return {"rule": "R3_high_risk", "state": "pass", "signals": sig,
+            "reason": "high-risk change reviewed: advisor consulted after it, small changes since"}
 
 
 # --- decision log -----------------------------------------------------------------------
@@ -294,18 +325,19 @@ def append_log(path, records):
 def resolve_outcomes(log, f, adv_times, now, transcript_ok=True):
     """Outcome records for earlier decisions that asked for an action and have no outcome yet.
     Called at the next Stop: by then Sonnet has had its chance to act."""
-    done = {r["id"] for r in log if r.get("kind") == "outcome"}
+    done = {r["id"] for r in log if r.get("kind") in ("outcome", "followup")}
     out = []
     for d in log:
         if d.get("kind") != "decision" or d["id"] in done or not d.get("action"):
             continue
-        if d["state"] not in ("triggered", "requested", "advised", "limited"):
+        if d["state"] not in ("triggered", "requested", "advised", "limited", "deferred"):
             continue
         if d.get("stop_ts", d["ts"]) >= now:
             continue
         t0 = d["ts"]
-        rec = {"kind": "outcome", "id": d["id"], "ts": now, "rule": d["rule"], "action": d["action"],
-               "after_state": d["state"]}
+        # "outcome" only for actions Sonnet was actually told to take; everything else is a "followup"
+        rec = {"kind": "outcome" if d["state"] == "requested" else "followup", "id": d["id"], "ts": now,
+               "rule": d["rule"], "action": d["action"], "after_state": d["state"]}
         if d["action"] == "consult_advisor":
             if not transcript_ok:
                 rec.update(outcome="unverified", cause="transcript unavailable")
@@ -319,8 +351,9 @@ def resolve_outcomes(log, f, adv_times, now, transcript_ok=True):
                 rec.update(outcome="observed", evidence=runs[-1]["cmd"][:80], result=runs[-1]["result"])
             else:
                 rec.update(outcome="not_observed")
-        if rec.get("outcome") == "not_observed" and d["state"] == "limited":
-            rec["cause"] = "block limit reached, nothing was requested"
+        if rec.get("outcome") == "not_observed" and d["state"] in ("limited", "deferred"):
+            rec["cause"] = {"limited": "block limit reached, nothing was requested",
+                            "deferred": "deferred while background agents ran"}[d["state"]]
         out.append(rec)
     return out
 
@@ -346,15 +379,15 @@ ACTION_TEXT = {
 }
 
 
-def gate(events, stop, pol, diff_files, adv_times, log, has_tests, sid, now=None, baseline_ts=None,
-         transcript_ok=True):
+def gate(events, stop, pol, change, adv_times, log, has_tests, sid, now=None, transcript_ok=True):
     """Evaluate the rules at a Stop. Returns (records_to_append, hook_output_dict_or_None)."""
     now = now or time.time()
     f = facts(events, pol)
     records = resolve_outcomes(log, f, adv_times, now, transcript_ok)
 
-    results = [r1_tests(f, diff_files, pol, has_tests), r2_repeat_error(f, adv_times, pol),
-               r3_high_risk(f, diff_files, adv_times, pol, baseline_ts)]
+    change = change or {}
+    results = [r1_tests(f, change, pol, has_tests), r2_repeat_error(f, adv_times, pol),
+               r3_high_risk(f, change, adv_times, pol)]
 
     turn_start = f["turn_start"] or 0
     blocks = sum(1 for r in log if r.get("kind") == "block" and r["ts"] >= turn_start)
@@ -420,3 +453,66 @@ def project_has_tests(root, pol):
         if dirpath.count(os.sep) - root.count(os.sep) >= 3:
             dirs[:] = []
     return False
+
+
+# --- setup check -------------------------------------------------------------------------
+
+REQUIRED_EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart",
+                   "SubagentStop", "Stop"]
+
+
+def check(project):
+    """Print what a live run in this project will and won't see. Changes nothing (snapshots go to a temp dir)."""
+    import shutil
+    import tempfile
+    import repostate
+    project = os.path.abspath(os.path.expanduser(project))
+    home = os.path.expanduser("~/.claude/settings.json")
+    files = [os.path.join(project, ".claude", n) for n in ("settings.json", "settings.local.json")] + [home]
+    found = {}
+    for path in files:
+        try:
+            s = json.loads(open(path).read())
+        except Exception:
+            continue
+        for ev, groups in (s.get("hooks") or {}).items():
+            for g in groups or []:
+                for h in g.get("hooks", []):
+                    if "hook.py" in str(h.get("command", "")):
+                        found.setdefault(ev, []).append((path.replace(os.path.expanduser("~"), "~"),
+                                                         h.get("timeout"), h.get("command")))
+    print(f"project      {project}")
+    print("hook events  (swarmscope hook.py)")
+    for ev in REQUIRED_EVENTS:
+        where = found.get(ev)
+        if where:
+            path, timeout, _ = where[0]
+            note = "  ← Stop snapshots the repo: use timeout >= 30" if ev == "Stop" and (timeout or 60) < 30 else ""
+            print(f"  ok       {ev:<20} {path}  timeout={timeout}{note}")
+        else:
+            print(f"  MISSING  {ev:<20}")
+    cmds = {c for v in found.values() for _, _, c in v}
+    if len(cmds) > 1:
+        print(f"  note: several hook.py commands registered: {sorted(cmds)}")
+    pol = load_policy(project)
+    print(f"policy       {'off (no .claude/swarmscope-policy.json)' if not pol else pol['mode'] + ' · ' + pol['policy_version']}")
+    tmp = tempfile.mkdtemp()
+    try:
+        snap = repostate.snapshot(project, tmp)
+        if snap.get("git"):
+            sk = snap.get("skipped") or []
+            print(f"snapshots    ok (git) · {len(sk)} untracked files not read" + (f": {sk[:3]}" if sk else ""))
+        else:
+            print(f"snapshots    unavailable: {snap.get('why')} → R1/R3 will say 'skipped'. Fix: git init")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"tests        {'found' if project_has_tests(project, pol or DEFAULTS) else 'none found → R1 skipped'}")
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "--check":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        check(sys.argv[2])
+    else:
+        print("usage: python rules.py --check <project dir>")
