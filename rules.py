@@ -175,6 +175,13 @@ def test_runs_last(cmd, pol):
 
 def test_scope(cmd, pol):
     cmd = shell_only(cmd)
+    # look only at the test invocation itself, not at `cat >> tests/x.py` before it (live run 14.11)
+    starts = [m.start() for p in pol["test_patterns"] for m in re.finditer(p, cmd)]
+    if starts:
+        seg = cmd[max(starts):]
+        seg = re.split(r"[;&|\n]", seg, maxsplit=1)[0]
+        if not (pol.get("test_command") and cmd.strip() == pol["test_command"].strip()):
+            cmd = seg
     if pol.get("test_command") and cmd.strip() == pol["test_command"].strip():
         return "configured"
     if re.search(r"\S+\.(py|js|ts|tsx|go|rs|rb|java)\b|::|\s-k\s|--testNamePattern|\s-run\s|\s-t\s", cmd):

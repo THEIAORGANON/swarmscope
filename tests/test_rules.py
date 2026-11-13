@@ -357,6 +357,12 @@ def test_write_and_test_in_one_command_counts_as_tested():
     assert by_rule(run(ev, files(("src/a.py", 3, 0)), times=[452])[0], "R1_tests")["state"] == "pass"
 
 
+def test_scope_looks_at_the_test_invocation_only():
+    cmd = "cat >> tests/test_cache.py <<'EOF'\nx = 1\nEOF\nuv run --with pytest python -m pytest -q 2>&1 | tail -5"
+    assert rules.test_scope(cmd, POL) == "suite"
+    assert rules.test_scope("pytest tests/test_x.py -q | tail -3", POL) == "targeted"
+
+
 def test_heredoc_body_is_not_a_test_run():
     """Live run 13.11: writing a test file containing `pytest.raises` was taken for a pytest run."""
     cmd = "cat >> tests/test_m.py <<'EOF'\nwith pytest.raises(X):\n    pass\nEOF"
