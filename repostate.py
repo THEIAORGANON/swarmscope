@@ -69,12 +69,15 @@ def snapshot(cwd, store, exclude=()):
         if os.path.exists(real):
             shutil.copyfile(real, idx)          # reuse the stat cache: fast on big repos
         env = _env(root, store, idx)
-        excl = [f":(exclude){p}" for p in list(ALWAYS_EXCLUDE) + [e for e in exclude if e]]
-        _git(["add", "-u", "--", ".", *excl], root, env=env, timeout=30)       # tracked: modified/deleted
-        listed = _git(["ls-files", "-o", "--exclude-standard", "-z", "--", ".", *excl], root, env=env)
+        skip_paths = list(ALWAYS_EXCLUDE) + [e for e in exclude if e]
+        # tracked files: modified/deleted. No pathspec here: older git (e.g. Apple's) fails on a pathspec
+        # that matches nothing, which is every fresh `git init`. Excluded paths are dropped afterwards.
+        _git(["add", "-u"], root, env=env, timeout=30)
+        _git(["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *skip_paths], root, env=env)
+        listed = _git(["ls-files", "-o", "--exclude-standard", "-z"], root, env=env)
         add, skipped = [], []
         for p in listed.decode(errors="replace").split("\0"):
-            if not p:
+            if not p or any(p == x or p.startswith(x.rstrip("/") + "/") for x in skip_paths):
                 continue
             try:
                 big = os.path.getsize(os.path.join(root, p)) > MAX_FILE_BYTES

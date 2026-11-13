@@ -141,6 +141,30 @@ def test_reverted_change_nets_out(repo, tmp_path_factory):
     assert repostate.diff(cur["root"], store, base["tree"], cur["tree"]) == []
 
 
+def test_fresh_git_init_without_tracked_files(tmp_path):
+    """Regression: older git fails `add -u -- .` when nothing is tracked yet (live run on macOS)."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    store = str(tmp_path / ".swarmscope" / "store")
+    base = repostate.snapshot(str(tmp_path), store)
+    assert base["git"], base
+    (tmp_path / "x.py").write_text("x\n")
+    cur = repostate.snapshot(str(tmp_path), store)
+    assert [f["path"] for f in repostate.diff(cur["root"], store, base["tree"], cur["tree"])] == ["x.py"]
+
+
+def test_tracked_files_in_excluded_folders_are_ignored(repo, tmp_path_factory):
+    root, git = repo
+    (root / ".claude").mkdir()
+    (root / ".claude" / "settings.json").write_text("{}")
+    git("add", ".claude/settings.json")
+    git("commit", "-qm", "settings")
+    store = str(tmp_path_factory.mktemp("store"))
+    base = repostate.snapshot(str(root), store)
+    (root / ".claude" / "settings.json").write_text('{"changed": 1}')
+    cur = repostate.snapshot(str(root), store)
+    assert repostate.diff(cur["root"], store, base["tree"], cur["tree"]) == []
+
+
 def test_not_a_repo(tmp_path):
     assert repostate.snapshot(str(tmp_path), str(tmp_path / "store"))["git"] is False
 
