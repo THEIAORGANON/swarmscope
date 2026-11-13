@@ -31,7 +31,7 @@ import os
 import re
 import time
 
-POLICY_VERSION = "b-3"
+POLICY_VERSION = "b-4"
 
 DEFAULTS = {
     "mode": "observe",                 # observe | advise | enforce
@@ -39,6 +39,8 @@ DEFAULTS = {
     "risk": {
         "min_files": 3,                # source files changed
         "min_lines": 50,               # added + deleted source lines
+        # after a consult, only new risk counts: Sonnet applying the advice must not trigger another consult
+        "after_consult": {"min_files": 3, "min_lines": 100, "new_critical_only": True},
         "critical": ["**/auth/**", "**/*auth*", "**/security/**", "**/migrations/**",
                      "**/*secret*", "**/*crypt*", "**/*permission*", "**/*payment*"],
     },
@@ -108,8 +110,18 @@ def cmd_head(cmd):
     return " ".join(toks[:2])
 
 
+_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)", re.S)
+
+
+def shell_only(cmd):
+    """The command without heredoc bodies: file contents written by `cat > f <<EOF` are not commands
+    (live run 13.11: a test file containing `pytest.raises` looked like a pytest run)."""
+    return _HEREDOC.sub("<<HEREDOC", str(cmd or ""))
+
+
 def is_test_cmd(cmd, pol):
-    return bool(cmd) and any(re.search(p, cmd) for p in pol["test_patterns"])
+    c = shell_only(cmd)
+    return bool(c) and any(re.search(p, c) for p in pol["test_patterns"])
 
 
 _MASK = re.compile(r"\|\|\s*(true|:|exit 0)\b|;\s*(true|exit 0)\s*$|\|\s*(tee|head|tail|grep|less|cat)\b")
@@ -127,7 +139,7 @@ _PASSED_IN_OUTPUT = re.compile(
 
 def classify_test_run(e, pol):
     """One Bash test command → {"result": passed|failed|unknown, "scope", "why"}."""
-    cmd = e.get("cmd") or e.get("arg") or ""
+    cmd = shell_only(e.get("cmd") or e.get("arg") or "")
     if e.get("err"):
         return {"result": "failed", "why": "command failed"}
     out = e.get("out") or ""
@@ -150,7 +162,19 @@ def classify_test_run(e, pol):
     return {"result": "unknown", "why": "exit looked clean but no recognizable test summary"}
 
 
+def test_runs_last(cmd, pol):
+    """True when the command ends with the test run (optionally piped to tail/head), e.g.
+    `cat >> t.py <<EOF … EOF\npytest -q 2>&1 | tail -5`: the run happened after the write in the same call."""
+    cmd = shell_only(cmd)
+    ends = [m.end() for p in pol["test_patterns"] for m in re.finditer(p, cmd)]
+    if not ends:
+        return False
+    rest = cmd[max(ends):]
+    return bool(re.fullmatch(r"[^;&|<>\n]*?(\s*2>&1)?(\s*\|\s*(tail|head)\b[^;&|<>\n]*)*\s*", rest))
+
+
 def test_scope(cmd, pol):
+    cmd = shell_only(cmd)
     if pol.get("test_command") and cmd.strip() == pol["test_command"].strip():
         return "configured"
     if re.search(r"\S+\.(py|js|ts|tsx|go|rs|rb|java)\b|::|\s-k\s|--testNamePattern|\s-run\s|\s-t\s", cmd):
@@ -183,7 +207,7 @@ def facts(events, pol):
                 f["bash"].append(rec)
                 if is_test_cmd(cmd, pol):
                     f["tests"].append(dict(rec, **classify_test_run(dict(e, event=ev), pol),
-                                           scope=test_scope(cmd, pol)))
+                                           scope=test_scope(cmd, pol), runs_last=test_runs_last(cmd, pol)))
             if e.get("err"):
                 f["errors"].append({"ts": ts, "tool": tool, "head": cmd_head(e.get("cmd") or e.get("arg")),
                                     "sig": normalize_error(e["err"]), "raw": e["err"][:120]})
@@ -211,7 +235,8 @@ def r1_tests(f, change, pol, has_tests):
     t_change = max(change["src_times"]) if change["src_times"] else None
     if t_change is None:
         return {"rule": "R1_tests", "state": "skipped", "reason": "source changed but its time is unknown"}
-    after = [t for t in f["tests"] if t["ts"] > t_change]
+    # same tool call that changed the code and then ran the tests: counts as after (seen live 13.11)
+    after = [t for t in f["tests"] if t["ts"] > t_change or (t["ts"] == t_change and t.get("runs_last"))]
     sig = {"files_changed": len(src), "last_change": t_change, "verified_test_result": "not_run"}
     if after:
         last = after[-1]
@@ -297,7 +322,21 @@ def r3_high_risk(f, change, adv_times, pol):
     if rest is None:
         return {"rule": "R3_high_risk", "state": "skipped", "signals": sig,
                 "reason": "advisor consulted, but the tree at that moment is unknown"}
-    rest_hits, rest_sig = _risk(source_changes(rest, pol), pol)
+    ac = pol["risk"].get("after_consult") or {}
+    rest_src = source_changes(rest, pol)
+    reviewed = {d["path"] for d in (source_changes(change.get("before_advisor"), pol) or [])}
+    rpol = {"risk": dict(pol["risk"], min_files=ac.get("min_files", pol["risk"]["min_files"]),
+                         min_lines=ac.get("min_lines", pol["risk"]["min_lines"]),
+                         critical=pol["risk"]["critical"])}
+    if ac.get("new_critical_only", True):
+        # critical files already changed before the consult were part of what the advisor saw
+        crit_src = [d for d in rest_src if d["path"] not in reviewed]
+        rest_hits, rest_sig = _risk(rest_src, dict(rpol, risk=dict(rpol["risk"], critical=[])))
+        crit_hits, _ = _risk(crit_src, dict(rpol, risk=dict(rpol["risk"], min_files=10**9, min_lines=10**9)))
+        rest_hits += crit_hits
+        rest_sig["critical"] = [d["path"] for d in crit_src if _match(d["path"], pol["risk"]["critical"])][:5]
+    else:
+        rest_hits, rest_sig = _risk(rest_src, rpol)
     sig["since_advisor"] = rest_sig
     if rest_hits:
         return {"rule": "R3_high_risk", "state": "triggered", "action": "consult_advisor", "signals": sig,

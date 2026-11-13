@@ -52,7 +52,9 @@ def main():
 
     # Bash: full command + output tail, so rules can tell a test run from a test result
     if d.get("tool_name") == "Bash" and isinstance(ti, dict) and ti.get("command"):
-        ev["cmd"] = str(ti["command"])[:400]
+        c = str(ti["command"])
+        # keep both ends: a long heredoc write is often followed by the test run at the very end
+        ev["cmd"] = c if len(c) <= 1200 else c[:500] + "\n…\n" + c[-600:]
     tr0 = d.get("tool_response")
     if d.get("tool_name") == "Bash" and tr0 is not None and not isinstance(tr0, dict):
         ev["resp_type"] = type(tr0).__name__
@@ -160,8 +162,10 @@ def policy(d, sid, ev):
         t_a = max(times)
         at = [e for e in timeline if e["ts"] <= t_a] or [base]
         since = repostate.diff(cur["root"], store, at[-1]["tree"], cur["tree"])
+        before = repostate.diff(cur["root"], store, base["tree"], at[-1]["tree"])
     change = {"files": repostate.diff(cur["root"], store, base["tree"], cur["tree"]),
               "src_times": [e["ts"] for e in timeline if e.get("src")], "since_advisor": since,
+              "before_advisor": before if times else None,
               "skipped": cur.get("skipped") or []}
     run_gate(d, sid, ev, pol, change, BASE, lambda _: adv, load_events, rules, cwd, base)
 

@@ -47,7 +47,8 @@ def files(*specs):
     return [{"path": p, "added": a, "deleted": d, "binary": False} for p, a, d in specs]
 
 
-def run(events, diff, p=None, adv=(), log=(), stop=None, has_tests=True, now=100.0, times=None, since=None):
+def run(events, diff, p=None, adv=(), log=(), stop=None, has_tests=True, now=100.0, times=None, since=None,
+        before=None):
     """diff: baseline→now files (None = no git). times: when source changed; by default the edit events."""
     if diff is None:
         change = {"files": None, "src_times": None, "since_advisor": None}
@@ -55,7 +56,7 @@ def run(events, diff, p=None, adv=(), log=(), stop=None, has_tests=True, now=100
         if times is None:
             times = [e["ts"] for e in events if e.get("tool_name") == "Edit"] if any(
                 not rules._match(d["path"], POL["ignore"]) for d in diff) else []
-        change = {"files": diff, "src_times": times, "since_advisor": since}
+        change = {"files": diff, "src_times": times, "since_advisor": since, "before_advisor": before}
     return rules.gate(events, stop or {}, p or pol(), change, list(adv), list(log), has_tests, "sess1234", now=now)
 
 
@@ -319,10 +320,67 @@ def test_advisor_before_bash_only_change_does_not_count():
 
 def test_big_changes_after_the_last_consult_need_another():
     d = files(("src/a.py", 60, 0), ("src/b.py", 40, 0))
-    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/b.py", 40, 20)))[0], "R3_high_risk")
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/b.py", 90, 20)))[0], "R3_high_risk")
     assert r3["state"] == "triggered" and "after the last advisor call" in r3["reason"]
     r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/b.py", 2, 1)))[0], "R3_high_risk")
     assert r3["state"] == "pass"
+
+
+def test_applying_advice_to_reviewed_critical_file_is_not_new_risk():
+    """Live run 13.11: after a consult Sonnet changed client.py (already changed before the consult,
+    55 lines). b-3 demanded another consult, then a third one for a 5-line metrics.py tweak."""
+    d = files(("src/auth/client.py", 120, 10), ("src/auth/metrics.py", 40, 0), ("tests/test_m.py", 30, 0))
+    before = files(("src/auth/client.py", 70, 5), ("src/auth/metrics.py", 35, 0), ("tests/test_m.py", 25, 0))
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/auth/client.py", 50, 5)),
+                     before=before)[0], "R3_high_risk")
+    assert r3["state"] == "pass"
+
+
+def test_new_critical_file_after_consult_is_new_risk():
+    d = files(("src/a.py", 60, 0), ("src/auth/token.py", 3, 0))
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/auth/token.py", 3, 0)),
+                     before=files(("src/a.py", 60, 0)))[0], "R3_high_risk")
+    assert r3["state"] == "triggered" and "critical" in r3["reason"]
+
+
+def test_large_change_after_consult_still_counts():
+    d = files(("src/a.py", 200, 0))
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=files(("src/a.py", 120, 0)),
+                     before=files(("src/a.py", 80, 0)))[0], "R3_high_risk")
+    assert r3["state"] == "triggered"
+
+
+def test_write_and_test_in_one_command_counts_as_tested():
+    """Live run 13.11: `cat >> tests/x.py <<EOF … EOF` + pytest in one Bash call; b-3 asked for another run."""
+    cmd = "cat >> tests/test_m.py <<'EOF'\ndef test_x(): pass\nEOF\nuv run python -m pytest -q 2>&1 | tail -3"
+    ev = [prompt(1), bash(452, cmd, out="32 passed in 0.07s")]
+    assert by_rule(run(ev, files(("src/a.py", 3, 0)), times=[452])[0], "R1_tests")["state"] == "pass"
+
+
+def test_heredoc_body_is_not_a_test_run():
+    """Live run 13.11: writing a test file containing `pytest.raises` was taken for a pytest run."""
+    cmd = "cat >> tests/test_m.py <<'EOF'\nwith pytest.raises(X):\n    pass\nEOF"
+    assert not rules.is_test_cmd(cmd, POL)
+    assert rules.is_test_cmd(cmd + "\npytest -q | tail -3", POL)
+
+
+def test_long_command_keeps_its_tail(tmp_path):
+    body = "x = 1\n" * 400
+    cmd = f"cat > tests/test_big.py <<'EOF'\n{body}EOF\npython -m pytest -q 2>&1 | tail -5"
+    env = dict(os.environ, SWARMSCOPE_DIR=str(tmp_path))
+    env.pop("SWARMSCOPE_POLICY", None)
+    payload = {"session_id": "long", "cwd": str(tmp_path), "hook_event_name": "PostToolUse", "tool_name": "Bash",
+               "tool_input": {"command": cmd}, "tool_response": {"stdout": "3 passed"}}
+    subprocess.run([sys.executable, os.path.join(ROOT, "hook.py")], input=json.dumps(payload), text=True,
+                   env=env, check=True)
+    ev = json.loads((tmp_path / "events" / "long.jsonl").read_text().splitlines()[-1])
+    assert ev["cmd"].endswith("tail -5") and rules.test_runs_last(ev["cmd"], POL)
+
+
+def test_test_then_write_in_one_command_is_not_tested():
+    cmd = "pytest -q && sed -i s/a/b/ src/a.py"
+    ev = [prompt(1), bash(452, cmd, out="5 passed")]
+    assert by_rule(run(ev, files(("src/a.py", 3, 0)), times=[452])[0], "R1_tests")["state"] == "triggered"
 
 
 def test_unknown_tree_at_consult_is_skipped_not_pass():
