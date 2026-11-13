@@ -18,6 +18,9 @@ A live terminal dashboard for a Claude Code session where Sonnet writes the code
 
 - **Claude Code hooks** for tool calls, errors, edits and subagents (`hook.py` appends one JSON line per event).
 - **The session transcript** for advisor calls. Hooks never see the advisor: it runs server-side.
+- **Token usage in the transcripts** for the COST column (`costs.py`). Sonnet's usage comes from the main transcript and each subagent's from its own. The advisor's tokens are only in `usage.iterations[]` (`advisor_message`). Dollars are list-price estimates (edit `prices.json` in the swarmscope folder to change them). The total row also shows Claude Code's own `total_cost_usd` so you can compare. `~` marks an advisor figure estimated as a lower bound, used when the transcript has advisor calls but no advisor usage.
+
+Check a past session: `python costs.py ~/path/to/project` (or a transcript `.jsonl`, or `--latest`).
 
 Things it can't do:
 

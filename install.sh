@@ -36,7 +36,7 @@ diff -u "${SETTINGS}" "$TMP" 2>/dev/null || diff -u /dev/null "$TMP" || true
 if [ $DRY = 1 ]; then rm -f "$TMP"; echo "(dry run — nothing changed)"; exit 0; fi
 
 mkdir -p "$DEST" "$HOME/.claude/agents" "$HOME/.local/bin"
-cp "$SRC"/{common.py,hook.py,statusline.py,dashboard.py,swarmscope} "$DEST/"
+cp "$SRC"/{common.py,costs.py,hook.py,statusline.py,dashboard.py,swarmscope} "$DEST/"
 chmod +x "$DEST"/*.py "$DEST/swarmscope"
 ln -sf "$DEST/swarmscope" "$HOME/.local/bin/swarmscope"
 

@@ -17,6 +17,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (advisor_activity, advisor_name, build_state, latest_session_id,  # noqa: E402
                     load_events, load_meta, session_file, subagent_model, pretty_model)
+from costs import session_costs  # noqa: E402
 
 from rich import box  # noqa: E402
 from rich.align import Align  # noqa: E402
@@ -719,13 +720,24 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     tbl.add_column("ACTIVITY", no_wrap=True, width=12)
     tbl.add_column("CALLS", no_wrap=True, justify="right", width=5)
     tbl.add_column("TIME", no_wrap=True, justify="right", width=4)
+    tbl.add_column("COST", no_wrap=True, justify="right", width=6)
     tbl.add_column("NOW", no_wrap=True, overflow="ellipsis", ratio=1)
+    cost = st.get("cost") or {}
 
-    def row(name, color, model, state, state_style, marks, calls, tsec, now_txt, now_style, fresh_age):
+    def usd(b, approx=False):
+        if not b or not b.get("msgs"):
+            return Text("—", style=FAINT)
+        x = b["usd"]
+        s = "<$0.01" if 0 < x < 0.005 else (f"${x:.2f}" if x < 10 else f"${x:.1f}" if x < 100 else f"${x:.0f}")
+        s = ("~" + s) if approx and not s.startswith("<") else s
+        return Text(s, style=DIM if approx else FG)
+
+    def row(name, color, model, state, state_style, marks, calls, tsec, now_txt, now_style, fresh_age, c=None):
         name_style = f"bold {fade(color, fresh_age, 1.2)}" if fresh_age < 1.2 else f"bold {color}"
         tbl.add_row(Text(name, style=name_style), Text(state, style=state_style),
                     spark_text(activity(marks, now, window, 12), color, frame),
-                    Text(str(calls), style=FG), Text(tsec, style=DIM), Text(now_txt, style=now_style))
+                    Text(str(calls), style=FG), Text(tsec, style=DIM), c if c is not None else Text("—", style=FAINT),
+                    Text(now_txt, style=now_style))
 
     # sonnet
     lm = [m[0] for m in st["lead_marks"]]
@@ -739,7 +751,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     span = st["work_spans"][-1] if st["work_spans"] else None
     tsec = f"{(span[1] or now) - span[0]:.0f}s" if span else "—"
     row("sonnet", ORANGE, lead, sstate, sstyle, lm, st["tool_total"], tsec,
-        st["last_tool"] or "—", FG, now - lm[-1] if lm else 99)
+        st["last_tool"] or "—", FG, now - lm[-1] if lm else 99, usd(cost.get("lead")))
 
     # opus
     adv_age = now - a["times"][-1] if a["times"] else 99
@@ -766,7 +778,8 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     else:
         otxt, osty = "silent on routine turns", DIM
     row("opus", PURPLE, adv or "—", ostate, ostyle, a["times"], a["calls"],
-        f"{sum(durs) / len(durs):.0f}s" if durs else "—", otxt, osty, adv_age)
+        f"{sum(durs) / len(durs):.0f}s" if durs else "—", otxt, osty, adv_age,
+        usd(cost.get("advisor"), (cost.get("advisor") or {}).get("source") == "estimate"))
 
     # haiku swarm
     for k in st["sub_order"][-5:]:
@@ -783,10 +796,10 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
             now_txt = f"✕{sa['errors']} · " + now_txt
         row(sa["type"], BLUE, "", state, sty, sa["marks"], sa["tools"], f"{el:.0f}s",
             now_txt, (RED if sa.get("errors") else FG) if run else (mix(RED, DIM, 0.4) if sa.get("errors") else DIM),
-            now - sa["marks"][-1] if sa["marks"] else now - sa["start"])
+            now - sa["marks"][-1] if sa["marks"] else now - sa["start"], usd((cost.get("subs") or {}).get(k)))
     if not st["sub_order"]:
         tbl.add_row(Text("swarm", style=DIM), Text("standby", style=DIM),
-                    Text(""), Text(""), Text(""), Text("no subagents yet", style=DIM))
+                    Text(""), Text(""), Text(""), Text(""), Text("no subagents yet", style=DIM))
     # totals
     tbl.add_section()
     all_marks = lm + [x for sa in st["subagents"].values() for x in sa["marks"]]
@@ -797,7 +810,9 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
                 spark_text(activity(all_marks, now, window, 12), GREEN, frame),
                 Text(str(st["tool_total"] + st["sub_tool_total"]), style=f"bold {FG}"),
                 Text(f"{elapsed:.0f}s", style=DIM),
-                Text(f"{len(st['sub_order'])} sub · {a['calls']} advice · {len(st['edits'])} edits", style=DIM))
+                usd({"usd": cost.get("total_usd", 0), "msgs": 1} if cost else None, cost.get("estimated")),
+                Text((f"cc says ${cost['cc_usd']:.2f} · " if cost.get("cc_usd") is not None else "")
+                     + f"{len(st['sub_order'])} sub · {a['calls']} advice · {len(st['edits'])} edits", style=DIM))
     running = sum(1 for x in st["subagents"].values() if x["status"] == "running")
     models = sorted({m for m in (sub_model or pretty_model(subagent_model(transcript, k)) for k in st["sub_order"]) if m})
     swarm = " / ".join(models) if models else ("subagents" if st["sub_order"] else "no subagents")
@@ -984,6 +999,17 @@ def demo_events(t0, now):
     return out, {"calls": len(times), "last": allv[-1] if allv else "", "times": times, "all": allv}
 
 
+def demo_costs(st, a):
+    """Made-up but plausible per-model spend for the demo, growing with activity."""
+    def b(usd):
+        return {"usd": usd, "msgs": 1 if usd else 0}
+    lead = b(0.006 * len(st["lead_marks"]) + 0.02 * bool(st["lead_marks"]))
+    adv = dict(b(0.11 * a["calls"]), source="iterations")
+    subs = {k: b(0.0006 * s["tools"]) for k, s in st["subagents"].items()}
+    return {"lead": lead, "advisor": adv, "subs": subs, "estimated": False,
+            "total_usd": lead["usd"] + adv["usd"] + sum(x["usd"] for x in subs.values())}
+
+
 # --- main --------------------------------------------------------------------------
 
 def main():
@@ -1018,7 +1044,9 @@ def main():
     def snapshot_data(now):
         if args.demo:
             events, a = demo_events(t0, now)
-            return "sonnet 5.5", "opus 5.5", build_state(events), a
+            st = build_state(events)
+            st["cost"] = demo_costs(st, a)
+            return "sonnet 5.5", "opus 5.5", st, a
         sid = args.session or latest_session_id()
         key = None
         if sid:
@@ -1033,6 +1061,8 @@ def main():
         cache["tp"] = meta.get("transcript_path") or st["transcript"]
         adv = advisor_name()
         a = advisor_activity(meta.get("transcript_path") or st["transcript"]) if adv else {"calls": 0, "last": "", "times": []}
+        c = session_costs(cache["tp"], adv)
+        st["cost"] = dict(c, cc_usd=meta.get("cost")) if c else ({"cc_usd": meta["cost"]} if meta.get("cost") is not None else {})
         return meta.get("model") or "lead", adv, st, a
 
     def frame_renderable(frame, now):
