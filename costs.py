@@ -42,6 +42,10 @@ PRICES = {
     "fable-5-2":  {"in": 10.00, "out": 50.00, "cr": 0.25, "cw5": 12.50, "cw1h": 20.00},
 }
 PRICES_AS_OF = "2026-11-13"
+# fast mode (usage.speed == "fast"): Opus 5.5 is listed at $8/$40, i.e. 2x. For other models we assume
+# the same 2x on every bucket and flag the figure as estimated.
+FAST_MULT = {"opus-5-5": 2.0}
+FAST_DEFAULT = 2.0
 
 
 def _load_prices():
@@ -72,7 +76,8 @@ def price_key(model):
 
 
 def _zero():
-    return {"in": 0, "out": 0, "cr": 0, "cw5": 0, "cw1h": 0, "usd": 0.0, "msgs": 0, "unpriced": 0}
+    return {"in": 0, "out": 0, "cr": 0, "cw5": 0, "cw1h": 0, "usd": 0.0, "msgs": 0, "unpriced": 0,
+            "fast": 0, "fast_guess": 0}
 
 
 def _tokens(u):
@@ -84,7 +89,8 @@ def _tokens(u):
     if cw5 is None and cw1h is None:
         cw5, cw1h = total_cw, 0
     return {"in": u.get("input_tokens") or 0, "out": u.get("output_tokens") or 0,
-            "cr": u.get("cache_read_input_tokens") or 0, "cw5": cw5 or 0, "cw1h": cw1h or 0}
+            "cr": u.get("cache_read_input_tokens") or 0, "cw5": cw5 or 0, "cw1h": cw1h or 0,
+            "fast": u.get("speed") == "fast"}
 
 
 def _usd(model, t):
@@ -95,14 +101,19 @@ def _usd(model, t):
     prompt = t["in"] + t["cr"] + t["cw5"] + t["cw1h"]
     if "long" in p and prompt > p["long"]["over"]:
         p = p["long"]
-    return (t["in"] * p["in"] + t["out"] * p["out"] + t["cr"] * p["cr"]
-            + t["cw5"] * p["cw5"] + t["cw1h"] * p["cw1h"]) / 1e6
+    mult = FAST_MULT.get(k, FAST_DEFAULT) if t.get("fast") else 1.0
+    return mult * (t["in"] * p["in"] + t["out"] * p["out"] + t["cr"] * p["cr"]
+                   + t["cw5"] * p["cw5"] + t["cw1h"] * p["cw1h"]) / 1e6
 
 
 def _add(bucket, model, t, count=1):
     for k in ("in", "out", "cr", "cw5", "cw1h"):
         bucket[k] += t[k]
     bucket["msgs"] += count
+    if t.get("fast"):
+        bucket["fast"] += 1
+        if price_key(model) not in FAST_MULT:
+            bucket["fast_guess"] += 1
     usd = _usd(model, t)
     if usd is None:
         bucket["unpriced"] += 1
@@ -198,6 +209,8 @@ def session_costs(transcript_path, advisor_model=None):
             seen["with_iterations"] += 1
             first = True
             for it in its:
+                if "speed" not in it and "speed" in u:
+                    it = dict(it, speed=u["speed"])
                 typ = it.get("type", "?")
                 seen["iteration_types"][typ] = seen["iteration_types"].get(typ, 0) + 1
                 if typ == "advisor_message":
@@ -235,13 +248,18 @@ def session_costs(transcript_path, advisor_model=None):
         if b["msgs"]:
             subs[aid] = b
 
+    buckets = [lead, adv] + list(subs.values())
+    nfast = sum(b["fast"] for b in buckets)
+    fast_guess = sum(b["fast_guess"] for b in buckets)
+    if nfast:
+        notes.append(f"{nfast} fast-mode usage records priced at 2x" + (" (assumed for non-Opus models)" if fast_guess else ""))
     unpriced = lead["unpriced"] + adv["unpriced"] + sum(s["unpriced"] for s in subs.values())
     if unpriced:
         notes.append(f"{unpriced} messages from models without a price: not counted in $")
     total = lead["usd"] + adv["usd"] + sum(s["usd"] for s in subs.values())
     seen["usage_keys"] = sorted(seen["usage_keys"])
     res = {"lead": lead, "advisor": adv, "subs": subs, "total_usd": total,
-           "estimated": adv["source"] == "estimate" or bool(unpriced), "notes": notes, "seen": seen,
+           "estimated": adv["source"] == "estimate" or bool(unpriced) or bool(fast_guess), "notes": notes, "seen": seen,
            "prices_as_of": PRICES_AS_OF}
     _cache[transcript_path] = (key, res)
     return res
@@ -286,23 +304,25 @@ def main():
     a = advisor_activity(tp)
     c = session_costs(tp, "claude-opus-5-5")
     s = c["seen"]
-    print(f"transcript   {tp}")
+    print(f"transcript   {os.path.basename(tp)}")
     print(f"prices       list prices as of {c['prices_as_of']}, USD / 1M tokens")
     print()
 
-    def line(name, b):
-        tok = f"in {fmt_tok(b['in']):>6}  out {fmt_tok(b['out']):>6}  cache r {fmt_tok(b['cr']):>6}  w {fmt_tok(b['cw5'] + b['cw1h']):>6}"
-        print(f"  {name:<10} {pretty_model(b['model']) or '?':<12} {b['msgs']:>4} msg  {tok}   {fmt_usd(b['usd']):>8}")
+    print(f"  {'':<8} {'model':<10} {'msg':>3}  {'in':>5} {'out':>5} {'c.read':>6} {'c.write':>7} {'usd':>8}")
+
+    def line(name, b, approx=False):
+        print(f"  {name:<8} {pretty_model(b['model']) or '?':<10} {b['msgs']:>3}  {fmt_tok(b['in']):>5} "
+              f"{fmt_tok(b['out']):>5} {fmt_tok(b['cr']):>6} {fmt_tok(b['cw5'] + b['cw1h']):>7} {fmt_usd(b['usd'], approx):>8}")
 
     line("lead", c["lead"])
-    line("advisor", c["advisor"])
+    line("advisor", c["advisor"], c["advisor"]["source"] == "estimate")
     for aid, b in c["subs"].items():
-        line(aid[:10], b)
-    print(f"  {'total':<10} {'':<12}{'':61}{fmt_usd(c['total_usd'], c['estimated']):>8}")
+        line(aid[:8], b)
+    print(f"  {'total':<8} {'':<10} {'':>3}  {'':>5} {'':>5} {'':>6} {'':>7} {fmt_usd(c['total_usd'], c['estimated']):>8}")
     print()
     print("diagnostics (paste this block back into the chat)")
     print(f"  unique assistant messages      {s['messages']}")
-    print(f"  advisor calls (server_tool_use) {a['calls']}  in {s['advisor_call_msgs']} messages")
+    print(f"  advisor calls                  {a['calls']} in {s['advisor_call_msgs']} messages")
     print(f"  messages with usage.iterations {s['with_iterations']}")
     print(f"  iteration types                {s['iteration_types'] or '—'}")
     print(f"  advisor usage source           {c['advisor']['source']}")
