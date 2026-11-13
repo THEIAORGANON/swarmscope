@@ -3,6 +3,12 @@
 Pure functions over data the hooks and transcripts already give us: no model calls, no guessing.
 The Stop hook (hook.py) calls gate(); everything here is testable with synthetic events.
 
+Files are classified once, the same way for every rule and every moment of the session:
+  production code → R1 (needs tests) and R3 (risk)
+  test code       → R1 only: changed tests must run, but test files are not architectural risk
+  ignored         → docs, test data, lockfiles: neither
+Policies can add escalations; they never forbid the voluntary advisor calls Sonnet makes on its own.
+
 Rules, evaluated at every Stop of the main session:
   R1 tests_after_change   source changed → a test run must have passed after the last change
   R2 repeat_error         the same normalised error happened again → consult the advisor
@@ -31,7 +37,7 @@ import os
 import re
 import time
 
-POLICY_VERSION = "b-4"
+POLICY_VERSION = "b-5"
 
 DEFAULTS = {
     "mode": "observe",                 # observe | advise | enforce
@@ -44,6 +50,10 @@ DEFAULTS = {
         "critical": ["**/auth/**", "**/*auth*", "**/security/**", "**/migrations/**",
                      "**/*secret*", "**/*crypt*", "**/*permission*", "**/*payment*"],
     },
+    # test code: counts for R1 (changed tests must run), never for R3 risk
+    "tests": ["tests/**", "test/**", "**/tests/**", "**/test/**", "**/__tests__/**", "spec/**", "**/spec/**",
+              "**/test_*.py", "**/*_test.py", "**/conftest.py", "**/*_test.go", "**/*.test.*", "**/*.spec.*",
+              "**/*_spec.rb"],
     # never counted as source: docs, test data, lockfiles
     "ignore": ["*.md", "*.rst", "*.txt", "docs/**", "**/fixtures/**", "**/testdata/**",
                "**/__snapshots__/**", "*.lock", "**/package-lock.json", "LICENSE*", ".gitignore",
@@ -223,10 +233,26 @@ def facts(events, pol):
     return f
 
 
+def classify(path, pol):
+    if _match(path, pol["ignore"]):
+        return "ignored"
+    if _match(path, pol.get("tests") or []):
+        return "test"
+    return "prod"
+
+
 def source_changes(diff_files, pol):
+    """Production + test code (what R1 cares about)."""
     if diff_files is None:
         return None
-    return [d for d in diff_files if not d["binary"] and not _match(d["path"], pol["ignore"])]
+    return [d for d in diff_files if not d["binary"] and classify(d["path"], pol) != "ignored"]
+
+
+def prod_changes(diff_files, pol):
+    """Production code only (what R3 cares about)."""
+    if diff_files is None:
+        return None
+    return [d for d in diff_files if not d["binary"] and classify(d["path"], pol) == "prod"]
 
 
 # --- rules -----------------------------------------------------------------------------
@@ -304,22 +330,24 @@ def _risk(src, pol):
 
 
 def r3_high_risk(f, change, adv_times, pol):
-    src = source_changes(change.get("files"), pol)
+    src = prod_changes(change.get("files"), pol)
     if src is None or change.get("src_times") is None:
         return {"rule": "R3_high_risk", "state": "skipped", "reason": "no git snapshots: change size unknown"}
     if not src:
         return {"rule": "R3_high_risk", "state": "pass",
-                "reason": "only docs / test data changed" if change.get("files") else "no source changes"}
+                "reason": "no production code changed (only tests / docs)" if change.get("files")
+                else "no source changes"}
     hits, sig = _risk(src, pol)
     if change.get("skipped"):
         sig["unreadable_files"] = len(change["skipped"])
     if not hits:
         return {"rule": "R3_high_risk", "state": "pass", "reason": "small routine change: Sonnet decides",
                 "signals": sig}
-    if not change["src_times"]:
+    times = change.get("prod_times") if change.get("prod_times") is not None else change["src_times"]
+    if not times:
         return {"rule": "R3_high_risk", "state": "skipped", "signals": sig,
                 "reason": "high-risk change but its timing is unknown"}
-    t_first = min(change["src_times"])
+    t_first = min(times)
     consults = [t for t in adv_times if t > t_first]
     if not consults:
         return {"rule": "R3_high_risk", "state": "triggered", "action": "consult_advisor", "signals": sig,
@@ -330,8 +358,8 @@ def r3_high_risk(f, change, adv_times, pol):
         return {"rule": "R3_high_risk", "state": "skipped", "signals": sig,
                 "reason": "advisor consulted, but the tree at that moment is unknown"}
     ac = pol["risk"].get("after_consult") or {}
-    rest_src = source_changes(rest, pol)
-    reviewed = {d["path"] for d in (source_changes(change.get("before_advisor"), pol) or [])}
+    rest_src = prod_changes(rest, pol)
+    reviewed = {d["path"] for d in (prod_changes(change.get("before_advisor"), pol) or [])}
     rpol = {"risk": dict(pol["risk"], min_files=ac.get("min_files", pol["risk"]["min_files"]),
                          min_lines=ac.get("min_lines", pol["risk"]["min_lines"]),
                          critical=pol["risk"]["critical"])}
@@ -408,6 +436,18 @@ def resolve_outcomes(log, f, adv_times, now, transcript_ok=True):
             rec["cause"] = {"limited": "block limit reached, nothing was requested",
                             "deferred": "deferred while background agents ran"}[d["state"]]
         out.append(rec)
+    return out
+
+
+def finalize(log, events, pol, adv_times, transcript_ok=True, now=None):
+    """Close every open decision after the session has ended (the runner calls this; the live hook
+    only resolves at the next Stop). Idempotent: decisions that already have a result are skipped."""
+    now = now or time.time()
+    out = resolve_outcomes(log, facts(events, pol), adv_times, now, transcript_ok)
+    for r in out:
+        r["final"] = True
+        if r.get("outcome") == "not_observed" and not r.get("cause"):
+            r["cause"] = "session ended without the action"
     return out
 
 
@@ -564,8 +604,21 @@ def check(project):
 
 if __name__ == "__main__":
     import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     if len(sys.argv) >= 3 and sys.argv[1] == "--check":
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         check(sys.argv[2])
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--finalize":
+        # python rules.py --finalize <session_id> [project dir]   (SWARMSCOPE_DIR as for the hook)
+        from common import BASE, advisor_activity, load_events
+        sid = sys.argv[2]
+        events = load_events(sid)
+        pol = load_policy(sys.argv[3] if len(sys.argv) > 3 else os.getcwd()) or json.loads(json.dumps(DEFAULTS))
+        tp = next((e.get("transcript_path") for e in events if e.get("transcript_path")), None)
+        adv = advisor_activity(tp) if tp else {"times": []}
+        logf = str(BASE / "decisions" / f"{sid}.jsonl")
+        recs = finalize(load_log(logf), events, pol, adv.get("times") or [], bool(tp and os.path.exists(tp)))
+        append_log(logf, recs)
+        print(f"{len(recs)} records closed" + "".join(f"\n  {r['kind']:<8} {r['rule']:<16} {r['outcome']}"
+                                                     f"{' · ' + r['cause'] if r.get('cause') else ''}" for r in recs))
     else:
-        print("usage: python rules.py --check <project dir>")
+        print("usage: python rules.py --check <project dir> | --finalize <session_id> [project dir]")

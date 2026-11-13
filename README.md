@@ -65,13 +65,17 @@ Useful flags: `--title`, `--window N` (timeline seconds), `--layout classic`.
 
 `rules.py` checks three rules at every Stop and writes each decision to `decisions/<session>.jsonl`. Decisions show up in the session log with `⚑`.
 
-- **R1 tests**: code changed, so a test run has to pass after the last change. "Passed" needs a success event plus a recognizable runner summary (`5 passed`, `OK`, `test result: ok`…). A clean exit without a summary, a masked exit code (`|| true`, a pipe) or an interrupted run is "unknown". If the output reports failures, the run counts as failed.
+Files are classified once, the same way for every rule. **Production code** counts for R1 and R3. **Test code** (`tests/`, `test_*.py`, `*.spec.ts`…) counts for R1 only: changed tests must run, but they are not architectural risk. **Docs, test data and lockfiles** count for neither.
+
+- **R1 tests**: code changed, so a test run has to pass after the last change. "Passed" needs a success event plus the runner's own summary (`5 passed`, `OK`, `test result: ok`…). If a pipe hides the exit code (`| tail`, `|| true`), the summary still counts. If the output went through `| grep`, the result is unknown.
 - **R2 repeat error**: the same normalised error showed up twice, the action never succeeded in between, and the advisor was not called.
-- **R3 high risk**: 3+ source files, 50+ changed lines, or a critical path (auth, security, migrations…). It needs an advisor call after the code changed. If the change since the last call is high-risk on its own, it needs another one. Docs and test data don't count.
+- **R3 high risk**: 3+ production files, 50+ changed production lines, or a critical path (auth, security, migrations…). It needs an advisor call after the code changed. After a consult only new risk counts: 3+ files or 100+ lines since the last call, or a critical file the advisor hasn't seen yet.
 
-The changes come from the repo itself, not from tool calls. The engine snapshots the working tree when the session starts, after every tool call that can change files, and at Stop. New, staged, committed and Bash-made changes are all counted, along with when each one happened. Edits that were there before the session are not. Snapshots go to Swarmscope's own object store, so nothing is written into your repo. Untracked files that look like secrets (`.env`, keys, credentials) or are over 1 MB are never read. Without git, R1 and R3 say "skipped" instead of guessing.
+The rules can add escalations. They never stop Sonnet from calling the advisor on its own.
 
-Decisions that were put to Sonnet (enforce) get an `outcome`: observed, not_observed or unverified. All other decisions get a `followup`, which records what happened anyway and never counts as compliance.
+The changes come from the repo itself, not from tool calls. The engine snapshots the working tree when the session starts, after every tool call that can change files, and at Stop. New, staged, committed and Bash-made changes are all counted, along with when each one happened. Edits that were there before the session are not. Snapshots go to Swarmscope's own object store, so nothing is written into your repo. Stores older than 7 days are pruned. Files that look like secrets (`.env`, keys, credentials) or are over 1 MB are never read, whether git tracks them or not. The event log masks key=value secrets and common token formats, and doesn't record file contents written through heredocs. Without git, R1 and R3 say "skipped" instead of guessing. Snapshot and gate time is logged per session in `overhead/`.
+
+Decisions that were put to Sonnet (enforce) get an `outcome`: observed, not_observed or unverified. All other decisions get a `followup`, which records what happened anyway and never counts as compliance. The live hook settles results at the next Stop. Once a session has ended, `python rules.py --finalize <session_id> <project>` closes whatever is still open. Running it again does nothing.
 
 Turn it on per project with `.claude/swarmscope-policy.json`:
 

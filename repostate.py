@@ -12,8 +12,9 @@ Nothing is written into the user's repository:
   * a throw-away index (GIT_INDEX_FILE) leaves the staging area alone,
   * objects go to Swarmscope's own store (GIT_OBJECT_DIRECTORY); the repo's objects are only read
     through GIT_ALTERNATE_OBJECT_DIRECTORIES.
-Untracked files that look sensitive (.env, keys, credentials…) or are larger than MAX_FILE_BYTES are
-never read; they are listed in "skipped" instead. Swarmscope's own folders are excluded.
+Files that look sensitive (.env, keys, credentials…) or are larger than MAX_FILE_BYTES are never read,
+tracked or untracked: their snapshot entry keeps whatever the user's own index already had, and they are
+listed in "skipped". Swarmscope's own folders are excluded. prune() removes object stores of old sessions.
 
 Projects that are not git repositories get {"git": False}; rules then report "unknown" instead of
 guessing from mtimes.
@@ -70,20 +71,30 @@ def snapshot(cwd, store, exclude=()):
             shutil.copyfile(real, idx)          # reuse the stat cache: fast on big repos
         env = _env(root, store, idx)
         skip_paths = list(ALWAYS_EXCLUDE) + [e for e in exclude if e]
-        # tracked files: modified/deleted. No pathspec here: older git (e.g. Apple's) fails on a pathspec
-        # that matches nothing, which is every fresh `git init`. Excluded paths are dropped afterwards.
-        _git(["add", "-u"], root, env=env, timeout=30)
         _git(["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *skip_paths], root, env=env)
-        listed = _git(["ls-files", "-o", "--exclude-standard", "-z"], root, env=env)
-        add, skipped = [], []
-        for p in listed.decode(errors="replace").split("\0"):
-            if not p or any(p == x or p.startswith(x.rstrip("/") + "/") for x in skip_paths):
+
+        def ours(p):
+            return p and not any(p == x or p.startswith(x.rstrip("/") + "/") for x in skip_paths)
+
+        # Every file is filtered BEFORE git reads it: modified tracked files (-m), deleted ones (-d) and new
+        # untracked ones (-o). No `git add -u`: it would read tracked .env/keys/big files unfiltered.
+        modified = _git(["ls-files", "-m", "-z"], root, env=env).decode(errors="replace").split("\0")
+        deleted = set(_git(["ls-files", "-d", "-z"], root, env=env).decode(errors="replace").split("\0"))
+        untracked = _git(["ls-files", "-o", "--exclude-standard", "-z"], root, env=env).decode(errors="replace")
+        add, rm, skipped = [], [], []
+        for p in [x for x in modified if ours(x)] + [x for x in untracked.split("\0") if ours(x)]:
+            if p in deleted:
+                rm.append(p)
                 continue
             try:
                 big = os.path.getsize(os.path.join(root, p)) > MAX_FILE_BYTES
             except OSError:
                 continue
             (skipped if big or _sensitive(p) else add).append(p)
+        rm += [p for p in deleted if ours(p) and p not in rm]
+        if rm:
+            _git(["rm", "--cached", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], root, env=env,
+                 stdin="\0".join(rm).encode())
         if add:
             _git(["add", "--pathspec-from-file=-", "--pathspec-file-nul"], root, env=env, timeout=30,
                  stdin="\0".join(add).encode())
@@ -93,6 +104,29 @@ def snapshot(cwd, store, exclude=()):
         return {"git": False, "why": str(e)[:120]}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def prune(stores_dir, keep_days=7, keep=()):
+    """Delete per-session object stores not touched for keep_days (they only matter while a session runs
+    and for later analysis of it)."""
+    import time
+    cutoff = time.time() - keep_days * 86400
+    try:
+        names = os.listdir(stores_dir)
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        path = os.path.join(stores_dir, name)
+        if name in keep or not os.path.isdir(path):
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def diff(root, store, base_tree, cur_tree):

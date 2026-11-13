@@ -559,3 +559,141 @@ def test_hook_end_to_end_timeline(repo, tmp_path_factory):
     subprocess.run("echo 'c = 3' >> a.py", shell=True, cwd=root)           # external, no tool event
     out = hook(dict(c, hook_event_name="Stop"), env)
     assert out and "tests" in out["reason"]
+
+
+# --- b-5: production / test classification, the same for the whole policy ----------------------
+
+def test_classification():
+    assert rules.classify("src/auth/client.py", POL) == "prod"
+    assert rules.classify("tests/test_cache.py", POL) == "test"
+    assert rules.classify("src/auth/client_test.go", POL) == "test"
+    assert rules.classify("web/app.spec.ts", POL) == "test"
+    assert rules.classify("tests/fixtures/data.json", POL) == "ignored"
+    assert rules.classify("README.md", POL) == "ignored"
+
+
+def test_applying_advice_with_tests_is_one_prod_file():
+    """Live run 14.11: client.py + 2 test files after a consult counted as 3 files → extra consult."""
+    d = files(("src/a.py", 60, 0), ("tests/test_a.py", 30, 0), ("tests/test_b.py", 10, 0))
+    since = files(("src/a.py", 12, 3), ("tests/test_a.py", 8, 0), ("tests/test_b.py", 6, 0))
+    r3 = by_rule(run([prompt(1)], d, adv=[6], times=[5, 9], since=since, before=files(("src/a.py", 48, 0)))[0],
+                 "R3_high_risk")
+    assert r3["state"] == "pass" and r3["signals"]["since_advisor"]["files"] == 1
+
+
+def test_classification_is_symmetric_before_the_first_consult():
+    d = files(("src/a.py", 10, 0), ("tests/test_a.py", 30, 0), ("tests/test_b.py", 30, 0))
+    r3 = by_rule(run([prompt(1), edit(5)], d)[0], "R3_high_risk")
+    assert r3["state"] == "pass" and r3["signals"]["files"] == 1 and r3["signals"]["lines"] == 10
+
+
+def test_test_only_change_still_needs_tests_but_no_advisor():
+    d = files(("tests/test_a.py", 80, 0), ("tests/test_b.py", 5, 0), ("tests/test_c.py", 5, 0))
+    recs, _ = run([prompt(1), edit(5, "tests/test_a.py")], d, times=[5])
+    assert by_rule(recs, "R1_tests")["state"] == "triggered"
+    assert by_rule(recs, "R3_high_risk")["state"] == "pass"
+
+
+# --- tracked sensitive / large files are never read ----------------------------------------------
+
+def blob_in_store(root, store, content):
+    sha = subprocess.run(["git", "hash-object", "--stdin"], input=content, capture_output=True, text=True,
+                         cwd=root).stdout.strip()
+    env = dict(os.environ, GIT_OBJECT_DIRECTORY=store)
+    env.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+    return subprocess.run(["git", "cat-file", "-e", sha], cwd=root, env=env, capture_output=True).returncode == 0
+
+
+def test_tracked_secret_and_big_file_changes_are_not_read(repo, tmp_path_factory):
+    root, git = repo
+    (root / ".env").write_text("API_KEY=old\n")
+    (root / "big.dat").write_text("x\n")
+    git("add", "-f", ".env", "big.dat")
+    git("commit", "-qm", "tracked secrets")
+    store = str(tmp_path_factory.mktemp("store"))
+    base = repostate.snapshot(str(root), store)
+    secret = "API_KEY=new-super-secret\n"
+    (root / ".env").write_text(secret)
+    (root / "big.dat").write_text("y" * (repostate.MAX_FILE_BYTES + 10))
+    (root / "a.py").write_text("a\nb\n")
+    cur = repostate.snapshot(str(root), store)
+    paths = {f["path"] for f in repostate.diff(cur["root"], store, base["tree"], cur["tree"])}
+    assert paths == {"a.py"}
+    assert {".env", "big.dat"} <= set(cur["skipped"])
+    assert not blob_in_store(root, store, secret)
+
+
+def test_tracked_file_deletion_is_seen(repo, tmp_path_factory):
+    root, _ = repo
+    store = str(tmp_path_factory.mktemp("store"))
+    base = repostate.snapshot(str(root), store)
+    (root / "a.py").unlink()
+    cur = repostate.snapshot(str(root), store)
+    d = repostate.diff(cur["root"], store, base["tree"], cur["tree"])
+    assert [(f["path"], f["deleted"]) for f in d] == [("a.py", 1)]
+
+
+def test_prune_removes_old_stores_only(tmp_path):
+    old, new, keep = tmp_path / "old", tmp_path / "new", tmp_path / "cur"
+    for p in (old, new, keep):
+        p.mkdir()
+    os.utime(old, (0, 0))
+    os.utime(keep, (0, 0))
+    assert repostate.prune(str(tmp_path), keep_days=7, keep=["cur"]) == 1
+    assert not old.exists() and new.exists() and keep.exists()
+
+
+# --- the log never keeps secrets ------------------------------------------------------------------
+
+def test_hook_redacts_commands_heredocs_and_sensitive_edits(tmp_path):
+    env = dict(os.environ, SWARMSCOPE_DIR=str(tmp_path))
+    env.pop("SWARMSCOPE_POLICY", None)
+    c = {"session_id": "red", "cwd": str(tmp_path)}
+    cmd = ("export API_KEY=sk-live-0123456789abcdefghij && cat > conf.py <<'EOF'\nTOKEN = 'zzz-very-secret'\nEOF\n"
+           "curl -H 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123' x | tail -1")
+    hook(dict(c, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": cmd},
+              tool_response={"stdout": "password=hunter2secret ok"}), env)
+    hook(dict(c, hook_event_name="PreToolUse", tool_name="Edit",
+              tool_input={"file_path": str(tmp_path / ".env"), "old_string": "A=1", "new_string": "A=topsecret"}), env)
+    hook(dict(c, hook_event_name="PreToolUse", tool_name="Edit",
+              tool_input={"file_path": str(tmp_path / "app.py"), "old_string": "x",
+                          "new_string": "password = 'p4ssw0rd!!'"}), env)
+    text = (tmp_path / "events" / "red.jsonl").read_text()
+    for secret in ("sk-live", "zzz-very-secret", "ghp_abc", "hunter2", "topsecret", "p4ssw0rd"):
+        assert secret not in text, secret
+    assert "lines not logged" in text and "tail -1" in text
+
+
+# --- finalizer -------------------------------------------------------------------------------------
+
+def test_finalize_closes_open_decisions_once():
+    p = pol(mode="enforce")
+    log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
+    ev = [prompt(1), edit(5)]
+    first = rules.finalize(log, ev, p, adv_times=[], now=50.0)
+    assert {r["rule"]: r["outcome"] for r in first} == {"R1_tests": "not_observed", "R3_high_risk": "not_observed"}
+    assert all(r["final"] and r["cause"] == "session ended without the action" for r in first)
+    assert rules.finalize(log + first, ev, p, adv_times=[], now=60.0) == []
+
+
+def test_finalize_sees_actions_after_the_last_stop():
+    p = pol(mode="enforce")
+    log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
+    ev = [prompt(1), edit(5), bash(12, "pytest -q", out="3 passed")]
+    out = {r["rule"]: r for r in rules.finalize(log, ev, p, adv_times=[11], now=50.0)}
+    assert out["R3_high_risk"]["outcome"] == "observed" and out["R1_tests"]["result"] == "passed"
+
+
+def test_hook_writes_overhead(repo, tmp_path_factory):
+    root, _ = repo
+    (root / ".claude").mkdir()
+    (root / ".claude" / "swarmscope-policy.json").write_text('{"mode": "observe"}')
+    sw = tmp_path_factory.mktemp("sw")
+    env = dict(os.environ, SWARMSCOPE_DIR=str(sw))
+    env.pop("SWARMSCOPE_POLICY", None)
+    c = {"session_id": "ovh", "cwd": str(root)}
+    hook(dict(c, hook_event_name="UserPromptSubmit", prompt="go"), env)
+    hook(dict(c, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": "ls"}), env)
+    hook(dict(c, hook_event_name="Stop"), env)
+    rows = rules.load_log(str(sw / "overhead" / "ovh.jsonl"))
+    assert [r["event"] for r in rows] == ["PostToolUse", "Stop"] and "gate_ms" in rows[-1]
