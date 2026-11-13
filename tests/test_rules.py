@@ -1,0 +1,347 @@
+"""Rules Engine checks on synthetic events. The three failure types that would invalidate the A/B/C
+experiment: missed file changes, failed tests counted as passed, endless Stop loops."""
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import repostate  # noqa: E402
+import rules  # noqa: E402
+
+POL = json.loads(json.dumps(rules.DEFAULTS))
+
+
+def pol(**kw):
+    p = json.loads(json.dumps(POL))
+    for k, v in kw.items():
+        if isinstance(v, dict):
+            p[k].update(v)
+        else:
+            p[k] = v
+    return p
+
+
+def prompt(ts):
+    return {"event": "UserPromptSubmit", "prompt": "do it", "ts": ts}
+
+
+def edit(ts, path="src/app.py"):
+    return {"event": "PostToolUse", "tool_name": "Edit", "arg": path, "ts": ts}
+
+
+def bash(ts, cmd, err=None, out=None):
+    e = {"event": "PostToolUseFailure" if err else "PostToolUse", "tool_name": "Bash", "cmd": cmd, "arg": cmd[:80],
+         "ts": ts}
+    if err:
+        e["err"] = err
+    if out:
+        e["out"] = out
+    return e
+
+
+def files(*specs):
+    return [{"path": p, "added": a, "deleted": d, "binary": False} for p, a, d in specs]
+
+
+def run(events, diff, p=None, adv=(), log=(), stop=None, has_tests=True, now=100.0):
+    return rules.gate(events, stop or {}, p or pol(), diff, list(adv), list(log), has_tests, "sess1234", now=now,
+                      baseline_ts=0)
+
+
+def by_rule(records, rule):
+    return [r for r in records if r.get("kind") == "decision" and r["rule"] == rule][-1]
+
+
+# --- 1. file changes are not missed -----------------------------------------------------
+
+@pytest.fixture
+def repo(tmp_path):
+    def git(*a):
+        subprocess.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "a.py").write_text("a\n")
+    (tmp_path / ".gitignore").write_text("*.log\n")
+    git("add", ".")
+    git("commit", "-qm", "init")
+    return tmp_path, git
+
+
+def test_snapshot_sees_untracked_staged_committed_and_bash_changes(repo):
+    root, git = repo
+    (root / "a.py").write_text("a\npre-existing\n")          # dirty before the session: not ours
+    base = repostate.snapshot(str(root))
+    (root / "new.py").write_text("x = 1\ny = 2\n")            # untracked
+    (root / "s.py").write_text("s\n")
+    git("add", "s.py")                                        # staged
+    (root / "c.py").write_text("c\n")
+    git("add", "c.py")
+    git("commit", "-qm", "agent commit")                      # committed by the agent
+    subprocess.run("echo bash >> a.py", shell=True, cwd=root)  # changed by Bash
+    (root / "x.log").write_text("ignored")
+    index_before = (root / ".git" / "index").read_bytes()
+    cur = repostate.snapshot(str(root))
+    d = {f["path"]: f for f in repostate.diff(cur["root"], base["tree"], cur["tree"])}
+    assert set(d) == {"a.py", "new.py", "s.py", "c.py"}
+    assert d["a.py"]["added"] == 1                            # only the Bash line, not the pre-existing one
+    assert (root / ".git" / "index").read_bytes() == index_before
+
+
+def test_reverted_change_nets_out(repo):
+    root, _ = repo
+    base = repostate.snapshot(str(root))
+    (root / "a.py").write_text("changed\n")
+    (root / "a.py").write_text("a\n")
+    cur = repostate.snapshot(str(root))
+    assert repostate.diff(cur["root"], base["tree"], cur["tree"]) == []
+
+
+def test_not_a_repo(tmp_path):
+    assert repostate.snapshot(str(tmp_path))["git"] is False
+
+
+def test_bash_only_change_dates_last_change_by_bash():
+    ev = [prompt(1), bash(5, "pytest -q", out="3 passed"), bash(8, "sed -i s/a/b/ src/app.py")]
+    recs, _ = run(ev, files(("src/app.py", 1, 1)))
+    r1 = by_rule(recs, "R1_tests")
+    assert r1["state"] == "triggered" and r1["signals"]["last_change"] == 8
+
+
+# --- 2. failed tests are never counted as passed ------------------------------------------
+
+@pytest.mark.parametrize("test_event,expected", [
+    (bash(10, "pytest -q", err="exit code 1: 2 failed"), "failed"),
+    (bash(10, "pytest -q || true", out="2 failed, 5 passed"), "failed"),
+    (bash(10, "pytest -q || true"), "unknown"),
+    (bash(10, "pytest -q | tail -5", out="all good"), "unknown"),
+    (bash(10, "npm test", out="Tests: 1 failed, 9 passed"), "failed"),
+])
+def test_bad_or_unknown_test_runs_trigger_r1(test_event, expected):
+    recs, _ = run([prompt(1), edit(5), test_event], files(("src/app.py", 3, 1)))
+    r1 = by_rule(recs, "R1_tests")
+    assert r1["state"] == "triggered"
+    assert r1["signals"]["observed_test_result"] == expected
+
+
+def test_test_before_last_edit_does_not_count():
+    recs, _ = run([prompt(1), bash(3, "pytest -q", out="7 passed"), edit(5)], files(("src/app.py", 3, 1)))
+    assert by_rule(recs, "R1_tests")["signals"]["observed_test_result"] == "none"
+
+
+def test_passing_targeted_run_passes_but_records_scope():
+    recs, _ = run([prompt(1), edit(5), bash(6, "pytest tests/test_x.py -q", out="2 passed")],
+                  files(("src/app.py", 3, 1)))
+    r1 = by_rule(recs, "R1_tests")
+    assert r1["state"] == "pass" and r1["signals"]["test_scope"] == "targeted"
+    assert r1["signals"]["verified_test_result"] == "not_run"
+
+
+def test_no_tests_in_project_skips_r1():
+    recs, _ = run([prompt(1), edit(5)], files(("src/app.py", 3, 1)), has_tests=False)
+    assert by_rule(recs, "R1_tests")["state"] == "skipped"
+
+
+def test_docs_only_change_needs_nothing():
+    recs, _ = run([prompt(1), edit(5, "README.md")], files(("README.md", 200, 10), ("docs/x.md", 80, 0)))
+    assert by_rule(recs, "R1_tests")["state"] == "pass"
+    assert by_rule(recs, "R3_high_risk")["state"] == "pass"
+
+
+# --- R2 repeat error ----------------------------------------------------------------------
+
+def test_repeat_error_without_edit_triggers():
+    ev = [prompt(1), bash(2, "pytest -q", err="fixture 'token' not found at line 12"),
+          bash(4, "pytest -q", err="fixture 'token' not found at line 14")]
+    r2 = by_rule(run(ev, [])[0], "R2_repeat_error")
+    assert r2["state"] == "triggered" and r2["signals"]["edits_between"] == 0
+
+
+def test_repeat_error_records_edits_between():
+    ev = [prompt(1), bash(2, "pytest -q", err="boom 1"), edit(3), bash(4, "pytest -q", err="boom 2")]
+    assert by_rule(run(ev, [])[0], "R2_repeat_error")["signals"]["edits_between"] == 1
+
+
+def test_success_resets_repeat_error():
+    ev = [prompt(1), bash(2, "pytest -q", err="boom"), bash(3, "pytest -q", err="boom"),
+          bash(4, "pytest -q", out="5 passed")]
+    assert by_rule(run(ev, [])[0], "R2_repeat_error")["state"] == "pass"
+
+
+def test_advisor_after_first_error_satisfies_r2():
+    ev = [prompt(1), bash(2, "pytest -q", err="boom"), bash(4, "pytest -q", err="boom")]
+    assert by_rule(run(ev, [], adv=[3])[0], "R2_repeat_error")["state"] == "pass"
+
+
+def test_subagent_errors_are_ignored():
+    ev = [prompt(1)] + [dict(bash(t, "rg x", err="EACCES posix_spawn rg"), agent_id="a1") for t in (2, 3, 4)]
+    assert by_rule(run(ev, [])[0], "R2_repeat_error")["state"] == "pass"
+
+
+# --- R3 high risk -----------------------------------------------------------------------------
+
+def test_three_files_trigger_r3():
+    d = files(("src/a.py", 2, 0), ("src/b.py", 2, 0), ("src/c.py", 2, 0))
+    r3 = by_rule(run([prompt(1), edit(5)], d)[0], "R3_high_risk")
+    assert r3["state"] == "triggered" and "3 files" in r3["reason"]
+
+
+def test_fifty_lines_trigger_r3_and_thresholds_are_configurable():
+    d = files(("src/a.py", 40, 10))
+    assert by_rule(run([prompt(1), edit(5)], d)[0], "R3_high_risk")["state"] == "triggered"
+    p = pol(risk={"min_lines": 100})
+    assert by_rule(run([prompt(1), edit(5)], d, p=p)[0], "R3_high_risk")["state"] == "pass"
+
+
+def test_small_change_in_critical_module_triggers_r3():
+    r3 = by_rule(run([prompt(1), edit(5, "src/auth/session.py")], files(("src/auth/session.py", 1, 1)))[0],
+                 "R3_high_risk")
+    assert r3["state"] == "triggered" and "critical" in r3["reason"]
+
+
+def test_small_routine_change_left_to_sonnet():
+    assert by_rule(run([prompt(1), edit(5)], files(("src/a.py", 3, 1)))[0], "R3_high_risk")["state"] == "pass"
+
+
+def test_advisor_before_first_edit_does_not_satisfy_r3_but_after_does():
+    d = files(("src/a.py", 60, 0))
+    assert by_rule(run([prompt(1), edit(5)], d, adv=[3])[0], "R3_high_risk")["state"] == "triggered"
+    assert by_rule(run([prompt(1), edit(5)], d, adv=[7])[0], "R3_high_risk")["state"] == "pass"
+
+
+def test_no_git_skips_r3():
+    assert by_rule(run([prompt(1), edit(5)], None)[0], "R3_high_risk")["state"] == "skipped"
+
+
+# --- 3. no endless Stop loops; modes ------------------------------------------------------------
+
+BIG = files(("src/a.py", 60, 0))
+
+
+def test_observe_never_outputs():
+    recs, out = run([prompt(1), edit(5)], BIG, p=pol(mode="observe"))
+    assert out is None and by_rule(recs, "R3_high_risk")["state"] == "triggered"
+
+
+def test_advise_talks_to_user_only():
+    _, out = run([prompt(1), edit(5)], BIG, p=pol(mode="advise"))
+    assert set(out) == {"systemMessage"}
+
+
+def test_enforce_blocks_at_most_max_times_per_turn():
+    p = pol(mode="enforce")
+    ev, log, outs = [prompt(1), edit(5)], [], []
+    for i in range(4):
+        recs, out = run(ev, BIG, p=p, log=log, now=10.0 + i, stop={"stop_hook_active": i > 0})
+        log += recs
+        outs.append(out)
+    assert [o and o.get("decision") for o in outs] == ["block", "block", None, None]
+    assert by_rule(log, "R3_high_risk")["state"] == "limited"
+
+
+def test_block_budget_resets_on_new_user_turn():
+    p = pol(mode="enforce")
+    log = []
+    for i in range(3):
+        recs, _ = run([prompt(1), edit(5)], BIG, p=p, log=log, now=10.0 + i)
+        log += recs
+    _, out = run([prompt(1), edit(5), prompt(50), edit(55)], BIG, p=p, log=log, now=60.0)
+    assert out and out["decision"] == "block"
+
+
+def test_background_subagent_defers_gate():
+    stop = {"background_tasks": [{"id": "x", "type": "local_agent", "status": "running"}]}
+    recs, out = run([prompt(1), edit(5)], BIG, p=pol(mode="enforce"), stop=stop)
+    assert out is None and by_rule(recs, "R3_high_risk")["state"] == "deferred"
+
+
+def test_long_running_shell_and_teammate_do_not_defer():
+    stop = {"background_tasks": [{"id": "m", "type": "local_bash", "status": "running"},
+                                 {"id": "t", "type": "in_process_teammate", "status": "running"}]}
+    _, out = run([prompt(1), edit(5)], BIG, p=pol(mode="enforce"), stop=stop)
+    assert out and out["decision"] == "block"
+
+
+# --- decision life cycle ------------------------------------------------------------------------
+
+def test_outcomes_observed_and_not_observed():
+    p = pol(mode="enforce")
+    log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
+    recs, _ = run([prompt(1), edit(5)], BIG, p=p, log=log, adv=[12], now=20.0)
+    oc = {o["rule"]: o for o in recs if o.get("kind") == "outcome"}
+    assert oc["R3_high_risk"]["outcome"] == "observed"
+    assert oc["R1_tests"]["outcome"] == "not_observed"             # no test run after the request
+    recs, _ = run([prompt(1), edit(5)], BIG, p=p, log=log, now=20.0)
+    oc = {o["rule"]: o for o in recs if o.get("kind") == "outcome"}
+    assert oc["R3_high_risk"]["outcome"] == "not_observed" and "cause" not in oc["R3_high_risk"]
+
+
+def test_limited_decision_gets_cause_not_blamed_on_sonnet():
+    p = pol(mode="enforce", max_blocks_per_turn=0)
+    log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
+    recs, _ = run([prompt(1), edit(5)], BIG, p=p, log=log, now=20.0)
+    oc = [r for r in recs if r.get("kind") == "outcome"][0]
+    assert oc["outcome"] == "not_observed" and "block limit" in oc["cause"]
+
+
+def test_unverified_without_transcript():
+    p = pol(mode="enforce")
+    log, _ = run([prompt(1), edit(5)], BIG, p=p, now=10.0)
+    recs, _ = rules.gate([prompt(1), edit(5)], {}, p, BIG, [], log, True, "sess1234", now=20.0, transcript_ok=False)
+    oc = {o["rule"]: o for o in recs if o.get("kind") == "outcome"}
+    assert oc["R3_high_risk"]["outcome"] == "unverified"
+
+
+def test_decision_records_carry_id_policy_version_and_gate_state():
+    recs, _ = run([prompt(1), edit(5)], BIG, p=pol(mode="enforce"))
+    d = by_rule(recs, "R3_high_risk")
+    assert d["id"].startswith("sess1234-") and d["policy_version"] == rules.POLICY_VERSION
+    assert {"mode", "stop_hook_active", "blocks_this_turn", "background_agents"} <= set(d["gate"])
+
+
+# --- end to end through hook.py -------------------------------------------------------------------
+
+def hook(payload, env):
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "hook.py")], input=json.dumps(payload),
+                       capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def test_hook_end_to_end_enforce(repo, tmp_path_factory):
+    root, _ = repo
+    (root / ".claude").mkdir()
+    (root / ".claude" / "swarmscope-policy.json").write_text(json.dumps({"mode": "enforce"}))
+    (root / "tests").mkdir()
+    env = dict(os.environ, SWARMSCOPE_DIR=str(tmp_path_factory.mktemp("sw")))
+    env.pop("SWARMSCOPE_POLICY", None)
+    common = {"session_id": "e2e-sess", "cwd": str(root)}
+    assert hook(dict(common, hook_event_name="UserPromptSubmit", prompt="go"), env) is None
+    (root / "src").mkdir()
+    (root / "src" / "big.py").write_text("x = 1\n" * 60)               # written via "Bash"
+    hook(dict(common, hook_event_name="PostToolUse", tool_name="Bash",
+              tool_input={"command": "python gen.py"}, tool_response={"stdout": "ok"}), env)
+    out1 = hook(dict(common, hook_event_name="Stop", stop_hook_active=False), env)
+    out2 = hook(dict(common, hook_event_name="Stop", stop_hook_active=True), env)
+    out3 = hook(dict(common, hook_event_name="Stop", stop_hook_active=True), env)
+    assert out1["decision"] == "block" and "advisor" in out1["reason"] and "tests" in out1["reason"]
+    assert out2["decision"] == "block" and out3 is None
+    log = rules.load_log(os.path.join(env["SWARMSCOPE_DIR"], "decisions", "e2e-sess.jsonl"))
+    assert any(r.get("kind") == "outcome" and r["outcome"] == "not_observed" for r in log)
+
+
+def test_hook_fails_open_on_broken_policy_and_is_off_without_one(repo, tmp_path_factory):
+    root, _ = repo
+    env = dict(os.environ, SWARMSCOPE_DIR=str(tmp_path_factory.mktemp("sw")))
+    env.pop("SWARMSCOPE_POLICY", None)
+    common = {"session_id": "s2", "cwd": str(root)}
+    hook(dict(common, hook_event_name="UserPromptSubmit", prompt="go"), env)
+    assert not os.path.exists(os.path.join(env["SWARMSCOPE_DIR"], "baseline"))     # engine off
+    (root / ".claude").mkdir()
+    (root / ".claude" / "swarmscope-policy.json").write_text("{not json")
+    (root / "big.py").write_text("x\n" * 99)
+    assert hook(dict(common, hook_event_name="Stop"), env) is None                   # observe default, no crash

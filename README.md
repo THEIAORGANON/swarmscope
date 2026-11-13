@@ -61,6 +61,28 @@ A terminal of about 80×53 fits everything.
 
 Useful flags: `--title`, `--window N` (timeline seconds), `--layout classic`.
 
+## Policy engine (experimental, off by default)
+
+`rules.py` checks three rules at every Stop and writes each decision to `decisions/<session>.jsonl`. Decisions show up in the session log with `⚑`.
+
+- **R1 tests**: code changed, so a test run has to pass after the last change. A run whose exit code is masked (`|| true`, a pipe) counts as unknown. So does an interrupted run. If the output reports failures, the run counts as failed.
+- **R2 repeat error**: the same normalised error showed up twice, the action never succeeded in between, and the advisor was not called.
+- **R3 high risk**: 3+ source files, 50+ changed lines, or a critical path (auth, security, migrations…), and no advisor call after the code changed. Docs and test data don't count.
+
+The changes come from the repo itself, not from tool calls. The engine snapshots the working tree when the session starts and diffs it at Stop, so new, staged, committed and Bash-made changes are all counted. Edits that were there before the session are not.
+
+Turn it on per project with `.claude/swarmscope-policy.json`:
+
+```json
+{"mode": "observe", "risk": {"min_files": 3, "min_lines": 50}, "test_command": "pytest -q"}
+```
+
+- `observe` logs decisions only.
+- `advise` also shows them to you, not to the model.
+- `enforce` sends Sonnet back to work with the reason.
+
+Enforce blocks at most twice per turn and waits while background subagents run. If anything inside the engine fails, Claude stops normally. Run the checks with `python -m pytest tests`.
+
 ## Prompting the advisor
 
 Sonnet chooses when to call the advisor. This line in `CLAUDE.md` makes the three checkpoints more likely:

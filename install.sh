@@ -20,7 +20,8 @@ for ev, matcher in [("UserPromptSubmit", None), ("PreToolUse", "*"), ("PostToolU
     groups = hooks.setdefault(ev, [])
     if any(h.get("command") == hook for g in groups for h in g.get("hooks", [])):
         continue
-    g = {"hooks": [{"type": "command", "command": hook, "timeout": 5}]}
+    # Stop may snapshot the repo for the policy engine (only if the project enables it)
+    g = {"hooks": [{"type": "command", "command": hook, "timeout": 30 if ev == "Stop" else 5}]}
     if matcher: g = {"matcher": matcher, **g}
     groups.append(g)
 if s.get("statusLine") and "swarmscope" not in json.dumps(s["statusLine"]):
@@ -36,7 +37,7 @@ diff -u "${SETTINGS}" "$TMP" 2>/dev/null || diff -u /dev/null "$TMP" || true
 if [ $DRY = 1 ]; then rm -f "$TMP"; echo "(dry run — nothing changed)"; exit 0; fi
 
 mkdir -p "$DEST" "$HOME/.claude/agents" "$HOME/.local/bin"
-cp "$SRC"/{common.py,costs.py,hook.py,statusline.py,dashboard.py,swarmscope} "$DEST/"
+cp "$SRC"/{common.py,costs.py,repostate.py,rules.py,hook.py,statusline.py,dashboard.py,swarmscope} "$DEST/"
 chmod +x "$DEST"/*.py "$DEST/swarmscope"
 ln -sf "$DEST/swarmscope" "$HOME/.local/bin/swarmscope"
 

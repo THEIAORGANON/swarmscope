@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (advisor_activity, advisor_name, build_state, latest_session_id,  # noqa: E402
                     load_events, load_meta, session_file, subagent_model, pretty_model)
 from costs import session_costs  # noqa: E402
+from common import BASE  # noqa: E402
+import rules  # noqa: E402
 
 from rich import box  # noqa: E402
 from rich.align import Align  # noqa: E402
@@ -999,6 +1001,30 @@ def demo_events(t0, now):
     return out, {"calls": len(times), "last": allv[-1] if allv else "", "times": times, "all": allv}
 
 
+RULE_SHORT = {"R1_tests": "tests", "R2_repeat_error": "repeat", "R3_high_risk": "risk"}
+ACTION_SHORT = {"run_tests": "run tests", "consult_advisor": "advisor"}
+
+
+def decision_entries(sid):
+    """Session-log lines for the policy engine: only decisions that asked for something, and outcomes."""
+    out = []
+    for r in rules.load_log(str(BASE / "decisions" / f"{sid}.jsonl")):
+        rule = RULE_SHORT.get(r.get("rule"), r.get("rule", "?"))
+        if r.get("kind") == "decision" and r.get("action") and r.get("state") not in ("pass", "skipped"):
+            state = {"triggered": "noted", "requested": "required", "advised": "advised",
+                     "deferred": "deferred", "limited": "limit hit"}.get(r["state"], r["state"])
+            out.append((r["ts"], "policy", f"{rule} → {ACTION_SHORT.get(r['action'], r['action'])} [{state}] · {r.get('reason', '')}",
+                        "gate" if r["state"] in ("requested", "advised") else "gate_miss"))
+        elif r.get("kind") == "outcome":
+            what = ACTION_SHORT.get(r.get("action"), r.get("action"))
+            o = r.get("outcome")
+            txt = {"observed": f"{rule}: {what} done" + (f" ({r['result']})" if r.get("result") else ""),
+                   "not_observed": f"{rule}: {what} not seen" + (f" · {r['cause']}" if r.get("cause") else ""),
+                   "unverified": f"{rule}: {what} unverified · {r.get('cause', '')}"}.get(o, f"{rule}: {o}")
+            out.append((r["ts"], "policy", txt, "gate" if o == "observed" else "gate_miss"))
+    return out
+
+
 def demo_costs(st, a):
     """Made-up but plausible per-model spend for the demo, growing with activity."""
     def b(usd):
@@ -1061,6 +1087,9 @@ def main():
         cache["tp"] = meta.get("transcript_path") or st["transcript"]
         adv = advisor_name()
         a = advisor_activity(meta.get("transcript_path") or st["transcript"]) if adv else {"calls": 0, "last": "", "times": []}
+        extra = decision_entries(sid) if sid else []
+        if extra:
+            st = dict(st, log=sorted(st["log"] + extra, key=lambda x: x[0]))
         c = session_costs(cache["tp"], adv)
         st["cost"] = dict(c, cc_usd=meta.get("cost")) if c else ({"cc_usd": meta["cost"]} if meta.get("cost") is not None else {})
         return meta.get("model") or "lead", adv, st, a
