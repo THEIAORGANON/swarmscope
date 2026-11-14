@@ -50,6 +50,8 @@ def main():
     d = json.load(sys.stdin)
     sid = d.get("session_id") or "unknown"
     ev = {"ts": time.time(), "event": d.get("hook_event_name")}
+    if ev["event"] in ("UserPromptSubmit", "SessionStart") and d.get("cwd"):
+        ev["cwd"] = d["cwd"]                    # which project this session works on (window title)
     for k in ("tool_name", "tool_use_id", "agent_id", "agent_type", "source",
               "transcript_path", "agent_transcript_path"):
         if d.get(k):

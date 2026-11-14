@@ -733,6 +733,32 @@ def render(console, lead, adv, st, a, frame, now, adv_ts, window, rnd):
 
 # --- table layout (default): readable first, animation only marks change ------------
 
+def watched_project(sid=None):
+    """Name of the project the watched session works on (not the folder the dashboard runs from):
+    the session's cwd from the hook, else the folder that holds a project-local .swarmscope."""
+    if sid:
+        for e in load_events(sid):
+            if e.get("cwd"):
+                return os.path.basename(e["cwd"].rstrip("/"))
+    if BASE.name == ".swarmscope":
+        return BASE.parent.name
+    return None
+
+
+def window_title(custom, sid=None):
+    """'swarmscope · <project>' — app name, then what it watches; --title overrides it verbatim."""
+    if custom:
+        return custom
+    proj = watched_project(sid)
+    return f"swarmscope · {proj}" if proj else "swarmscope"
+
+
+def set_window_title(title):
+    # OSC 0 sets both window and tab title (Terminal.app, iTerm2, Ghostty, tmux with set-titles)
+    sys.stdout.write(f"\033]0;{title}\007")
+    sys.stdout.flush()
+
+
 def project_name(title):
     if title and " — " in title:
         return title.split(" — ")[0]
@@ -1215,11 +1241,10 @@ def main():
     t0 = time.time() - (args.start if args.demo else 0)
     rnd = random.Random()
 
-    title = args.title or ("swarmscope" if args.demo else f"swarmscope — {os.path.basename(os.getcwd())}")
-    if title and args.snapshot is None:
-        # OSC 0 sets both window and tab title (Terminal.app, iTerm2, Ghostty, tmux with set-titles)
-        sys.stdout.write(f"\033]0;{title}\007")
-        sys.stdout.flush()
+    title = args.title or ("swarmscope · demo" if args.demo else window_title(None, args.session or latest_session_id()))
+    shown_title = {"t": title}
+    if args.snapshot is None:
+        set_window_title(title)
 
     cache = {"key": None, "st": None}
     launch = {"t": time.time()}
@@ -1240,6 +1265,10 @@ def main():
                 key = (sid, 0)
         if key != cache["key"] or cache["st"] is None:
             cache["key"], cache["st"] = key, build_state(load_events(sid)) if sid else build_state([])
+            new_title = window_title(args.title, sid)
+            if args.snapshot is None and new_title != shown_title["t"]:   # a new session started elsewhere
+                shown_title["t"] = new_title
+                set_window_title(new_title)
         st = cache["st"]
         meta = load_meta(sid) if sid else {}
         cache["tp"] = meta.get("transcript_path") or st["transcript"]
