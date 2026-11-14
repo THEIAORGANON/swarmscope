@@ -377,10 +377,40 @@ def advisor_panel(adv, a, st, height, frame, now, adv_ts, rnd, gates=None):
                  padding=(0, 1), height=height, width=LEFT_W)
 
 
-def timeline_panel(st, a_times, width, now, window, frame, roomy=False):
+def fmt_dur(sec):
+    """56s · 3m48 · 1h02 — fits a 4-character column."""
+    sec = max(0, int(sec))
+    if sec < 100:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}"
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}"
+
+
+def session_end(st, now):
+    """Live sessions end at `now`; finished ones at their last event (so durations stop growing)."""
+    if st.get("working") or not st.get("log"):
+        return now
+    return min(now, max(x[0] for x in st["log"]))
+
+
+def timeline_panel(st, a_times, width, now, window, frame, roomy=False, fit=True):
+    """fit=True: the whole session from its first event to now/end, so a finished session never shows
+    an empty strip. Policy decisions get their own lane: ⚑ asked, ✓ action seen, ✕ not seen."""
+    if fit and st.get("log"):
+        t_start = st["started"]
+        t_end = session_end(st, now)
+        window = max(20.0, (t_end - t_start) * 1.03)
+        now_ref = t_start + window
+    else:
+        now_ref = now
+    return _timeline(st, a_times, width, now, now_ref, window, frame, roomy, fit)
+
+
+def _timeline(st, a_times, width, now, now_ref, window, frame, roomy, fit):
     label_w = 8
     cols = max(10, width - 4 - label_w - 1)
-    t0 = now - window
+    t0 = now_ref - window
 
     def cell(ts):
         return int((ts - t0) / window * cols)
@@ -388,7 +418,7 @@ def timeline_panel(st, a_times, width, now, window, frame, roomy=False):
     def lane(name, color, spans=(), marks=(), mark_ch="█", diamonds=(), errs=()):
         chars = [("─", FAINT)] * cols
         for s, e in spans:
-            a, b = max(0, cell(s)), min(cols - 1, cell(e if e else now))
+            a, b = max(0, cell(s)), min(cols - 1, cell(e if e else min(now, now_ref)))
             for x in range(a, b + 1):
                 chars[x] = ("━", mix(color, FAINT, 0.55))
         for ts in marks:
@@ -404,7 +434,8 @@ def timeline_panel(st, a_times, width, now, window, frame, roomy=False):
             if 0 <= x < cols:
                 fresh = now - ts < 2.5
                 chars[x] = ("◆", (WHITE if blink(frame, 2) else PURPLE) if fresh else PURPLE)
-        chars[-1] = ("▏", mix(FG, FAINT, pulse(frame, 0.6)))
+        if st.get("working") or not fit:
+            chars[-1] = ("▏", mix(FG, FAINT, pulse(frame, 0.6)))
         t = Text(f"{name[:label_w]:<{label_w}} ", style=color)
         for ch, col in chars:
             t.append(ch, style=col)
@@ -413,7 +444,18 @@ def timeline_panel(st, a_times, width, now, window, frame, roomy=False):
     rows = [lane("sonnet", ORANGE, st["work_spans"], [m[0] for m in st["lead_marks"]], "▮",
                  errs=st["err_marks"])]
     rows.append(lane("opus", PURPLE, diamonds=a_times))
-    if roomy:
+    pm = st.get("policy_marks") or []
+    if pm:
+        chars = [("┈", FAINT)] * cols
+        for ts, ch, col in pm:
+            x = cell(ts)
+            if 0 <= x < cols:
+                chars[x] = (ch, col)
+        t = Text(f"{'policy':<{label_w}} ", style=DIM)
+        for ch, col in chars:
+            t.append(ch, style=col)
+        rows.append(t)
+    if roomy and st["sub_order"] and not fit:
         sep = Text(f"{'swarm':<{label_w}} ", style=DIM)
         sep.append("┈" * cols, style=FAINT)
         rows.append(sep)
@@ -425,11 +467,17 @@ def timeline_panel(st, a_times, width, now, window, frame, roomy=False):
     for q in range(5):
         ticks[min(cols - 1, q * (cols - 1) // 4)] = "┴"
     axis.append("".join(ticks), style=FAINT)
-    if roomy:
+    if roomy and not fit:
         rows.append(Text(""))
     lab = Text(" " * (label_w + 1))
-    left, right = f"-{window:.0f}s", "now"
-    lab.append(left + " " * max(1, cols - len(left) - len(right)) + right, style=DIM)
+    if fit:
+        mid = fmt_dur(window / 2)
+        left, right = "0s", ("now" if st.get("working") else f"end {fmt_dur(session_end(st, now) - st['started'])}")
+        gap = cols - len(left) - len(right) - len(mid)
+        lab.append(left + " " * max(1, gap // 2) + mid + " " * max(1, gap - gap // 2) + right, style=DIM)
+    else:
+        left, right = f"-{window:.0f}s", "now"
+        lab.append(left + " " * max(1, cols - len(left) - len(right)) + right, style=DIM)
     return Panel(Group(*rows, axis, lab), title=Text(" timeline ", style=FG), title_align="left",
                  box=box.SQUARE, border_style=FAINT, padding=(0, 1))
 
@@ -492,7 +540,8 @@ def log_icon(tag, text, kind):
 
 def log_panel(st, height, now=0, gates=None, launch=None):
     log = list(st["log"])
-    for name, (state, ts) in (gates or {}).items():
+    # with the policy engine on, its decisions replace the old observed checks (they can disagree)
+    for name, (state, ts) in ({} if st.get("policy_marks") else (gates or {})).items():
         if state == "passed" and ts:
             log.append((ts, "check", f"advisor called {GATE_WORDS[name]}", "gate"))
         elif state == "missed" and ts:
@@ -568,6 +617,14 @@ GAP = 4
 
 
 def compute_gates(st, a_times, now):
+    g = _compute_gates(st, a_times, now)
+    if not st.get("working") and st.get("log"):
+        # the session is over: nothing is still "waiting" for the advisor
+        g = {k: (("missed", v[1]) if v[0] == "waiting" else v) for k, v in g.items()}
+    return g
+
+
+def _compute_gates(st, a_times, now):
     """Advisor gates inferred from events: idle / waiting / passed / missed, with the time it happened.
     (Observed, not enforced — enforcement comes with the P0 hooks.)"""
     edits = [e[0] for e in st["edits"]] or [m[0] for m in st["lead_marks"] if m[1] in ("Edit", "Write", "MultiEdit")]
@@ -751,14 +808,14 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     else:
         sstate, sstyle = "○ idle", DIM
     span = st["work_spans"][-1] if st["work_spans"] else None
-    tsec = f"{(span[1] or now) - span[0]:.0f}s" if span else "—"
+    tsec = fmt_dur((span[1] or now) - span[0]) if span else "—"
     row("sonnet", ORANGE, lead, sstate, sstyle, lm, st["tool_total"], tsec,
         st["last_tool"] or "—", FG, now - lm[-1] if lm else 99, usd(cost.get("lead")))
 
     # opus
     adv_age = now - a["times"][-1] if a["times"] else 99
     pending = a.get("pending")
-    waiting = any(v[0] == "waiting" for v in gates.values())
+    waiting = st.get("working") and any(v[0] == "waiting" for v in gates.values())
     if not adv:
         ostate, ostyle = "off", DIM
     elif pending or adv_age < 2.5:
@@ -767,12 +824,13 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
         ostate, ostyle = "◇ pending", (f"bold {PURPLE}" if blink(frame, 4) else PURPLE)
     else:
         ostate, ostyle = "on call", PURPLE
-    pend = [n for n, v in gates.items() if v[0] == "waiting"]
+    pend = [n for n, v in gates.items() if v[0] == "waiting"] if st.get("working") else []
     durs = a.get("durations") or []
     if pending:
         otxt, osty = f"thinking {now - a['times'][-1]:.0f}s…", PURPLE
     elif a.get("redacted"):
-        otxt, osty = f"{a['calls']} consults · advice encrypted, Ctrl+O in Claude Code", PURPLE
+        otxt, osty = (f"{a['calls']} consult{'s' if a['calls'] != 1 else ''} · advice encrypted, "
+                      "Ctrl+O in Claude Code"), PURPLE
     elif pend and adv_age >= 2.5:
         otxt, osty = "needed: " + {"PLAN": "before plan", "ERR×2": "after error x2", "DONE": "before done"}[pend[0]], PURPLE
     elif a["last"]:
@@ -780,7 +838,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     else:
         otxt, osty = "silent on routine turns", DIM
     row("opus", PURPLE, adv or "—", ostate, ostyle, a["times"], a["calls"],
-        f"{sum(durs) / len(durs):.0f}s" if durs else "—", otxt, osty, adv_age,
+        fmt_dur(sum(durs) / len(durs)) if durs else "—", otxt, osty, adv_age,
         usd(cost.get("advisor"), (cost.get("advisor") or {}).get("source") == "estimate"))
 
     # haiku swarm
@@ -796,7 +854,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
         now_txt = sa["desc"] or sa["last"] or "—"
         if sa.get("errors"):
             now_txt = f"✕{sa['errors']} · " + now_txt
-        row(sa["type"], BLUE, "", state, sty, sa["marks"], sa["tools"], f"{el:.0f}s",
+        row(sa["type"], BLUE, "", state, sty, sa["marks"], sa["tools"], fmt_dur(el),
             now_txt, (RED if sa.get("errors") else FG) if run else (mix(RED, DIM, 0.4) if sa.get("errors") else DIM),
             now - sa["marks"][-1] if sa["marks"] else now - sa["start"], usd((cost.get("subs") or {}).get(k)))
     if not st["sub_order"]:
@@ -806,12 +864,12 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     tbl.add_section()
     all_marks = lm + [x for sa in st["subagents"].values() for x in sa["marks"]]
     nerr = len(st["err_marks"]) + st.get("sub_errors", 0)
-    elapsed = max(0, now - st["started"])
+    elapsed = max(0, session_end(st, now) - st["started"])
     tbl.add_row(Text("total", style=f"bold {FG}"),
                 Text(f"{nerr} error{'s' if nerr != 1 else ''}", style=RED if nerr else DIM),
                 spark_text(activity(all_marks, now, window, 12), GREEN, frame),
                 Text(str(st["tool_total"] + st["sub_tool_total"]), style=f"bold {FG}"),
-                Text(f"{elapsed:.0f}s", style=DIM),
+                Text(fmt_dur(elapsed), style=DIM),
                 usd({"usd": cost.get("total_usd", 0), "msgs": 1} if cost else None, cost.get("estimated")),
                 Text((f"cc says ${cost['cc_usd']:.2f} · " if cost.get("cc_usd") is not None else "")
                      + f"{len(st['sub_order'])} sub · {a['calls']} advice · {len(st['edits'])} edits", style=DIM))
@@ -852,29 +910,28 @@ def gates_panel(adv, a, gates, frame, now, rnd):
     fresh = adv_ts and now - adv_ts < 2.5
     border = (WHITE if blink(frame, 2) else PURPLE) if fresh else mix(PURPLE, FAINT, 0.45)
     durs = a.get("durations") or []
-    title = Text.assemble((" advisor checkpoints ", PURPLE), (f"{adv or 'off'} ", DIM), (f"· {a['calls']} calls ", DIM),
+    title = Text.assemble((" advisor checkpoints ", PURPLE), (f"{adv or 'off'} ", DIM), (f"· {a['calls']} call{'s' if a['calls'] != 1 else ''} ", DIM),
                           (f"· avg {sum(durs) / len(durs):.0f}s " if durs else "", DIM))
     return Panel(Group(t, line, hist), title=title, title_align="left", box=box.SQUARE, border_style=border, padding=(0, 0))
 
 
 def render_table(console, lead, adv, st, a, frame, now, window, rnd, project, launch=None,
-                 sub_model=None, transcript=None):
+                 sub_model=None, transcript=None, timeline_top=True):
     width = console.size.width
     height = console.size.height
     gates = compute_gates(st, a["times"], now)
     agents = agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model, transcript)
     gp = gates_panel(adv, a, gates, frame, now, rnd)
-    tl = timeline_panel(st, a["times"], width, now, window, frame, roomy=True)
+    tl = timeline_panel(st, a["times"], width, now, window, frame, roomy=True, fit=not launch)
     opts = console.options.update(width=width)
     used = 1 + 1 + sum(len(console.render_lines(x, opts, pad=False)) for x in (agents, gp, tl))
     rest = max(14, height - used - 1)
     log_h = max(6, int(rest * 0.52))
     code_h = max(8, rest - log_h)
+    top = [tl, agents, gp] if timeline_top else [agents, gp, tl]
     return Group(
         Text(""),                       # top line intentionally empty
-        agents,
-        gp,
-        tl,
+        *top,
         code_panel(st, now, code_h, frame),
         log_panel(st, log_h, now, gates, launch),
         footer(adv, st, a, now, width),
@@ -1005,6 +1062,18 @@ RULE_SHORT = {"R1_tests": "tests", "R2_repeat_error": "repeat", "R3_high_risk": 
 ACTION_SHORT = {"run_tests": "run tests", "consult_advisor": "advisor"}
 
 
+def policy_marks(sid):
+    """(ts, char, color) for the timeline's policy lane."""
+    out = []
+    for r in rules.load_log(str(BASE / "decisions" / f"{sid}.jsonl")):
+        if r.get("kind") == "decision" and r.get("action") and r.get("state") not in ("pass", "skipped"):
+            out.append((r["ts"], "⚑", ORANGE if r["state"] in ("requested", "advised") else DIM))
+        elif r.get("kind") == "outcome":
+            out.append((r["ts"], "✓" if r.get("outcome") == "observed" else "✕",
+                        GREEN if r.get("outcome") == "observed" else RED))
+    return out
+
+
 def decision_entries(sid):
     """Session-log lines for the policy engine: only decisions that asked for something, and outcomes."""
     out = []
@@ -1056,6 +1125,8 @@ def main():
     ap.add_argument("--layout", choices=["table", "classic"], default="table",
                     help="table = agents table (default), classic = the original flowchart look")
     ap.add_argument("--snapshot", type=float, help="render once at t seconds (demo) and exit")
+    ap.add_argument("--timeline", choices=["top", "middle"], default="top",
+                    help="where the timeline goes: top (overview first, like htop) or middle (under the agents)")
     args = ap.parse_args()
     console = Console()
     window = args.window or (DEMO_LOOP if args.demo else 120)
@@ -1094,7 +1165,7 @@ def main():
         a = advisor_activity(meta.get("transcript_path") or st["transcript"]) if adv else {"calls": 0, "last": "", "times": []}
         extra = decision_entries(sid) if sid else []
         if extra:
-            st = dict(st, log=sorted(st["log"] + extra, key=lambda x: x[0]))
+            st = dict(st, log=sorted(st["log"] + extra, key=lambda x: x[0]), policy_marks=policy_marks(sid))
         c = session_costs(cache["tp"], adv)
         st["cost"] = dict(c, cc_usd=meta.get("cost")) if c else ({"cc_usd": meta["cost"]} if meta.get("cost") is not None else {})
         return meta.get("model") or "lead", adv, st, a
@@ -1112,7 +1183,7 @@ def main():
         if args.layout == "table":
             return render_table(console, lead, adv, st, a, frame, now, window, rnd, project_name(args.title),
                                 launch["t"] if args.demo else None,
-                                "haiku 5.5" if args.demo else None, cache.get("tp"))
+                                "haiku 5.5" if args.demo else None, cache.get("tp"), args.timeline == "top")
         return render(console, lead, adv, st, a, frame, now, adv_seen["ts"], window, rnd)
 
     if args.snapshot is not None:
