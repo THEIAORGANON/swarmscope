@@ -751,6 +751,26 @@ def top_bar(project, st, now, width, frame):
     return t
 
 
+def short_cmd(text):
+    """'Bash V=/x ; $V/bin/python -m pytest -q 2>&1 | tail -5' → 'Bash pytest -q': the first real command,
+    without variable assignments, absolute interpreter paths and output plumbing."""
+    import re
+    if not text.startswith("Bash "):
+        return text
+    for seg in re.split(r"\s*(?:;|&&|\|\||\n)\s*", text[5:]):
+        seg = re.sub(r"^(\s*\w+=\S*\s*)+", "", seg).strip()          # VAR=value prefixes
+        seg = re.split(r"\s*(?:2>&1|\|)", seg, maxsplit=1)[0].strip()   # | tail, 2>&1
+        if not seg:
+            continue
+        toks = seg.split()
+        if "/" in toks[0]:
+            toks[0] = toks[0].rsplit("/", 1)[-1]                        # /…/bin/python → python
+        if len(toks) >= 3 and toks[0].startswith("python") and toks[1] == "-m":
+            toks = toks[2:]                                             # python -m pytest → pytest
+        return "Bash " + " ".join(toks)
+    return text
+
+
 def activity(marks, now, window, n):
     b = [0] * n
     for ts in marks:
@@ -773,7 +793,13 @@ def spark_text(buckets, color, now_frame):
 
 
 def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=None, transcript=None):
-    tbl = Table(box=None, padding=(0, 1), expand=True, show_edge=False, header_style=f"{DIM}")
+    # structure from two faint rules (under the header, above total) instead of extra blank rows
+    tbl = Table(box=box.SIMPLE_HEAD, padding=(0, 1, 0, 0), expand=True, show_edge=False, header_style=f"{DIM}",
+                border_style=FAINT, pad_edge=False)
+    if not st.get("working") and st.get("log"):
+        # finished session: activity sparklines cover the whole session, not the last minutes of silence
+        end = session_end(st, now)
+        now, window = end, max(20.0, end - st["started"])
     tbl.add_column("AGENT", no_wrap=True, width=7)
     tbl.add_column("STATE", no_wrap=True, width=10)
     tbl.add_column("ACTIVITY", no_wrap=True, width=12)
@@ -810,7 +836,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     span = st["work_spans"][-1] if st["work_spans"] else None
     tsec = fmt_dur((span[1] or now) - span[0]) if span else "—"
     row("sonnet", ORANGE, lead, sstate, sstyle, lm, st["tool_total"], tsec,
-        st["last_tool"] or "—", FG, now - lm[-1] if lm else 99, usd(cost.get("lead")))
+        short_cmd(st["last_tool"]) or "—", FG, now - lm[-1] if lm else 99, usd(cost.get("lead")))
 
     # opus
     adv_age = now - a["times"][-1] if a["times"] else 99
@@ -829,8 +855,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     if pending:
         otxt, osty = f"thinking {now - a['times'][-1]:.0f}s…", PURPLE
     elif a.get("redacted"):
-        otxt, osty = (f"{a['calls']} consult{'s' if a['calls'] != 1 else ''} · advice encrypted, "
-                      "Ctrl+O in Claude Code"), PURPLE
+        otxt, osty = (f"{a['calls']} consult{'s' if a['calls'] != 1 else ''} · encrypted"), PURPLE
     elif pend and adv_age >= 2.5:
         otxt, osty = "needed: " + {"PLAN": "before plan", "ERR×2": "after error x2", "DONE": "before done"}[pend[0]], PURPLE
     elif a["last"]:
@@ -857,9 +882,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
         row(sa["type"], BLUE, "", state, sty, sa["marks"], sa["tools"], fmt_dur(el),
             now_txt, (RED if sa.get("errors") else FG) if run else (mix(RED, DIM, 0.4) if sa.get("errors") else DIM),
             now - sa["marks"][-1] if sa["marks"] else now - sa["start"], usd((cost.get("subs") or {}).get(k)))
-    if not st["sub_order"]:
-        tbl.add_row(Text("swarm", style=DIM), Text("standby", style=DIM),
-                    Text(""), Text(""), Text(""), Text(""), Text("no subagents yet", style=DIM))
+    # no filler row when there are no subagents: the panel title already says so
     # totals
     tbl.add_section()
     all_marks = lm + [x for sa in st["subagents"].values() for x in sa["marks"]]
@@ -871,14 +894,27 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
                 Text(str(st["tool_total"] + st["sub_tool_total"]), style=f"bold {FG}"),
                 Text(fmt_dur(elapsed), style=DIM),
                 usd({"usd": cost.get("total_usd", 0), "msgs": 1} if cost else None, cost.get("estimated")),
-                Text((f"cc says ${cost['cc_usd']:.2f} · " if cost.get("cc_usd") is not None else "")
-                     + f"{len(st['sub_order'])} sub · {a['calls']} advice · {len(st['edits'])} edits", style=DIM))
+                total_note(cost, st, a))
     running = sum(1 for x in st["subagents"].values() if x["status"] == "running")
     models = sorted({m for m in (sub_model or pretty_model(subagent_model(transcript, k)) for k in st["sub_order"]) if m})
     swarm = " / ".join(models) if models else ("subagents" if st["sub_order"] else "no subagents")
     title = Text.assemble((" agents ", FG), (lead, ORANGE), (" · ", DIM), (adv or "no advisor", PURPLE),
                           (" · ", DIM), (swarm + " ", BLUE), (f"({running} running) ", BLUE if running else DIM))
-    return Panel(tbl, title=title, title_align="left", box=box.SQUARE, border_style=FAINT, padding=(0, 1, 1, 1))
+    return Panel(tbl, title=title, title_align="left", box=box.SQUARE, border_style=FAINT, padding=(0, 1))
+
+
+def total_note(cost, st, a):
+    """Claude Code's own figure for comparison, then edits: short enough to never be cut off."""
+    t = Text(no_wrap=True, overflow="ellipsis")
+    if cost.get("cc_usd") is not None:
+        t.append(f"cc ${cost['cc_usd']:.2f}", style=DIM)
+        if cost.get("total_usd") is not None and abs(cost["cc_usd"] - cost["total_usd"]) <= 0.02:
+            t.append(" ✓", style=GREEN)
+        t.append(" · ", style=FAINT)
+    t.append(f"{len(st['edits'])} edits", style=DIM)
+    if st["sub_order"]:
+        t.append(f" · {len(st['sub_order'])} sub", style=DIM)
+    return t
 
 
 def gates_panel(adv, a, gates, frame, now, rnd):

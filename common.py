@@ -313,7 +313,9 @@ def build_state(events):
             else:
                 st["tools"][tool] += 1
                 st["tool_total"] += 1
-                st["last_tool"] = f"{tool} {e.get('arg', '')}".strip()
+                # Bash: the full command (first line) when the hook recorded it, not the 80-char arg
+                shown = " ; ".join((e.get("cmd") or "").splitlines())[:300] if tool == "Bash" else ""
+                st["last_tool"] = f"{tool} {shown or e.get('arg', '')}".strip()
                 st["lead_marks"].append((ts, tool))
                 if e.get("new") is not None:
                     st["edits"].append((ts, e.get("arg", "?"), e.get("old", ""), e["new"], tool))
