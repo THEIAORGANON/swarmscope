@@ -878,7 +878,7 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
     swarm = " / ".join(models) if models else ("subagents" if st["sub_order"] else "no subagents")
     title = Text.assemble((" agents ", FG), (lead, ORANGE), (" · ", DIM), (adv or "no advisor", PURPLE),
                           (" · ", DIM), (swarm + " ", BLUE), (f"({running} running) ", BLUE if running else DIM))
-    return Panel(tbl, title=title, title_align="left", box=box.SQUARE, border_style=FAINT, padding=(0, 1))
+    return Panel(tbl, title=title, title_align="left", box=box.SQUARE, border_style=FAINT, padding=(0, 1, 1, 1))
 
 
 def gates_panel(adv, a, gates, frame, now, rnd):
@@ -912,7 +912,53 @@ def gates_panel(adv, a, gates, frame, now, rnd):
     durs = a.get("durations") or []
     title = Text.assemble((" advisor checkpoints ", PURPLE), (f"{adv or 'off'} ", DIM), (f"· {a['calls']} call{'s' if a['calls'] != 1 else ''} ", DIM),
                           (f"· avg {sum(durs) / len(durs):.0f}s " if durs else "", DIM))
-    return Panel(Group(t, line, hist), title=title, title_align="left", box=box.SQUARE, border_style=border, padding=(0, 0))
+    return Panel(Group(t, line, hist, policy_line(gates_panel.policy)), title=title, title_align="left",
+                 box=box.SQUARE, border_style=border, padding=(0, 0))
+
+
+gates_panel.policy = None
+RULE_NAMES = (("R1_tests", "tests"), ("R2_repeat_error", "repeat"), ("R3_high_risk", "risk"))
+
+
+def policy_summary(sid):
+    """Latest state per rule + policy mode/version, from the decision log."""
+    last, outcome, mode, ver = {}, {}, None, None
+    for r in rules.load_log(str(BASE / "decisions" / f"{sid}.jsonl")):
+        if r.get("kind") == "decision":
+            last[r["rule"]] = r
+            mode, ver = (r.get("gate") or {}).get("mode"), r.get("policy_version")
+        elif r.get("kind") in ("outcome", "followup"):
+            outcome[r["rule"]] = r.get("outcome")
+    return {"last": last, "outcome": outcome, "mode": mode, "version": ver} if last else None
+
+
+def policy_line(p):
+    """One line: policy mode · R1 tests ✓ · R2 repeat · R3 risk ⚑→✓ (asked, then the action was seen)."""
+    t = Text(no_wrap=True, overflow="ellipsis")
+    if not p:
+        t.append(" ⚑ policy off", style=FAINT)
+        return t
+    t.append(f" ⚑ policy {p['mode']} · {p['version']}", style=DIM)
+    for rule, name in RULE_NAMES:
+        r = p["last"].get(rule)
+        if not r:
+            continue
+        st_, oc = r.get("state"), p["outcome"].get(rule)
+        t.append("   ")
+        if st_ == "pass":
+            # passed now; show if it had asked earlier and the action was seen
+            mark, col = ("⚑→✓", GREEN) if oc == "observed" else ("✓", GREEN)
+        elif st_ == "skipped":
+            mark, col = ("–", FAINT)
+        elif st_ in ("requested", "advised"):
+            mark, col = ("⚑", ORANGE)
+        elif st_ == "triggered":
+            mark, col = ("⚑", DIM)
+        else:                                   # deferred / limited
+            mark, col = ("⚑ " + st_, DIM)
+        t.append(f"{name} ", style=DIM if st_ in ("pass", "skipped") else FG)
+        t.append(mark, style=col)
+    return t
 
 
 def render_table(console, lead, adv, st, a, frame, now, window, rnd, project, launch=None,
@@ -1166,6 +1212,7 @@ def main():
         extra = decision_entries(sid) if sid else []
         if extra:
             st = dict(st, log=sorted(st["log"] + extra, key=lambda x: x[0]), policy_marks=policy_marks(sid))
+        gates_panel.policy = policy_summary(sid) if sid else None
         c = session_costs(cache["tp"], adv)
         st["cost"] = dict(c, cc_usd=meta.get("cost")) if c else ({"cc_usd": meta["cost"]} if meta.get("cost") is not None else {})
         return meta.get("model") or "lead", adv, st, a
