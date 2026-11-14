@@ -745,12 +745,18 @@ def watched_project(sid=None):
     return None
 
 
+def app_name():
+    """'swarmscope', or 'brand/swarmscope' when $SWARMSCOPE_BRAND is set (like owner/repo on GitHub)."""
+    brand = os.environ.get("SWARMSCOPE_BRAND", "").strip().strip("/")
+    return f"{brand}/swarmscope" if brand else "swarmscope"
+
+
 def window_title(custom, sid=None):
-    """'swarmscope · <project>' — app name, then what it watches; --title overrides it verbatim."""
+    """'[brand/]swarmscope · <project>' — who and what, then what it watches; --title overrides verbatim."""
     if custom:
         return custom
     proj = watched_project(sid)
-    return f"swarmscope · {proj}" if proj else "swarmscope"
+    return f"{app_name()} · {proj}" if proj else app_name()
 
 
 def set_window_title(title):
@@ -1241,7 +1247,7 @@ def main():
     t0 = time.time() - (args.start if args.demo else 0)
     rnd = random.Random()
 
-    title = args.title or ("swarmscope · demo" if args.demo else window_title(None, args.session or latest_session_id()))
+    title = args.title or (f"{app_name()} · demo" if args.demo else window_title(None, args.session or latest_session_id()))
     shown_title = {"t": title}
     if args.snapshot is None:
         set_window_title(title)

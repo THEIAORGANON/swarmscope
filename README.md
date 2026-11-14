@@ -61,6 +61,10 @@ A terminal of about 80×53 fits everything.
 
 Useful flags: `--title`, `--window N` (timeline seconds), `--layout classic`.
 
+## Window title
+
+The dashboard sets the window title to `swarmscope · <project>`, where the project is the one the watched session runs in, not the dashboard's own folder. Set `SWARMSCOPE_BRAND=yourname` to get `yourname/swarmscope · <project>`, or pass `--title` to use your own text as is. In Terminal.app, turn off the extra title parts (Settings → Profiles → Window → Title) so only this title shows.
+
 ## Policy engine (experimental, off by default)
 
 `rules.py` checks three rules at every Stop and writes each decision to `decisions/<session>.jsonl`. Decisions show up in the session log with `⚑`.
