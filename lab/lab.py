@@ -748,6 +748,28 @@ def final_diff(base_dir, snapshot, run_dir):
     return {"files": files, "lines": totals, "patch_sha256": sha256(text), "patch": "final.diff", "method": "python"}
 
 
+_PYTEST_SUMMARY = re.compile(r"^=*\s*((?:\d+ (?:failed|passed|errors?|skipped|deselected|xfailed|xpassed|warnings?|"
+                             r"rerun|subtests? passed|subtests? failed)(?:, )?)+) in [\d.]+s(?: \([^)]*\))?\s*=*\s*$", re.M)
+
+
+def parse_pytest(text):
+    """pytest's final summary ("4 failed, 63746 passed, 444 deselected in 41.25s") and the short test summary
+    ids (FAILED/ERROR lines, pytest's default -rfE), or None without a summary line. tests = passed + failed +
+    errors: skipped, xfailed and deselected tests are environment- or selection-dependent and are reported
+    apart, so expected_tests is the number of tests that pass on the reference in the same environment."""
+    found = _PYTEST_SUMMARY.findall(text)
+    if not found:
+        return None
+    counts = {}
+    for n, k in re.findall(r"(\d+) ((?:subtests? )?[a-z]+)", found[-1]):
+        k = {"error": "errors", "warning": "warnings"}.get(k, k)
+        counts[k] = counts.get(k, 0) + int(n)
+    ids = sorted({m for m in re.findall(r"^(?:FAILED|ERROR) (\S+)", text, re.M)})
+    bad = counts.get("failed", 0) + counts.get("errors", 0)
+    return {"tests": counts.get("passed", 0) + bad, "failed": bad, "passed": counts.get("passed", 0),
+            "counts": counts, "not_passed": ids}
+
+
 def parse_unittest(text):
     """(ran, not_passed) from unittest's summary, or (None, None) without a complete report. Skipped tests,
     expected failures and unexpected successes are not passes: "OK (skipped=7)" is 0 of 7."""
@@ -844,17 +866,27 @@ def run_suite(name, cmd, snapshot, run_dir, expected=None, timeout=300, hidden_d
     shutil.rmtree(d, ignore_errors=True)
     text = (r["out"] or "") + (r["err"] or "")
     ran, failed = parse_unittest(text)
-    report = ran is not None and failed is not None
-    cases = parse_cases(text)
-    if report and len(cases) == ran:             # per-test outcomes: subTest failures cannot push this below 0
-        passed = sum(1 for st in cases.values() if st == "ok")
+    pyt = parse_pytest(text) if ran is None else None
+    if pyt:                                      # pytest: counts from its summary, ids of what did not pass
+        ran, failed, passed = pyt["tests"], pyt["failed"], pyt["passed"]
+        cases, not_passed = None, pyt["not_passed"]
+        report = True
     else:
-        passed = max(ran - failed, 0) if report else None
+        report = ran is not None and failed is not None
+        cases = parse_cases(text)
+        if report and len(cases) == ran:         # per-test outcomes: subTest failures cannot push this below 0
+            passed = sum(1 for st in cases.values() if st == "ok")
+        else:
+            passed = max(ran - failed, 0) if report else None
+        cases, not_passed = cases or None, sorted(k for k, st in cases.items() if st != "ok")
     ok = (r["code"] == 0 and report and failed == 0 and ran > 0 and (expected is None or ran == expected))
-    return {"cmd": cmd, "exit_code": r["code"], "timed_out": r["timed_out"], "report": report, "tests": ran,
-            "expected": expected, "passed": passed, "ok": bool(ok), "seconds": r["s"], "sandbox": sandbox,
-            "cases": cases or None, "not_passed": sorted(k for k, st in cases.items() if st != "ok"),
-            "tail": text[-1500:]}
+    out = {"cmd": cmd, "exit_code": r["code"], "timed_out": r["timed_out"], "report": report, "tests": ran,
+           "expected": expected, "passed": passed, "ok": bool(ok), "seconds": r["s"], "sandbox": sandbox,
+           "framework": "pytest" if pyt else ("unittest" if report else None),
+           "cases": cases, "not_passed": not_passed, "tail": text[-1500:]}
+    if pyt:
+        out["pytest_counts"] = pyt["counts"]
+    return out
 
 
 def code_versions():

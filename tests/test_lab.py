@@ -2,6 +2,7 @@
 (no network, no model). Each test pins one failure that would make a run look valid when it is not."""
 import argparse
 import http.server
+import importlib.util
 import json
 import os
 import subprocess
@@ -759,3 +760,48 @@ def test_a0_and_a_are_different_experiments_for_calib():
     a, a0 = _rj("x"), _rj("y")
     a0["config"]["advisor"] = None
     assert lab.experiment_key(a) != lab.experiment_key(a0)
+# --- pytest suites (historical-bug tasks: packaging, Click) -------------------------------------------------
+
+@pytest.mark.parametrize("text,tests,failed,passed,ids", [
+    ("....F\nFAILED tests/test_a.py::test_x[1-2] - assert 1 == 2\n4 failed, 63746 passed, 444 deselected in 41.25s\n",
+     63750, 4, 63746, ["tests/test_a.py::test_x[1-2]"]),
+    ("=== short test summary info ===\nFAILED t.py::T::test_b - AssertionError\nERROR t.py::test_c - KeyError\n"
+     "==== 1 failed, 2 passed, 24 skipped, 1 xfailed, 1 error, 3 warnings in 0.50s ====\n",
+     4, 2, 2, ["t.py::T::test_b", "t.py::test_c"]),
+    ("ERROR tests/test_deprecations.py\n!!!!!! Interrupted: 1 error during collection !!!!!!\n"
+     "31000 deselected, 1 error in 2.09s\n", 1, 1, 0, ["tests/test_deprecations.py"]),
+    ("2083 passed, 24 skipped, 31000 deselected, 1 xfailed in 4.87s\n", 2083, 0, 2083, []),
+])
+def test_parse_pytest_summary_and_failing_ids(text, tests, failed, passed, ids):
+    p = lab.parse_pytest(text)
+    assert (p["tests"], p["failed"], p["passed"], p["not_passed"]) == (tests, failed, passed, ids)
+
+
+def test_parse_pytest_needs_a_summary():
+    assert lab.parse_pytest("no tests ran in 0.01s\n") is None
+    assert lab.parse_pytest("Traceback (most recent call last):\nKeyboardInterrupt\n") is None
+
+
+PYTEST_SUITE = '''import pytest
+def test_ok(): pass
+@pytest.mark.parametrize("x", [1, 2])
+def test_param(x): assert x == 1
+@pytest.mark.skip(reason="platform")
+def test_skipped(): pass
+'''
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")
+def test_hidden_pytest_suite_counts_and_ids(tmp_path):
+    snap = tmp_path / "snap"
+    (snap / "tests").mkdir(parents=True)
+    (snap / "tests" / "test_p.py").write_text(PYTEST_SUITE)
+    r = lab.run_suite("hidden", f"{sys.executable} -m pytest -q -p no:cacheprovider tests", snap, tmp_path,
+                      expected=3, work_base=tmp_path)
+    assert r["framework"] == "pytest" and r["report"] is True and r["ok"] is False
+    assert (r["tests"], r["passed"], r["not_passed"]) == (3, 2, ["tests/test_p.py::test_param[2]"])
+    assert r["pytest_counts"]["skipped"] == 1
+    (snap / "tests" / "test_p.py").write_text(PYTEST_SUITE.replace("assert x == 1", "assert x"))
+    r = lab.run_suite("hidden", f"{sys.executable} -m pytest -q -p no:cacheprovider tests", snap, tmp_path,
+                      expected=3, work_base=tmp_path)
+    assert r["ok"] is True and r["passed"] == 3 and r["not_passed"] == []
