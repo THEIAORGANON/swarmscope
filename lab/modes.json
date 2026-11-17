@@ -1,13 +1,31 @@
 {
-  "version": "m-1",
+  "version": "m-2",
   "common": {
-    "model": "sonnet",
-    "advisor": "opus",
+    "model": "claude-sonnet-5-5",
+    "advisor": "claude-opus-5-5",
     "effort": "high",
+    "claude_code": "2.1.326",
     "permission_mode": "bypassPermissions",
     "timeout_s": 1200,
+    "work_root": "/tmp/swarmscope-w",
+    "allowed_domains": [],
+    "expected_agents": [
+      "claude",
+      "docs",
+      "Explore",
+      "general-purpose",
+      "grep",
+      "Plan",
+      "search",
+      "statusline-setup",
+      "web-fetch"
+    ],
+    "subagent_models": [
+      "claude-haiku-5-5"
+    ],
     "jev": {
-      "enabled": true
+      "enabled": true,
+      "include_task": false
     }
   },
   "modes": {

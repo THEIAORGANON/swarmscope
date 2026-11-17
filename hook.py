@@ -218,6 +218,11 @@ def run_gate(d, sid, ev, pol, change, BASE, advisor_activity, load_events, rules
     has_tests = rules.project_has_tests(base.get("root") or cwd, pol)
     records, out = rules.gate(events, d, pol, change, adv.get("times") or [], rules.load_log(logf),
                               has_tests, sid, now=ev["ts"], transcript_ok=bool(tp and os.path.exists(tp)))
+    src = pol.get("_source") or {}
+    for r in records:                           # which policy file this Stop actually used (runner checks it)
+        r["policy_source"] = src.get("kind")
+        if src.get("sha256"):
+            r["policy_sha256"] = src["sha256"]
     rules.append_log(logf, records)
     if out:
         sys.stdout.write(json.dumps(out))
