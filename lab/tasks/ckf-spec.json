@@ -1,0 +1,61 @@
+{
+  "task_id": "ckf-spec",
+  "manifest_version": 2,
+  "set": "calib-3-features",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/ckf-spec",
+    "commit": "5cb2cb3",
+    "commit_full": "5cb2cb34a370eec3f4152d4fe5e3c482a212d067",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pallets/click",
+    "base_sha": "06b2a678741131fd577ce170e23e5ca0aeba0309",
+    "fix_sha": "2247b35ea1c47c727d7a06e51fa280e12a863ff6",
+    "pr": 3877,
+    "pr_created": "2026-09-23",
+    "first_public_note": "branch commit 2026-09-02; follow-up of PR #3821 (2026-09-01)"
+  },
+  "prompt": "A Click parameter has three strings for three audiences: `decls` (what the developer passes to the decorator), `spec` (what the user reads in --help and types on the command line) and `name` (the internal Python name). Click has no attribute for the spec: Parameter.human_readable_name returns the internal name for options, so messages say `The option 'my_option' is deprecated.` where the user typed `--my-option`. Introduce `spec`, use it everywhere Click shows a parameter to the user, and deprecate human_readable_name.\n\nChangelog entries for this change:\n- Add Parameter.spec, which returns how the user spells the parameter on the command line: `--times` for an option declared as `-t`, `--times`, and `FILENAME` for an argument declared as `filename`.\n- Move get_help_spec from Option to Parameter, and give Argument an override that returns its metavar.\n- Error messages and deprecation warnings name an option by its spec instead of its internal name, so they read `The option '--my-option' is deprecated.` where they read `The option 'my_option' is deprecated.` before.\n- Parameter.human_readable_name is deprecated and will be removed in Click 9.0. Use Parameter.spec instead. It returned the internal name for options, so its value changes from `my_option` to `--my-option`. Click no longer reads it, and a subclass that overrides it gets a warning when the class is defined.\n\nFor `@click.argument('recipe')` and `@click.option('-g', '--gluten-free/--no-gluten-free')`: spec is `RECIPE` and `--gluten-free`; name is `recipe` and `gluten_free`; opts are `['recipe']` and `['-g', '--gluten-free']`.\n\nAPI (docstrings):\n- `Parameter.spec` (property): \"Returns how the user spells this parameter on the command line. This is the declaration with the longest prefix, so an option declared as \"-t\", \"--times\" returns --times. Click derives name from that same declaration, unless the developer passed an explicit name. A parameter without declarations returns its name.\"\n- `Argument.spec` (property): \"Returns the argument's metavar, which is how the user reads it in --help. An argument has no flag to spell, so this is the metavar if one was given, and the uppercased name otherwise.\"\n- `Parameter.get_help_spec(ctx)`: \"Returns the left column of this parameter's help record. This implementation returns spec. Option returns every spelling, plus the metavar when the option takes a value. Argument returns its metavar, which already carries the markers for an optional, repeated or deprecated value. Unlike get_help_record(), the spec is produced even when the parameter is left out of the help page, like a hidden option.\"\n- `Argument.get_help_spec(ctx)`: \"Returns the left column of the argument's help record: its metavar, like FILENAME or [FILENAME].\" An argument's help record (get_help_record) uses it as its left column.\n- `Parameter.human_readable_name` (deprecated property): returns spec and emits DeprecationWarning \"'human_readable_name' is deprecated and will be removed in Click 9.0. Use 'spec' instead.\"\n- Defining a subclass of Parameter (or Option, Argument) that overrides human_readable_name emits, at class definition, DeprecationWarning \"<ClassName> overrides 'human_readable_name'. Click no longer reads that property. Override 'spec' instead. Click will remove 'human_readable_name' in 9.0.\" A subclass that does not override it emits nothing.\n\n## Contract (also checked)\n- Option spec examples: [\"-t\", \"--times\"] and [\"--times\", \"-t\"] give --times; [\"-t\"] gives -t; [\"-t\", \"--times\", \"--repeat\"] gives --times; [\"--color/--no-color\"] gives --color; [\"/debug;/no-debug\"] gives /debug; [\"--times\", \"repeat_count\"] (explicit name) gives --times with name repeat_count. The name is still derived from that same declaration.\n- Argument examples: Argument([\"filename\"]) spec FILENAME, help spec FILENAME; required=False: help spec [FILENAME]; nargs=-1: [FILENAME]...; metavar=\"<file>\": spec and help spec <file>.\n- Everything Click shows to the user (error messages, deprecation warnings, hints) uses spec where it used human_readable_name; Click itself never reads human_readable_name.\n\nImplement this in the library code under src/, keep everything else working, and add tests under tests/. Run the test suite with: mkdir -p .lab-meta/click-8.6.0.dev0.dist-info && printf 'Metadata-Version: 2.1\\nName: click\\nVersion: 8.6.0.dev0\\n' > .lab-meta/click-8.6.0.dev0.dist-info/METADATA && PYTHONPATH=src:.lab-meta /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, click; p = os.path.realpath(click.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && mkdir -p .lab-meta/click-8.6.0.dev0.dist-info && printf 'Metadata-Version: 2.1\\nName: click\\nVersion: 8.6.0.dev0\\n' > .lab-meta/click-8.6.0.dev0.dist-info/METADATA && PYTHONPATH=src:.lab-meta /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0",
+    "selection": "upstream addopts: -m 'not stress'; tests/test_deprecations.py runs with a minimal click dist-info (.lab-meta) so importlib.metadata finds a version",
+    "expected_tests_note": "Linux count; re-count on the Mac (a platform skip may lower it by one)"
+  },
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/ckf-spec/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, click; p = os.path.realpath(click.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && mkdir -p .lab-meta/click-8.6.0.dev0.dist-info && printf 'Metadata-Version: 2.1\\nName: click\\nVersion: 8.6.0.dev0\\n' > .lab-meta/click-8.6.0.dev0.dist-info/METADATA && PYTHONPATH=src:.lab-meta /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 2262,
+    "bug_tests": [
+      "tests/test_arguments.py::test_help_spec_matches_help_record[None]",
+      "tests/test_arguments.py::test_help_spec_matches_help_record[path to the file]",
+      "tests/test_arguments.py::test_spec_and_help_spec[kwargs0-FILENAME-FILENAME]",
+      "tests/test_arguments.py::test_spec_and_help_spec[kwargs1-FILENAME-[FILENAME]]",
+      "tests/test_arguments.py::test_spec_and_help_spec[kwargs2-FILENAME-[FILENAME]...]",
+      "tests/test_arguments.py::test_spec_and_help_spec[kwargs3-<file>-<file>]",
+      "tests/test_deprecations.py::test_parameter_human_readable_name_deprecated[argument]",
+      "tests/test_deprecations.py::test_parameter_human_readable_name_deprecated[option]",
+      "tests/test_deprecations.py::test_parameter_human_readable_name_override_deprecated[Argument]",
+      "tests/test_deprecations.py::test_parameter_human_readable_name_override_deprecated[Option]",
+      "tests/test_deprecations.py::test_parameter_human_readable_name_override_deprecated[Parameter]",
+      "tests/test_deprecations.py::test_parameter_subclass_without_override_is_silent[Argument]",
+      "tests/test_deprecations.py::test_parameter_subclass_without_override_is_silent[Option]",
+      "tests/test_deprecations.py::test_parameter_subclass_without_override_is_silent[Parameter]",
+      "tests/test_options.py::test_deprecated_warning[True]",
+      "tests/test_options.py::test_deprecated_warning[USE B INSTEAD]",
+      "tests/test_options.py::test_spec[param_decls0---times-times]",
+      "tests/test_options.py::test_spec[param_decls1---times-times]",
+      "tests/test_options.py::test_spec[param_decls2--t-t]",
+      "tests/test_options.py::test_spec[param_decls3---times-times]",
+      "tests/test_options.py::test_spec[param_decls4---color-color]",
+      "tests/test_options.py::test_spec[param_decls5-/debug-debug]",
+      "tests/test_options.py::test_spec_with_explicit_name"
+    ]
+  },
+  "difficulty": "unknown (upstream feature with integration)",
+  "notes": "click PR #3877 (feature); hidden = the fix's whole tests/ directory; feature tests: 23 (new: 21, failing on the base: 20)",
+  "task_summary": "Add Parameter.spec to Click, move get_help_spec to Parameter, name options by spec in messages and deprecate human_readable_name; done when the test suite passes."
+}

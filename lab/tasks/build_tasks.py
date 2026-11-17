@@ -129,7 +129,10 @@ def validate_historical(task_dir, manifest):
             p, h = _run(manifest["public_tests"], d), _run(hidden, d)
         finally:
             shutil.rmtree(d, ignore_errors=True)
-        if name == "base":
+        if name == "base" and meta.get("feature"):
+            # an upstream feature: the base passes its own suite and fails the feature's (often at import)
+            good = p["code"] == 0 and h["code"] != 0
+        elif name == "base":
             # a complete report over the whole expected collection, failing exactly the declared bug tests: an import
             # error or a missing report fails "nothing known" and must not pass for a reproduced bug
             good = (p["code"] == 0 and h["code"] != 0 and h["ran"] == expected
