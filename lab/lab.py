@@ -76,6 +76,15 @@ def work_root(modes):
     return p.resolve()
 
 
+def check_root(modes):
+    """Where test suites run on copies of a snapshot (with hidden tests copied in): a root of its own next to the
+    work root, denied to every agent, so a session running beside another never sees its checks."""
+    w = work_root(modes)
+    p = w.parent / (w.name + "-check")
+    p.mkdir(parents=True, exist_ok=True)
+    return p.resolve()
+
+
 def sha256(data):
     return hashlib.sha256(data if isinstance(data, bytes) else data.encode()).hexdigest()
 
@@ -391,7 +400,8 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
         if ev in WITH_MATCHER:
             h["matcher"] = "*"
         hooks[ev] = [h]
-    denied = deny_paths(task, lab)
+    # check copies (hidden tests) of every run, including runs beside this one; the Read/Edit tools and Bash
+    denied = deny_paths(task, lab, extra=[str(check_root(modes))])
     allow_read = [expand(p) for p in (task or {}).get("allow_read", [])]
     rules = []
     # Read rules also cover Glob/Grep, Edit rules cover every file-editing tool (Write, MultiEdit, NotebookEdit)
@@ -408,7 +418,9 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
         # sandbox's network requests are a separate approval that nobody grants in -p (checked by probe).
         "permissions": {"allow": ["Bash"], "deny": rules},
         "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
-                    "filesystem": {"denyRead": ["~/"] + denied, "allowRead": [str(work)] + allow_read,
+                    # sibling work dirs (other sessions' copies) are closed to Bash; its own dir is the exception
+                    "filesystem": {"denyRead": ["~/"] + denied + [str(work.parent)],
+                                   "allowRead": [str(work)] + allow_read,
                                    "allowWrite": [str(work)]},
                     "network": {"allowedDomains": allowed_domains(modes)}},
     }
@@ -1169,7 +1181,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         shutil.rmtree(work, ignore_errors=True)
     rj["diff"] = final_diff(run_dir / "base", snapshot, run_dir)
     tests = {}
-    wb = work_root(modes)
+    wb = check_root(modes)
     suite_timeout = int(task.get("tests_timeout_s", 300))     # large upstream suites (packaging: ~63k tests)
     if task.get("public_tests"):
         tests["public"] = run_suite("public", task["public_tests"], snapshot, run_dir, timeout=suite_timeout,
@@ -1613,6 +1625,10 @@ def cmd_screen(a):
     own runs, work dirs and batch manifest). Faster wall time for picking tasks; final mode comparisons should
     still run as ordinary batches. Stops starting new batches after an API failure or a batch that did not start."""
     tasks = [t.strip() for t in a.tasks.split(",") if t.strip()]
+    if a.jobs > 1 and len({str(load_task(t)["task_id"]) for t in tasks}) != len(tasks):
+        # the Read tool cannot be kept out of sibling work dirs (deny beats allow); different tasks only
+        print("screen: a task appears twice; side by side only different tasks may run (use --jobs 1 or a batch)")
+        return 2
     for t in tasks:
         load_task(t)                              # unknown task: fail before anything starts
     logs = lab_root() / "batches" / "screen"

@@ -3,6 +3,7 @@
 import argparse
 import http.server
 import importlib.util
+from pathlib import Path
 import json
 import os
 import subprocess
@@ -864,7 +865,9 @@ def test_hidden_bug_tests_and_regressions_are_reported_apart(task, monkeypatch):
 
 def test_screen_runs_batches_side_by_side(task, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_SLEEP", "1")
-    assert lab.main(["screen", "--tasks", f"{task['_file']},{task['_file']}", "--seed", "3", "--jobs", "2"]) == 0
+    second = Path(task["_file"]).with_name("task2.json")
+    second.write_text(json.dumps(dict(json.loads(Path(task["_file"]).read_text()), task_id="t2")))
+    assert lab.main(["screen", "--tasks", f"{task['_file']},{second}", "--seed", "3", "--jobs", "2"]) == 0
     out = capsys.readouterr().out
     assert out.count("started ") == 2 and out.count("VALID") == 2 and "2/2 batches all valid" in out
     batches = list((lab.lab_root() / "batches").glob("*.json"))
@@ -876,3 +879,60 @@ def test_screen_stops_starting_batches_after_an_api_failure(task, monkeypatch, c
     assert lab.main(["screen", "--tasks", ",".join([task["_file"]] * 3), "--seed", "3", "--jobs", "1"]) == 1
     out = capsys.readouterr().out
     assert out.count("started ") == 1 and "not started:" in out
+
+
+# --- review of PR #5: isolation of runs side by side, strict validation of historical tasks -----------------------
+
+def test_check_copies_live_apart_and_are_denied_to_the_agent(task, monkeypatch):
+    roots = []
+    real = lab.run_suite
+
+    def spy(name, cmd, snapshot, run_dir, **kw):
+        roots.append(kw.get("work_base"))
+        return real(name, cmd, snapshot, run_dir, **kw)
+    monkeypatch.setattr(lab, "run_suite", spy)
+    r = lab.attempt(task, "A")
+    modes, _ = lab.load_modes()
+    check, work = lab.check_root(modes), lab.work_root(modes)
+    assert roots and all(Path(x) == check for x in roots) and check != work and not str(check).startswith(str(work) + "/")
+    st = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    assert f"Read(/{check}/**)" in st["permissions"]["deny"] and f"Edit(/{check}/**)" in st["permissions"]["deny"]
+    fs = st["sandbox"]["filesystem"]
+    assert str(check) in fs["denyRead"] and str(work) in fs["denyRead"]          # siblings closed to Bash ...
+    assert any(a.startswith(str(work) + "/") for a in fs["allowRead"])         # ... its own dir re-opened
+
+
+def test_screen_refuses_the_same_task_twice_side_by_side(task, capsys):
+    assert lab.main(["screen", "--tasks", f"{task['_file']},{task['_file']}", "--seed", "3", "--jobs", "2"]) == 2
+    assert "a task appears twice" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")
+def test_historical_validation_needs_a_full_report_failing_exactly_the_bug_tests(tmp_path):
+    """Review of PR #5: a base that fails before the hidden tests run (ImportError, no report) used to pass, since
+    an empty list of failures is a subset of the bug tests."""
+    sys.path.insert(0, os.path.join(ROOT, "lab", "tasks"))
+    import build_tasks
+    t = tmp_path / "hist"
+    (t / "base" / "src").mkdir(parents=True)
+    (t / "base" / "tests").mkdir()
+    (t / "base" / "src" / "m.py").write_text("def f(x):\n    return x\n")
+    (t / "base" / "tests" / "test_old.py").write_text("from m import f\ndef test_one():\n    assert f(1) == 1\n")
+    (t / "ref" / "src").mkdir(parents=True)
+    (t / "ref" / "src" / "m.py").write_text("def f(x):\n    return abs(x)\n")
+    (t / "hidden" / "tests").mkdir(parents=True)
+    (t / "hidden" / "tests" / "test_old.py").write_text((t / "base" / "tests" / "test_old.py").read_text())
+    (t / "hidden" / "tests" / "test_bug.py").write_text("from m import f\ndef test_neg():\n    assert f(-2) == 2\n")
+    (t / "task.json").write_text(json.dumps({"id": "hist", "kind": "historical",
+                                             "bug_tests": ["tests/test_bug.py::test_neg"]}))
+    py = f"PYTHONPATH=src {sys.executable} -m pytest -q -p no:cacheprovider tests"
+    good = {"public_tests": py, "hidden_tests": {"expected_tests": 2,
+                                                  "cmd": "rm -rf tests && cp -R {hidden}/tests tests && " + py}}
+    assert build_tasks.validate_historical(t, good) == []
+    broken = json.loads(json.dumps(good))                    # fails before pytest: no report at all
+    broken["hidden_tests"]["cmd"] = f"{sys.executable} -c 'import no_such_module' && " + good["hidden_tests"]["cmd"]
+    assert any("hist/base" in p for p in build_tasks.validate_historical(t, broken))
+    wrong = json.loads(json.dumps(good))                     # bug tests declared but another test fails instead
+    (t / "task.json").write_text(json.dumps({"id": "hist", "kind": "historical",
+                                             "bug_tests": ["tests/test_bug.py::test_neg", "tests/test_old.py::test_one"]}))
+    assert any("hist/base" in p for p in build_tasks.validate_historical(t, wrong))

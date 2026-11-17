@@ -130,7 +130,10 @@ def validate_historical(task_dir, manifest):
         finally:
             shutil.rmtree(d, ignore_errors=True)
         if name == "base":
-            good = p["code"] == 0 and h["code"] != 0 and set(h["not_passed"]) <= set(meta["bug_tests"])
+            # a complete report over the whole expected collection, failing exactly the declared bug tests: an import
+            # error or a missing report fails "nothing known" and must not pass for a reproduced bug
+            good = (p["code"] == 0 and h["code"] != 0 and h["ran"] == expected
+                    and set(h["not_passed"]) == set(meta["bug_tests"]) and h["failed"] == len(meta["bug_tests"]))
         else:
             good = p["code"] == 0 and h["code"] == 0 and h["failed"] == 0 and h["ran"] == expected
         rows.append(f"    {'ok ' if good else 'BAD'} {name:<5} public {p['ran']}/{p['failed']} failed  hidden "
