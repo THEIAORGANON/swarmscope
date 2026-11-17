@@ -1,0 +1,21 @@
+{
+  "task_id": "semver",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/semver",
+    "commit": "6d41315",
+    "commit_full": "6d4131596a4cef1f23d9522003b1d99dc0b8df05",
+    "exclude": []
+  },
+  "prompt": "Implement satisfies(version, range_str) and max_satisfying(versions, range_str) in src/semver/range.py. Ranges follow node-semver (the npm semver package) in its default mode: not loose, prereleases not included by default.\n- Comparators <, <=, >, >=, = (or no operator) separated by spaces must all hold; comparator sets separated by || are alternatives.\n- Hyphen ranges (A - B), X-ranges (x, X, * or missing parts), tilde (~, ~>) and caret (^) ranges mean exactly what they mean in node-semver.\n- A version with a prerelease tag satisfies a comparator set only if some comparator in that set has a prerelease tag on the same major.minor.patch.\n- Build metadata is ignored.\nAn invalid range or version raises ValueError. max_satisfying returns the highest of the given version strings (as given) that satisfies the range, or None; strings that are not valid versions are skipped.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/semver/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 11
+  },
+  "difficulty": "medium-hard",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: numeric prerelease identifiers (public); ^0.x / ^0.0.x; >1.2 means >=1.3.0, <=1.2 means <1.3.0; hyphen with partial upper bound; prerelease rule needs same major.minor.patch; * does not match prereleases; <1.2.3 does not match 1.2.3-beta; || sets evaluated separately for the prerelease rule",
+  "task_summary": "Implement npm/node-semver range matching (caret, tilde, hyphen, x-ranges, prerelease rule) and fix a failing version-ordering test; done when all unit tests pass."
+}

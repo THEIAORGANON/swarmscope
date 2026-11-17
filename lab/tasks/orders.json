@@ -1,0 +1,21 @@
+{
+  "task_id": "orders",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/orders",
+    "commit": "298b534",
+    "commit_full": "298b534eb10b106ac9ab816d8aecc6d44e0869c6",
+    "exclude": []
+  },
+  "prompt": "Bug report from support: invoice and quote totals are sometimes wrong. The same cart for the same kind of customer gives a different total depending on which invoices or quotes were made earlier in the same process. tests/test_regression.py reproduces one case and fails.\nFind and fix the root cause or causes, not just this one case: after your fix, no total may depend on what was invoiced or quoted before. Keep the public API (Customer, Invoice, Coupon, quote, price_list) and the pricing rules unchanged. Add regression tests. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/orders/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 7
+  },
+  "difficulty": "medium-hard (root cause)",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: cached price dict mutated by coupons (public case); same cached dict mutated by quote's bulk discount; mutable default argument in Invoice; symptom fix in apply_coupon passes the public test",
+  "task_summary": "Fix a bug where invoice and quote totals depend on earlier invoices or quotes in the same process (shared mutable state); done when totals are independent and all unit tests pass."
+}

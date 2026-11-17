@@ -11,6 +11,7 @@ of the final snapshot after the session, and one run.json.
   python lab/lab.py run    --task T --mode A
   python lab/lab.py batch  --task T --modes A,B --repeats 1 --seed 1
   python lab/lab.py summary
+  python lab/lab.py calib  [--mode A] [--json]   per task: successes, hidden tests passed, which ones failed
 
 Runner side (the agent can neither read nor write it): $SWARMSCOPE_LAB or ~/Downloads/swarmscope-lab
   config/          CLAUDE_CONFIG_DIR (log in once; agents copied from the repo, nothing else)
@@ -466,6 +467,36 @@ def parse_stream(path):
     return init, result, bad
 
 
+API_FAILURES = ("api_error", "api_interrupted")
+
+
+def api_failure(result, rate_limits=()):
+    """(status, reason) when the session ended on an API failure, else None. Decided by the terminal result only:
+    a rejected rate-limit event in a session that still finished normally changes nothing.
+      api_error        the model was never reached (is_error, no model usage): says nothing about the task
+      api_interrupted  the API failed after work had begun (is_error, terminal_reason api_error, model usage)
+    Both are invalid attempts, never failed ones, and both stop a batch (the next attempt would hit the same wall)."""
+    if not result or not result.get("is_error"):
+        return None
+    rejected = [r["rate_limit_info"] for r in rate_limits
+                if (r.get("rate_limit_info") or {}).get("status") == "rejected"]
+    why = result.get("terminal_reason") or "is_error"
+    if rejected:
+        info = rejected[-1]
+        when = time.strftime("%H:%M", time.localtime(info["resetsAt"])) if info.get("resetsAt") else "?"
+        why = f"rate limit rejected ({info.get('rateLimitType')}, resets at {when})"
+    if not result.get("modelUsage"):
+        return "api_error", f"the model was not reached: {why}"
+    if result.get("terminal_reason") == "api_error":
+        return "api_interrupted", f"the API failed after work had begun: {why}"
+    return None
+
+
+def rate_limit_events(path):
+    recs, _ = jl(path)
+    return [r for r in recs or [] if r.get("type") == "rate_limit_event"]
+
+
 # --- advisor: calls, results and which block they answer -------------------------------------------------
 
 def advisor_calls(transcript):
@@ -725,6 +756,34 @@ def parse_unittest(text):
     return int(ran[-1]), sum(counts.values())
 
 
+# unittest's verbose output: "test_x (pkg.Class.test_x) ... ok" (3.11+) or "test_x (pkg.Class) ... ok" (up to 3.10);
+# a docstring, if any, sits on its own line before " ... ". With subTest the status line is missing or empty
+# (3.9 prints the next test on the same line), so FAIL:/ERROR: headers of the failure report have the last word.
+_TEST = r"(test\w*) \(([\w.]+)\)"
+_STATUS = re.compile(_TEST + r"(?:\n[^\n]*?)? \.\.\. (ok|FAIL|ERROR|skipped|expected failure|unexpected success)")
+_FAILURE = re.compile(r"^(FAIL|ERROR): " + _TEST, re.M)
+
+
+def _case(name, where):
+    """Full id module.Class.test: one-named tests in different modules stay apart."""
+    cls = where[:-len(name) - 1] if where.endswith("." + name) else where
+    return f"{cls}.{name}"
+
+
+def parse_cases(text):
+    """{"module.Class.test_name": status} from unittest's verbose output ({} when it is not verbose). status: ok, FAIL,
+    ERROR, skipped, expected failure, unexpected success, or unknown; only ok is a pass."""
+    cases = {}
+    for name, where in re.findall(_TEST + r" \.\.\. ", text):
+        cases.setdefault(_case(name, where), "unknown")
+    for name, where, status in _STATUS.findall(text):
+        if cases.get(_case(name, where)) in (None, "unknown"):
+            cases[_case(name, where)] = status
+    for status, name, where in _FAILURE.findall(text):
+        cases[_case(name, where)] = status
+    return cases
+
+
 TEST_ENV_ALLOW = re.compile(r"^(PATH|LANG|LC_[A-Z_]+|TZ|TMPDIR)$")
 
 
@@ -779,10 +838,15 @@ def run_suite(name, cmd, snapshot, run_dir, expected=None, timeout=300, hidden_d
     text = (r["out"] or "") + (r["err"] or "")
     ran, failed = parse_unittest(text)
     report = ran is not None and failed is not None
-    passed = (ran - failed) if report else None
+    cases = parse_cases(text)
+    if report and len(cases) == ran:             # per-test outcomes: subTest failures cannot push this below 0
+        passed = sum(1 for st in cases.values() if st == "ok")
+    else:
+        passed = max(ran - failed, 0) if report else None
     ok = (r["code"] == 0 and report and failed == 0 and ran > 0 and (expected is None or ran == expected))
     return {"cmd": cmd, "exit_code": r["code"], "timed_out": r["timed_out"], "report": report, "tests": ran,
             "expected": expected, "passed": passed, "ok": bool(ok), "seconds": r["s"], "sandbox": sandbox,
+            "cases": cases or None, "not_passed": sorted(k for k, st in cases.items() if st != "ok"),
             "tail": text[-1500:]}
 
 
@@ -830,7 +894,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     problems = rj["integrity"]
 
     def save():
-        rj["valid"] = not problems and rj.get("session_status") not in (None, "not_started")
+        rj["valid"] = not problems and rj.get("session_status") not in (None, "not_started", "running")
         (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False, default=str))
 
     def stop(why):
@@ -904,7 +968,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     if result:
         rj["result"] = {k: result.get(k) for k in ("subtype", "is_error", "total_cost_usd", "duration_ms",
                                                    "duration_api_ms", "num_turns", "usage", "modelUsage", "session_id",
-                                                   "permission_denials")}
+                                                   "permission_denials", "terminal_reason")}
         denials = result.get("permission_denials") or []
         if denials and not (plan or {}).get("probe"):
             # in a real run every refusal changes what the agent could do: never silently part of the data
@@ -916,6 +980,13 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         problems.append("no result message in stream")
     rj["session_status"] = ("timeout" if sess["timed_out"] else (result or {}).get("subtype") or
                             f"exit_{sess['exit_code']}") + ("" if not (result or {}).get("is_error") else ":is_error")
+    limits = rate_limit_events(run_dir / "stream.jsonl")
+    if limits:
+        rj["rate_limit_events"] = [r.get("rate_limit_info") for r in limits]
+    failure = api_failure(result, limits)
+    if failure:
+        rj["session_status"], why = failure
+        problems.append(why)
 
     # observation logs: wait for Jev workers, then close open decisions
     hook_env = dict(os.environ, SWARMSCOPE_DIR=str(sw), SWARMSCOPE_POLICY_FILE=str(policy_file))
@@ -1063,12 +1134,86 @@ def line(rj):
     adv = rj.get("advisor") or {}
     cost = (rj.get("costs") or {}).get("claude_code_total_usd")
     probe = (rj.get("plan") or {}).get("probe")
-    return (f"{rj['run_id']}  {rj['task_id']:<8} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
+    return (f"{rj['run_id']}  {rj['task_id']:<10} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
             f"hidden {h.get('passed', '-')}/{h.get('expected') or h.get('tests', '-')}  "
             f"${cost if cost is not None else float('nan'):.3f}  opus {adv.get('called', '-')} "
             f"(req {adv.get('requested', '-')}, vol {adv.get('voluntary', '-')})  "
             f"{(rj.get('session') or {}).get('wall_s', '-')} s  "
             f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}")
+
+
+def experiment_key(rj):
+    """What must be equal for attempts to be pooled: task, hidden tests, modes, policy, models, Claude Code."""
+    cfg, task, ver = rj.get("config") or {}, rj.get("task") or {}, rj.get("versions") or {}
+    parts = [task.get("sha256"), task.get("hidden_tests_sha256"), ver.get("modes_file_sha256"),
+             cfg.get("policy_sha256"), cfg.get("model"), cfg.get("advisor"), cfg.get("effort_requested"),
+             ver.get("claude_code")]
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:8]
+
+
+def calibration(run_jsons, mode="A", batch=None):
+    """Per task and experiment version (experiment_key): valid attempts in `mode`, successes, hidden tests passed
+    per attempt and how often each hidden test did not pass. Only finished records count; invalid ones are
+    counted separately and never mixed in. A valid timeout with a recorded verdict is an outcome like any other."""
+    out = {}
+    for rj in run_jsons:
+        plan = rj.get("plan") or {}
+        if rj.get("mode") != mode or plan.get("probe") or (batch and plan.get("batch_id") != batch):
+            continue
+        if not (rj.get("finished_at") and rj.get("verdict")):
+            continue                                   # still running or the runner died: not an attempt yet
+        t = out.setdefault(f"{rj.get('task_id')}@{experiment_key(rj)}", {
+            "task_id": rj.get("task_id"), "valid": 0, "invalid": 0, "success": 0, "passed": [], "expected": None,
+            "not_passed": {}, "cost_usd": [], "runs": [], "batches": []})
+        b = plan.get("batch_id")
+        if b and b not in t["batches"]:
+            t["batches"].append(b)
+        # records written before api_failure() existed can say valid although the model was never reached
+        if (not rj.get("valid") or rj.get("session_status") in API_FAILURES
+                or (api_failure(rj.get("result")) or ("",))[0] == "api_error"):
+            t["invalid"] += 1
+            continue
+        h = (rj.get("tests") or {}).get("hidden") or {}
+        t["valid"] += 1
+        t["success"] += bool(rj.get("success"))
+        t["passed"].append(h.get("passed"))
+        t["expected"] = h.get("expected") or t["expected"]
+        t["runs"].append(rj.get("run_id"))
+        cost = (rj.get("costs") or {}).get("claude_code_total_usd")
+        if cost is not None:
+            t["cost_usd"].append(cost)
+        for name in h.get("not_passed") or []:
+            t["not_passed"][name] = t["not_passed"].get(name, 0) + 1
+    return out
+
+
+def cmd_calib(a):
+    runs = []
+    for p in sorted((lab_root() / "runs").glob("*/run.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            runs.append(json.loads(p.read_text()))
+        except Exception as e:
+            print(f"{p.parent.name}: unreadable ({e})")
+    table = calibration(runs, a.mode, a.batch)
+    if a.json:
+        print(json.dumps(table, indent=2))
+        return 0
+    seen = {}
+    for key in table:
+        seen[table[key]["task_id"]] = seen.get(table[key]["task_id"], 0) + 1
+    for key, t in sorted(table.items(), key=lambda kv: str(kv[0])):
+        cost = f"${sum(t['cost_usd']) / len(t['cost_usd']):.3f}" if t["cost_usd"] else "-"
+        print(f"{key:<20} {a.mode}: {t['success']}/{t['valid']} success  hidden {t['passed']} of "
+              f"{t['expected'] or '-'}  mean {cost}" + (f"  (+{t['invalid']} invalid)" if t["invalid"] else "")
+              + (f"  batches {', '.join(t['batches'])}" if t["batches"] else ""))
+        if seen[t["task_id"]] > 1:
+            print(f"    ! {t['task_id']} has {seen[t['task_id']]} experiment versions (task, tests, modes, policy, "
+                  f"models or Claude Code changed); they are not pooled")
+        for name, n in sorted(t["not_passed"].items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"    {n}x {name}")
+    if not table:
+        print(f"no runs in mode {a.mode}")
+    return 0
 
 
 def cmd_setup(_):
@@ -1368,8 +1513,9 @@ def cmd_batch(a):
                                  "success": rj.get("success")})
         manifest["valid"] &= bool(rj.get("valid"))
         mpath.write_text(json.dumps(manifest, indent=2))
-        if rj.get("session_status") == "not_started":
-            print("stopping the batch: attempt not started (see its run.json)")
+        if rj.get("session_status") in ("not_started",) + API_FAILURES:
+            print(f"stopping the batch: {rj['session_status']} (see {rj['run_id']}/run.json: "
+                  f"{'; '.join(rj.get('integrity') or [])})")
             break
     return 0 if manifest["valid"] else 1
 
@@ -1403,9 +1549,13 @@ def main(argv=None):
     b.add_argument("--repeats", type=int, default=1)
     b.add_argument("--seed", type=int, required=True)
     sub.add_parser("summary")
+    c = sub.add_parser("calib")
+    c.add_argument("--mode", default="A")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--batch", help="only this batch id")
     a = ap.parse_args(argv)
     return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch,
-            "summary": cmd_summary}[a.cmd](a) or 0
+            "calib": cmd_calib, "summary": cmd_summary}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":

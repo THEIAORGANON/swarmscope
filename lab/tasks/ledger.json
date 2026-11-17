@@ -1,0 +1,21 @@
+{
+  "task_id": "ledger",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/ledger",
+    "commit": "1c579bd",
+    "commit_full": "1c579bdf646b18694a642b98636c4e28f724d1d8",
+    "exclude": []
+  },
+  "prompt": "Add src/ledger/split.py with two functions.\nallocate(money, weights) splits a Money into len(weights) Money parts in the same currency, proportional to the weights.\n- Weights are ints or Decimals, all >= 0, at least one > 0; otherwise raise ValueError (TypeError for floats).\n- The parts add up exactly to money, and every part is a whole number of minor units of the currency.\n- Rounding: compute each exact share of the absolute amount in minor units; every part first gets its share rounded toward zero; the minor units still left over go one each to the parts with the largest discarded fractions, ties to the lower index. A negative amount is split like its absolute value, with every part negated.\nsettle(balances) takes a dict name -> Money (positive: the person is owed money; negative: the person owes money) and returns a list of payments (debtor, creditor, Money).\n- All balances must be in one currency (else CurrencyMismatch) and add up to zero (else ValueError).\n- Repeat until every balance is zero: the debtor who owes the most pays the creditor who is owed the most (ties: the alphabetically first name) the smaller of the two amounts. Do not modify the dict passed in.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/ledger/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 11
+  },
+  "difficulty": "medium",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: half-even rounding (public); negative amounts split as mirrored absolute value; leftover units by largest fraction then index, never to zero weights; minor units per currency; settle must re-pick the largest debtor/creditor after every payment; do not mutate input",
+  "task_summary": "Add exact proportional money allocation (largest remainder, negatives, minor units) and greedy debt settlement, and fix a failing rounding test; done when all unit tests pass."
+}

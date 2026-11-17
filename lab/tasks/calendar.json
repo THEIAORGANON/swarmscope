@@ -1,0 +1,21 @@
+{
+  "task_id": "calendar",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/calendar",
+    "commit": "fa1599e",
+    "commit_full": "fa1599e179da8d218e041f985ba75ac892bb96ef",
+    "exclude": []
+  },
+  "prompt": "Implement free_slots(events, recurring, day, tz, work_start, work_end, min_minutes) in src/cal/freebusy.py.\n- tz is an IANA time zone name. The working window runs from work_start to work_end on `day`, as wall-clock times in tz (work_start < work_end).\n- Busy time is every Event and every occurrence of every Recurring; src/cal/model.py describes both. All intervals are half-open [start, end).\n- Return the free parts of the working window whose real elapsed length is at least min_minutes, as a sorted list of (start, end) pairs of timezone-aware datetimes in zoneinfo.ZoneInfo(tz).\n- Use zoneinfo and handle daylight saving time correctly. Recurring start times never fall into a daylight saving gap.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/calendar/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 11
+  },
+  "difficulty": "hard",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: touching intervals merge (public); aware datetime +/- in the same zone is wall-clock arithmetic in Python; 23/25-hour days; recurring keeps its wall-clock time across DST; US and EU switch on different dates; occurrence on the previous local date of the event's zone; first/until/skip are local dates of the event's zone; output in the viewer's zone",
+  "task_summary": "Compute free time slots in a working window across time zones and daylight saving changes, with one-off and recurring events, and fix a failing merge test; done when all unit tests pass."
+}

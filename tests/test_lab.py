@@ -90,7 +90,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -511,3 +511,213 @@ def test_symlink_changes_are_in_the_diff(tmp_path):
     os.symlink("/etc/passwd", snap / "a.py")
     d = lab.final_diff(base, snap, run)
     assert [f["path"] for f in d["files"]] == ["a.py"] and "symlink -> /etc/passwd" in (run / "final.diff").read_text()
+
+
+# --- per-test outcomes for task calibration (4b) -------------------------------------------------------------
+
+VERBOSE_311 = """test_a (__main__.Hidden.test_a) ... ok
+test_b (__main__.Hidden.test_b) ... FAIL
+test_c (__main__.Hidden.test_c) ... ERROR
+test_d (__main__.Hidden.test_d) ... skipped 'later'
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.01s
+
+FAILED (failures=1, errors=1, skipped=1)
+"""
+VERBOSE_39 = """test_a (__main__.Hidden) ... ok
+test_b (__main__.Hidden)
+What b checks. ... FAIL
+test_c (pkg.mod.Other) ... expected failure
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.01s
+
+FAILED (failures=1, expected failures=1)
+"""
+
+
+@pytest.mark.parametrize("text,expected", [
+    (VERBOSE_311, {"__main__.Hidden.test_a": "ok", "__main__.Hidden.test_b": "FAIL", "__main__.Hidden.test_c": "ERROR",
+                   "__main__.Hidden.test_d": "skipped"}),
+    (VERBOSE_39, {"__main__.Hidden.test_a": "ok", "__main__.Hidden.test_b": "FAIL",
+                  "pkg.mod.Other.test_c": "expected failure"}),
+    ("..F\n----\nRan 3 tests in 0.01s\n\nFAILED (failures=1)\n", {}),
+    # subTest, 3.9: the failing test has no status of its own, the next test is printed on the same line
+    ("test_a (__main__.T) ... test_b (__main__.T) ... ok\n\n" + "=" * 70 + "\nFAIL: test_a (__main__.T) (i=1)\n"
+     + "-" * 70 + "\nTraceback\n\nRan 2 tests in 0.0s\n\nFAILED (failures=2)\n",
+     {"__main__.T.test_a": "FAIL", "__main__.T.test_b": "ok"}),
+    # subTest, 3.11+: an empty status line, then one indented line per failing subtest
+    ("test_a (__main__.T.test_a) ... \n  test_a (__main__.T.test_a) (i=1) ... FAIL\ntest_b (__main__.T.test_b) ... ok\n"
+     "\n" + "=" * 70 + "\nFAIL: test_a (__main__.T.test_a) (i=1)\n" + "-" * 70 + "\nTraceback\n\nRan 2 tests in 0.0s\n\n"
+     "FAILED (failures=2)\n", {"__main__.T.test_a": "FAIL", "__main__.T.test_b": "ok"}),
+])
+def test_parse_cases_reads_both_unittest_formats(text, expected):
+    assert lab.parse_cases(text) == expected
+
+
+SUBTESTS = '''import unittest
+class T(unittest.TestCase):
+    def test_a(self):
+        for i in range(3):
+            with self.subTest(i=i):
+                self.assertEqual(i, 0)
+    def test_b(self):
+        pass
+unittest.main(verbosity=2)
+'''
+
+
+def test_hidden_suite_records_which_tests_failed_and_subtests_do_not_go_negative(tmp_path):
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "t.py").write_text(SUBTESTS)
+    r = lab.run_suite("hidden", f"{sys.executable} t.py", snap, tmp_path, expected=2, work_base=tmp_path)
+    # unittest says "Ran 2 tests ... FAILED (failures=2)": two subtests of one test; ran - failed would be 0 here
+    # and below 0 with a third failing subtest, so count passes per test instead
+    assert r["tests"] == 2 and r["passed"] == 1 and r["ok"] is False
+    assert r["cases"] == {"__main__.T.test_a": "FAIL", "__main__.T.test_b": "ok"}
+    assert r["not_passed"] == ["__main__.T.test_a"]
+
+
+def _rj(run_id, task="semver", mode="A", valid=True, success=False, passed=5, not_passed=(), cost=0.1, probe=False,
+        batch="b1", task_sha="t1", finished=True, status="success"):
+    r = {"run_id": run_id, "task_id": task, "mode": mode, "valid": valid, "success": success, "session_status": status,
+         "plan": {"probe": True} if probe else {"batch_id": batch}, "costs": {"claude_code_total_usd": cost},
+         "task": {"sha256": task_sha, "hidden_tests_sha256": "h1"}, "versions": {"modes_file_sha256": "m1",
+                                                                                "claude_code": "2.1.326"},
+         "config": {"policy_sha256": "p1", "model": "claude-sonnet-5-5", "advisor": "claude-opus-5-5",
+                    "effort_requested": "high"},
+         "result": {"is_error": False, "modelUsage": {"claude-sonnet-5-5": {}}},
+         "tests": {"hidden": {"passed": passed, "expected": 7, "not_passed": list(not_passed)}}}
+    if finished:
+        r.update(finished_at="2026-11-17T19:00:00+0200", verdict={"task_passed": success})
+    return r
+
+
+def test_calibration_counts_valid_runs_per_task_and_failing_tests():
+    runs = [_rj("r1", success=True, passed=7),
+            _rj("r2", passed=5, not_passed=["m.Hidden.test_caret", "m.Hidden.test_prerelease"]),
+            _rj("r3", passed=6, not_passed=["m.Hidden.test_prerelease"], status="timeout"),   # a valid timeout counts
+            _rj("r4", valid=False, success=True, passed=7),
+            _rj("r5", mode="B", success=True, passed=7),
+            _rj("r6", task="cron", probe=True)]
+    t = lab.calibration(runs, "A")
+    assert len(t) == 1
+    s = next(iter(t.values()))
+    assert s["task_id"] == "semver"
+    assert (s["valid"], s["invalid"], s["success"], s["passed"], s["expected"]) == (3, 1, 1, [7, 5, 6], 7)
+    assert s["not_passed"] == {"m.Hidden.test_caret": 1, "m.Hidden.test_prerelease": 2}
+    assert s["runs"] == ["r1", "r2", "r3"] and s["batches"] == ["b1"]
+
+
+def test_calibration_keeps_experiment_versions_apart_and_skips_unfinished_records():
+    """Review of PR #3: same task_id with another task/tests/modes hash must not be pooled; a record still marked
+    running (or left behind by a dead runner) is not an attempt."""
+    runs = [_rj("r1", success=True, passed=7), _rj("r2", task_sha="t2", passed=3, batch="b2"),
+            _rj("r3", success=True, passed=7, finished=False, status="running")]
+    t = lab.calibration(runs, "A")
+    assert sorted((v["task_id"], v["runs"]) for v in t.values()) == [("semver", ["r1"]), ("semver", ["r2"])]
+    assert [v["runs"] for v in lab.calibration(runs, "A", batch="b2").values()] == [["r2"]]
+
+
+def test_calib_command_prints_per_task_lines(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SWARMSCOPE_LAB", str(tmp_path))
+    for rid, sha in (("abc", "t1"), ("def", "t2")):
+        d = tmp_path / "runs" / rid
+        d.mkdir(parents=True)
+        (d / "run.json").write_text(json.dumps(_rj(rid, task="cron", passed=9, cost=0.25, task_sha=sha,
+                                                   not_passed=["__main__.Hidden.test_star"])))
+    assert lab.main(["calib"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("cron@") == 2 and "0/1 success" in out and "[9] of 7" in out and "$0.250" in out
+    assert "1x __main__.Hidden.test_star" in out and "! cron has 2 experiment versions" in out
+
+
+def test_calibration_ignores_old_runs_that_never_reached_the_model():
+    old = _rj("4df49f778f", passed=0, not_passed=["__main__.Hidden.test_or"], status="success:is_error")
+    old["result"] = {"subtype": "success", "is_error": True, "total_cost_usd": 0, "modelUsage": {}}
+    t = next(iter(lab.calibration([old], "A").values()))
+    assert (t["valid"], t["invalid"], t["not_passed"]) == (0, 1, {})
+
+
+@pytest.mark.parametrize("result,limits,expected", [
+    ({"is_error": False, "modelUsage": {"s": {}}}, [{"rate_limit_info": {"status": "rejected"}}], None),
+    ({"is_error": True, "modelUsage": {}, "terminal_reason": "api_error"}, [], "api_error"),
+    ({"is_error": True, "modelUsage": {"s": {}}, "terminal_reason": "api_error"}, [], "api_interrupted"),
+    ({"is_error": True, "modelUsage": {"s": {}}, "terminal_reason": "max_turns"}, [], None),
+    (None, [{"rate_limit_info": {"status": "rejected"}}], None),
+])
+def test_api_failure_is_decided_by_the_terminal_result(result, limits, expected):
+    got = lab.api_failure(result, limits)
+    assert (got[0] if got else None) == expected
+
+
+def test_rejected_event_in_a_finished_session_does_not_invalidate_it(task, monkeypatch):
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "warn")
+    r = lab.attempt(task, "A")
+    assert r["session_status"] == "success" and r["valid"] is True
+    assert r["rate_limit_events"][0]["status"] == "rejected"
+
+
+def test_api_failure_after_work_began_is_recorded_apart_and_stops_the_batch(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "mid")
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "2", "--seed", "1"]) == 1
+    out = capsys.readouterr().out
+    assert "stopping the batch: api_interrupted" in out and out.count("session running") == 1
+    rj = json.loads(next((lab.lab_root() / "runs").glob("*/run.json")).read_text())
+    assert rj["valid"] is False and any("after work had begun" in p for p in rj["integrity"])
+
+
+def test_same_test_name_in_two_modules_stays_apart():
+    text = ("test_x (pkg.a.Hidden.test_x) ... ok\ntest_x (pkg.b.Hidden.test_x) ... FAIL\n\n" + "=" * 70
+            + "\nFAIL: test_x (pkg.b.Hidden.test_x)\n\nRan 2 tests in 0.0s\n\nFAILED (failures=1)\n")
+    assert lab.parse_cases(text) == {"pkg.a.Hidden.test_x": "ok", "pkg.b.Hidden.test_x": "FAIL"}
+
+
+def _tiny_task(root, mutant_new):
+    t = root / "tiny"
+    (t / "base" / "src").mkdir(parents=True)
+    (t / "base" / "tests").mkdir()
+    (t / "base" / "tests" / "__init__.py").write_text("")
+    (t / "base" / "src" / "m.py").write_text("def f(x):\n    raise NotImplementedError\n")
+    (t / "base" / "tests" / "test_m.py").write_text(
+        "import unittest\nfrom m import f\nclass T(unittest.TestCase):\n    def test_one(self):\n"
+        "        self.assertEqual(f(1), 2)\n")
+    (t / "ref" / "src").mkdir(parents=True)
+    (t / "ref" / "src" / "m.py").write_text("def f(x):\n    return x * 2\n")
+    (t / "hidden").mkdir()
+    (t / "hidden" / "test_hidden.py").write_text(
+        "import unittest\nfrom m import f\nclass Hidden(unittest.TestCase):\n    def test_zero(self):\n"
+        "        self.assertEqual(f(0), 0)\n    def test_neg(self):\n        self.assertEqual(f(-3), -6)\n"
+        "unittest.main(verbosity=2)\n")
+    (t / "task.json").write_text(json.dumps({"id": "tiny", "mutants": [
+        {"name": "m1", "edits": [{"file": "src/m.py", "old": "return x * 2", "new": mutant_new}]}]}))
+    manifest = {"public_tests": f"PYTHONPATH=src {sys.executable} -m unittest discover -s tests -t .",
+                "hidden_tests": {"cmd": f"PYTHONPATH=src {sys.executable} {{hidden}}/test_hidden.py",
+                                 "expected_tests": 2}}
+    return t, manifest
+
+
+def test_task_repos_are_deterministic_and_validation_catches_a_weak_hidden_suite(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "lab", "tasks"))
+    import build_tasks
+    t, manifest = _tiny_task(tmp_path, "return x + x if x else 0")     # equivalent: no hidden test can catch it
+    a = build_tasks.build_repo(t / "base", tmp_path / "r1")
+    b = build_tasks.build_repo(t / "base", tmp_path / "r2")
+    assert a == b
+    assert any("tiny/m1" in p for p in build_tasks.validate(t, manifest))
+    t2, manifest = _tiny_task(tmp_path / "second", "return x * 2 if x > 0 else x")   # wrong for -3: caught
+    assert build_tasks.validate(t2, manifest) == []
+
+
+def test_rate_limited_session_is_invalid_and_stops_the_batch(task, monkeypatch, capsys):
+    """17.11: with the 5-hour window used up, Claude Code exits in ~3 s with is_error and $0. That is no attempt
+    at the task: it must not count as a failed A run (0/11), and the batch must not burn through the rest."""
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "1")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and r["success"] is False and r["session_status"] == "api_error"
+    assert any("rate limit rejected (five_hour" in p for p in r["integrity"])
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "3", "--seed", "1"]) == 1
+    out = capsys.readouterr().out
+    assert "stopping the batch: api_error" in out and out.count("session running") == 2      # one attempt per call

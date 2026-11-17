@@ -1,0 +1,21 @@
+{
+  "task_id": "unidiff",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/unidiff",
+    "commit": "f46c793",
+    "commit_full": "f46c793f0227275fea0a41a5320b67ad3d3db3f7",
+    "exclude": []
+  },
+  "prompt": "Implement apply_patch(text, diff) in src/unidiff/apply.py: apply a unified diff (as written by diff -u or git diff) to text and return the new text.\n- Text and diff are split into lines at \"\\n\" only; every line keeps its line ending (so \"\\r\\n\" stays as it is).\n- Lines before a hunk header that are not part of a hunk (---, +++, diff, index and the like) are ignored. A diff with no hunks raises PatchError.\n- A hunk is a header (see parse_hunk_header in src/unidiff/parse.py) followed by exactly as many lines as its counts say: \" \" context (counts for old and new), \"-\" removed (old), \"+\" added (new). An empty line inside a hunk is a context line for an empty line. A line \"\\ No newline at end of file\" means the line just before it has no line ending. A hunk that ends early or contains any other line raises PatchError.\n- Where a hunk applies: its old lines (context and removed) must match consecutive lines of the text exactly. Its expected position is its old start line (for an old count of 0 the new lines go right after that line; 0 means the start of the text) plus the offset at which the previous hunk was found (found position minus expected position; 0 for the first hunk). Try the expected position, then positions 1, 2, 3, ... lines away, the earlier one first at each distance. A hunk may not match before the end of the lines matched by the previous hunk. If no position matches, raise PatchFailed(n) with n the 1-based number of the hunk.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/unidiff/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 13
+  },
+  "difficulty": "hard",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: count left out means 1 (public); str.splitlines splits on form feed, \\u2028 and \\r; count-driven hunk bodies: '---'/'+++' lines inside a hunk; insertion hunk (old count 0) goes after the line; offset of the previous hunk carries over; nearest match, earlier first; no newline at end of file; blank context lines without the leading space",
+  "task_summary": "Implement applying unified diffs to text (fuzzy offset search, no-newline markers, insertion hunks) and fix a failing hunk-header test; done when all unit tests pass."
+}
