@@ -1,0 +1,21 @@
+{
+  "task_id": "smoke1",
+  "manifest_version": 1,
+  "source": {
+    "repo": "~/Downloads/swarmscope-smoke1",
+    "commit": "2eccfba",
+    "commit_full": "2eccfba8b04f298f19f527a06a1ac2ba45b0e734",
+    "exclude": [
+      ".claude",
+      "PROMPT.txt"
+    ]
+  },
+  "prompt": "Two tests in tests/ fail. Fix them. Then add reservations to Inventory in src/inventory/stock.py:\n- reserve(sku, qty, ttl_seconds, now=None) holds stock and returns a reservation id; available(sku, now=None) excludes held stock; reserving more than is available raises OutOfStock.\n- confirm(res_id, now=None) turns the hold into a permanent removal; release(res_id, now=None) gives the stock back.\n- A reservation older than ttl_seconds expires: its stock comes back automatically. confirm or release of an unknown, already finished or expired id raises KeyError.\n- now is a time in seconds for testing; when it is None use time.time().\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-smoke1-hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py"
+  },
+  "difficulty": "easy",
+  "notes": "stdlib unittest only; hidden tests: 7"
+}

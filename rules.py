@@ -30,6 +30,7 @@ Whether Sonnet followed the advice is never claimed: the advice is encrypted.
 
 Policy file: <project>/.claude/swarmscope-policy.json (presence turns the engine on), or
 $SWARMSCOPE_POLICY=observe|advise|enforce. Without either the engine does nothing.
+Experiments: $SWARMSCOPE_POLICY_FILE=<trusted file outside the repo> replaces the project file (see load_policy).
 """
 import fnmatch
 import json
@@ -70,15 +71,34 @@ EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 
 def load_policy(cwd):
-    """Policy dict, or None when the engine is off for this project."""
+    """Policy dict, or None when the engine is off for this project.
+
+    $SWARMSCOPE_POLICY_FILE (set by the experiment runner, outside the repo the agent works in) replaces the
+    project file entirely: <project>/.claude/swarmscope-policy.json is then never read, so nothing inside the
+    repo can change the policy or the Jev settings of a run. An unreadable or invalid trusted file turns the
+    engine off (the runner checks that decisions were logged); it never falls back to the project file."""
     env = os.environ.get("SWARMSCOPE_POLICY")
-    path = os.path.join(cwd or ".", ".claude", "swarmscope-policy.json")
+    trusted = os.environ.get("SWARMSCOPE_POLICY_FILE")
+    source = None
     user = None
-    if os.path.exists(path):
+    if trusted:
         try:
-            user = json.loads(open(path).read() or "{}")
+            raw = open(trusted, "rb").read()
+            user = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
-            user = {}
+            return None
+        if not isinstance(user, dict):
+            return None
+        import hashlib
+        source = {"kind": "trusted_file", "path": trusted, "sha256": hashlib.sha256(raw).hexdigest()}
+    else:
+        path = os.path.join(cwd or ".", ".claude", "swarmscope-policy.json")
+        if os.path.exists(path):
+            try:
+                user = json.loads(open(path).read() or "{}")
+            except Exception:
+                user = {}
+            source = {"kind": "project_file", "path": path}
     if user is None and not env:
         return None
     pol = json.loads(json.dumps(DEFAULTS))
@@ -91,6 +111,7 @@ def load_policy(cwd):
         pol["mode"] = env
     if pol["mode"] not in ("observe", "advise", "enforce"):
         pol["mode"] = "observe"
+    pol["_source"] = source or {"kind": "env"}
     return pol
 
 

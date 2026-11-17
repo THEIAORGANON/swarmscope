@@ -109,6 +109,26 @@ Options: `model` (pinned, default `jev-1.14.0`), `threshold` (default 0.5, provi
 
 Key: put it in `typesafe_key` in the swarmscope folder (`chmod 600`), or set `TYPESAFE_API_KEY`. It is only ever sent to `https://api.typesafe.ai/v1/systemone`, and the project's config cannot change that. It is never written to events, decisions or Jev records. `python jevshadow.py --show <session_id>` prints, per checkpoint, which consult rules fired, whether that was applied, whether the advisor was then called, and what Jev said. `--replay <session_id>` sends the stored requests again, or the current question with `--current-question`. Replays are kept apart and never replace the original answers. `python jev_probe.py` makes a one-off test call.
 
+## Lab runner (experimental)
+
+`lab/lab.py` runs the escalation experiment one attempt at a time: a fresh copy of the task's base commit
+(no history, no remote, experiment files excluded), a fresh Claude Code session with its own
+`CLAUDE_CONFIG_DIR`, hooks passed with `--settings` from outside the repo, the policy and Jev settings read
+from a trusted file outside the repo (`SWARMSCOPE_POLICY_FILE`), hidden tests after the session, and one
+`run.json` per attempt (versions, loaded config, decisions, advisor requested/called/returned, Jev, costs,
+diff, tests, integrity problems).
+
+```bash
+python lab/lab.py setup                 # ~/Downloads/swarmscope-lab, then log in once with its config dir
+python lab/lab.py doctor --ping         # CLI flags, isolation checks, one tiny call
+python lab/lab.py batch --task smoke1 --modes A,B --repeats 1 --seed 1
+python lab/lab.py summary
+```
+
+Modes live in `lab/modes.json` (A = rules and Jev only record, B = Rules Engine b-5 enforces), tasks in
+`lab/tasks/`. Every mode gets the same hooks, logs and checks; only the policy differs. Known limitation:
+the agent has a shell, so files outside its working copy are readable; full isolation needs a container.
+
 ## Prompting the advisor
 
 Sonnet chooses when to call the advisor. This line in `CLAUDE.md` makes the three checkpoints more likely:

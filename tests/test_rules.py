@@ -697,3 +697,55 @@ def test_hook_writes_overhead(repo, tmp_path_factory):
     hook(dict(c, hook_event_name="Stop"), env)
     rows = rules.load_log(str(sw / "overhead" / "ovh.jsonl"))
     assert [r["event"] for r in rows] == ["PostToolUse", "Stop"] and "gate_ms" in rows[-1]
+
+
+# --- trusted policy file (experiment runner) -------------------------------------------------------
+
+def _project_with_policy(tmp_path, body):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "swarmscope-policy.json").write_text(json.dumps(body))
+    return proj
+
+
+def test_trusted_policy_file_replaces_project_file(tmp_path, monkeypatch):
+    proj = _project_with_policy(tmp_path, {"mode": "observe", "jev": {"enabled": False}})
+    trusted = tmp_path / "outside" / "policy.json"
+    trusted.parent.mkdir()
+    trusted.write_text(json.dumps({"mode": "enforce", "jev": {"enabled": True}}))
+    monkeypatch.delenv("SWARMSCOPE_POLICY", raising=False)
+    monkeypatch.setenv("SWARMSCOPE_POLICY_FILE", str(trusted))
+    p = rules.load_policy(str(proj))
+    assert p["mode"] == "enforce" and p["jev"] == {"enabled": True}
+    assert p["_source"]["kind"] == "trusted_file" and p["_source"]["path"] == str(trusted)
+    assert len(p["_source"]["sha256"]) == 64
+
+
+def test_trusted_policy_file_turns_engine_on_without_project_file(tmp_path, monkeypatch):
+    proj = tmp_path / "bare"
+    proj.mkdir()
+    trusted = tmp_path / "policy.json"
+    trusted.write_text(json.dumps({"mode": "observe"}))
+    monkeypatch.delenv("SWARMSCOPE_POLICY", raising=False)
+    monkeypatch.setenv("SWARMSCOPE_POLICY_FILE", str(trusted))
+    p = rules.load_policy(str(proj))
+    assert p is not None and p["mode"] == "observe" and p["policy_version"] == rules.POLICY_VERSION
+
+
+@pytest.mark.parametrize("content", [None, "{not json", "[1, 2]"])
+def test_bad_trusted_policy_file_is_off_never_the_project_file(tmp_path, monkeypatch, content):
+    proj = _project_with_policy(tmp_path, {"mode": "enforce"})
+    trusted = tmp_path / "policy.json"
+    if content is not None:
+        trusted.write_text(content)
+    monkeypatch.delenv("SWARMSCOPE_POLICY", raising=False)
+    monkeypatch.setenv("SWARMSCOPE_POLICY_FILE", str(trusted))
+    assert rules.load_policy(str(proj)) is None
+
+
+def test_project_file_still_works_without_trusted_file(tmp_path, monkeypatch):
+    proj = _project_with_policy(tmp_path, {"mode": "advise"})
+    monkeypatch.delenv("SWARMSCOPE_POLICY", raising=False)
+    monkeypatch.delenv("SWARMSCOPE_POLICY_FILE", raising=False)
+    p = rules.load_policy(str(proj))
+    assert p["mode"] == "advise" and p["_source"]["kind"] == "project_file"

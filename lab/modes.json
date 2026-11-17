@@ -1,0 +1,23 @@
+{
+  "version": "m-1",
+  "common": {
+    "model": "sonnet",
+    "advisor": "opus",
+    "effort": "high",
+    "permission_mode": "bypassPermissions",
+    "timeout_s": 1200,
+    "jev": {
+      "enabled": true
+    }
+  },
+  "modes": {
+    "A": {
+      "policy_mode": "observe",
+      "about": "Sonnet + advisor decides itself; rules and Jev only record"
+    },
+    "B": {
+      "policy_mode": "enforce",
+      "about": "Rules Engine b-5 enforces R1/R2/R3 via the Stop hook; Jev records"
+    }
+  }
+}
