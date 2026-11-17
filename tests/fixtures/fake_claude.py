@@ -16,10 +16,14 @@ def iso():
     t=time.time(); return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t%1)*1000)
 def hook(ev, **kw):
     d = dict(session_id=sid, hook_event_name=ev, cwd=cwd, transcript_path=str(tp), **kw)
+    if "hooks" not in settings:
+        return None
     cmd = settings["hooks"][ev][0]["hooks"][0]["command"]
     r = subprocess.run(cmd, shell=True, input=json.dumps(d), capture_output=True, text=True)
     return json.loads(r.stdout) if r.stdout.strip() else None
 out({"type":"system","subtype":"init","session_id":sid,"cwd":cwd,"model":"claude-sonnet-5-5","tools":["Bash","Edit"],"mcp_servers":[],"agents":["search"],"permissionMode":"bypassPermissions"})
+if "hooks" not in settings:
+    out({"type":"result","subtype":"success","is_error":False,"session_id":sid,"result":"OK","total_cost_usd":0.001,"modelUsage":{"claude-sonnet-5-5":{}}}); sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
 f = Path("src/inventory/stock.py"); f.write_text(f.read_text() + "".join(f"# line {i}\n" for i in range(60)))
 hook("PreToolUse", tool_name="Bash", tool_input={"command":"cat > src/inventory/stock.py"})

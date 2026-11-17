@@ -45,7 +45,9 @@ WITH_MATCHER = {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
 # never handed to the agent's process: experiment config, keys, and anything that would change the model
 DROP_ENV = re.compile(r"^(SWARMSCOPE_|TYPESAFE_|CLAUDECODE$|CLAUDE_CODE_ENTRYPOINT$|CLAUDE_CODE_EFFORT_LEVEL$|"
                       r"ANTHROPIC_MODEL$|ANTHROPIC_DEFAULT_|ANTHROPIC_SMALL_FAST_MODEL$|CLAUDE_CONFIG_DIR$)")
-REQUIRED_FLAGS = ["--advisor", "--effort", "--settings", "--setting-sources", "--strict-mcp-config",
+# marketplace catalogs Claude Code downloads on first start: metadata, not installed plugins
+MARKETPLACE_CATALOG = ("known_marketplaces.json:", "marketplaces/")
+REQUIRED_FLAGS = ["--effort", "--settings", "--setting-sources", "--strict-mcp-config",
                   "--output-format", "--permission-mode"]
 GIT_ENV = {"GIT_AUTHOR_NAME": "lab", "GIT_AUTHOR_EMAIL": "lab@localhost", "GIT_COMMITTER_NAME": "lab",
            "GIT_COMMITTER_EMAIL": "lab@localhost", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
@@ -169,8 +171,10 @@ def instruction_files_above(work):
     found = []
     d = Path(work).resolve()
     for p in [d] + list(d.parents):
-        for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", ".claude/settings.json",
-                     ".claude/settings.local.json"):
+        names = ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"]
+        if p == d:          # project settings only come from the project itself (and --setting-sources user skips them)
+            names += [".claude/settings.json", ".claude/settings.local.json"]
+        for name in names:
             f = p / name
             if f.exists():
                 found.append(str(f))
@@ -211,9 +215,12 @@ def preflight(work, cfg):
                   "enabledPlugins"):
             if k in st:
                 problems.append(f"config settings.json sets '{k}': remove it (the runner sets everything)")
-    for sub in ("commands", "skills", "plugins", "output-styles"):
+    for sub in ("commands", "skills", "output-styles"):
         if inv[sub]:
             problems.append(f"config dir has {sub}: {inv[sub][:3]}")
+    installed = [f for f in inv["plugins"] if not f.startswith(MARKETPLACE_CATALOG)]
+    if installed:
+        problems.append(f"config dir has plugin files beyond marketplace catalogs: {installed[:3]}")
     above = instruction_files_above(work)
     if above:
         problems.append(f"instruction/settings files in or above the working copy: {above}")
@@ -658,7 +665,8 @@ def cmd_doctor(a):
     hlp = sh([claude_bin(), "--help"], env=env)
     text = hlp["out"] + hlp["err"]
     missing = [f for f in REQUIRED_FLAGS if f not in text]
-    print(f"flags        {'all present' if not missing else 'MISSING ' + ' '.join(missing)}")
+    print(f"flags        {'all in --help' if not missing else 'MISSING from --help ' + ' '.join(missing)}"
+          + "  (--advisor is hidden from --help; --ping checks the real command line)")
     ok &= not missing
     probe = lab / "w" / "_doctor"
     probe.mkdir(parents=True, exist_ok=True)
@@ -677,15 +685,34 @@ def cmd_doctor(a):
     print(f"modes        {modes.get('version')}: " + ", ".join(f"{k}={v['policy_mode']}" for k, v in modes["modes"].items())
           + f" · model {modes['common']['model']} · advisor {modes['common']['advisor']} · effort {modes['common']['effort']}")
     if a.ping:
-        r = sh([claude_bin(), "-p", "--output-format", "json", "--model", "haiku", "--strict-mcp-config",
-                "--setting-sources", "user", "Reply with the single word OK."], cwd=probe, env=env, timeout=120)
-        try:
-            j = json.loads(r["out"])
-            print(f"ping         {j.get('result', '').strip()[:40]!r}  ${j.get('total_cost_usd', 0):.5f}")
-            ok &= not j.get("is_error")
-        except ValueError:
-            print(f"ping         FAILED: {(r['out'] + r['err']).strip()[:300]}")
+        # the exact command line of a run (model, advisor, effort, settings, sources, MCP, permissions),
+        # with an empty settings file instead of the hooks
+        empty = lab / "w" / "_doctor_settings.json"
+        empty.write_text("{}")
+        r = sh(claude_cmd(modes, empty), cwd=probe, env=env, timeout=180,
+               input="Reply with the single word OK. Do not use any tools.")
+        empty.unlink()
+        recs = []
+        for ln in (r["out"] or "").splitlines():
+            try:
+                recs.append(json.loads(ln))
+            except ValueError:
+                pass
+        init = next((x for x in recs if x.get("type") == "system" and x.get("subtype") == "init"), None)
+        res = next((x for x in reversed(recs) if x.get("type") == "result"), None)
+        if not res:
+            print(f"ping         FAILED (exit {r['code']}): {(r['err'] or r['out']).strip()[:400]}")
             ok = False
+        else:
+            print(f"ping         {str(res.get('result', '')).strip()[:40]!r}  ${res.get('total_cost_usd') or 0:.5f}"
+                  f"  models: {', '.join(sorted((res.get('modelUsage') or {}).keys())) or '?'}")
+            ok &= not res.get("is_error")
+        if init:
+            adv = {k: v for k, v in init.items() if "advis" in k.lower() or "effort" in k.lower()}
+            print(f"loaded       model {init.get('model')} · permission {init.get('permissionMode')} · "
+                  f"mcp {init.get('mcp_servers')} · agents {init.get('agents')}")
+            print(f"             advisor/effort fields in init: {adv or 'none reported'}")
+            print(f"             init keys: {', '.join(sorted(init.keys()))}")
     shutil.rmtree(probe, ignore_errors=True)
     print("ready" if ok else "not ready")
     return 0 if ok else 1

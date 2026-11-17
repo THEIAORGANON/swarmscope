@@ -106,3 +106,29 @@ def test_voluntary_and_answering_calls():
     calls = [{"id": "c0", "ts": 50.0, "status": "returned"}, {"id": "c1", "ts": 101.0, "status": "returned"}]
     out, unanswered = lab.attribute_calls(calls, reqs)
     assert [c["voluntary"] for c in out] == [True, False] and out[1]["answers_request"] == "r1" and unanswered == []
+
+
+def test_marketplace_catalogs_and_home_settings_are_not_problems(task):
+    cfg = lab.lab_root() / "config"
+    (cfg / "plugins" / "marketplaces" / "official").mkdir(parents=True)
+    (cfg / "plugins" / "known_marketplaces.json").write_text("{}")
+    (cfg / "plugins" / "marketplaces" / "official" / "marketplace.json").write_text("{}")
+    home_claude = lab.lab_root().parent / ".claude"            # an ancestor's .claude/settings.json
+    home_claude.mkdir(exist_ok=True)
+    (home_claude / "settings.json").write_text('{"hooks": {}}')
+    work = lab.lab_root() / "w" / "x"
+    work.mkdir(parents=True)
+    pf = lab.preflight(work, cfg)
+    assert pf["ok"], pf["problems"]
+    (cfg / "plugins" / "installed_plugins.json").write_text("{}")
+    (home_claude / "CLAUDE.md").write_text("consult the advisor")
+    pf = lab.preflight(work, cfg)
+    assert any("plugin files" in p for p in pf["problems"]) and any(".claude/CLAUDE.md" in p for p in pf["problems"])
+
+
+def test_doctor_ping_runs_the_real_command_line(task, capsys):
+    import argparse
+    assert lab.cmd_doctor(argparse.Namespace(ping=True)) == 0
+    out = capsys.readouterr().out
+    assert "'OK'" in out and "advisor/effort fields in init" in out
+    assert "ready" in out.splitlines()[-1]
