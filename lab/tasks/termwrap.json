@@ -1,0 +1,21 @@
+{
+  "task_id": "termwrap",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/termwrap",
+    "commit": "810a178",
+    "commit_full": "810a1786829bfc2f95b2291e88d4692382647b03",
+    "exclude": []
+  },
+  "prompt": "Add src/termtext/wrap.py with wrap(text, width) and truncate(text, width, ellipsis=\"\\u2026\"), measuring display width with text_width from src/termtext/width.py.\nwrap returns a list of lines:\n- width must be at least 2, otherwise ValueError.\n- The text is split at \"\\n\" into paragraphs, each wrapped on its own; the lines of all paragraphs are returned in order. A paragraph with no words gives one empty line.\n- Words are the runs of characters between spaces (\" \"). Within a line words are joined by one space; lines have no leading or trailing spaces. Each line takes as many of the following words as fit in width.\n- A word wider than width starts on a new line and is cut into pieces, each as long as fits in width; the last piece may be followed by further words on its line.\n- A character is never separated from the zero-width characters (combining marks etc.) that follow it.\ntruncate returns text unchanged if it fits in width. Otherwise it returns the longest prefix that fits in width together with the ellipsis, followed by the ellipsis, again never separating a character from the zero-width characters that follow it. If the ellipsis alone is wider than width, raise ValueError.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/termwrap/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 11
+  },
+  "difficulty": "medium",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: fullwidth F counts 2 (public); long word starts a new line (not textwrap's fill); wide characters at a boundary; combining marks stay with their letter; ellipsis width counts; empty paragraphs",
+  "task_summary": "Add terminal-width-aware wrap and truncate (wide East Asian characters, combining marks) to a text module and fix a failing width test; done when all unit tests pass."
+}

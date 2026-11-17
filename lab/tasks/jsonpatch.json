@@ -1,0 +1,21 @@
+{
+  "task_id": "jsonpatch",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/jsonpatch",
+    "commit": "412ac50",
+    "commit_full": "412ac50ab5fae81e120ba9fd6aac5e00f9c57af3",
+    "exclude": []
+  },
+  "prompt": "Implement apply_patch(doc, operations) in src/jsondoc/patch.py: JSON Patch as defined in RFC 6902 (add, remove, replace, move, copy, test), using the JSON Pointer code in src/jsondoc/pointer.py (RFC 6901). It returns the patched document. The document passed in must never be modified, whether the patch succeeds or fails. Any operation that is invalid or cannot be applied, including a failed test, raises PatchError and no other exception.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/jsonpatch/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 12
+  },
+  "difficulty": "medium",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: pointer ~01 unescape order (public); leading zeros in array index; test: true != 1, 1 == 1.0; copy must not alias; atomicity / input never mutated; add with value null vs missing value; move into own child; move inside array = remove then add; PointerError must surface as PatchError",
+  "task_summary": "Implement RFC 6902 JSON Patch on top of an existing RFC 6901 pointer module and fix a failing pointer test; done when all unit tests pass."
+}

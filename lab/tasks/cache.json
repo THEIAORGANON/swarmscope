@@ -1,0 +1,21 @@
+{
+  "task_id": "cache",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/cache",
+    "commit": "a79420c",
+    "commit_full": "a79420c123511643d28f78534fc88dd237d08b92",
+    "exclude": []
+  },
+  "prompt": "Add src/cachekit/ttl.py with class WeightedTTLCache(max_weight, default_ttl=None, clock=time.monotonic, on_evict=None).\n- put(key, value, weight=1, ttl=<default_ttl>): weight is an int > 0; ttl is in seconds and > 0, or None for an entry that never expires. Leaving ttl out uses default_ttl; passing ttl=None explicitly means the entry never expires even when default_ttl is set. Invalid weight or ttl raises ValueError.\n- An entry put at time t with ttl expires at t + ttl (clock() >= t + ttl): from then on it is gone everywhere (get, peek, in, len, weight, delete).\n- An entry heavier than max_weight raises ValueError and leaves the cache unchanged, including an existing entry with the same key.\n- Putting an existing key replaces its value, weight and expiry and makes it the most recently used entry.\n- After a put, while the total weight of live entries exceeds max_weight, evict the least recently used live entry and call on_evict(key, value) for it.\n- get(key, default=None) returns the value of a live entry and makes it most recently used; it does not change the expiry. peek(key, default=None) and `key in cache` do not change recency.\n- delete(key) removes a live entry, otherwise raises KeyError. len(cache) and the property cache.weight count live entries only.\n- stats() returns {\"hits\": ..., \"misses\": ..., \"evictions\": ...}: hits and misses count get calls only; evictions counts only entries evicted to make room (not expirations, deletes or replacements).\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/cache/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 11
+  },
+  "difficulty": "easy-medium",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: put refreshes recency (public); expired entries never force evictions; replacing a key replaces its weight and recency; too heavy entry leaves the cache unchanged; explicit ttl=None vs default_ttl; expiry at exactly t + ttl; get does not extend expiry; peek/in do not touch recency",
+  "task_summary": "Add a weight-bounded LRU cache with per-entry TTL, eviction callback and stats, and fix a failing LRU test; done when all unit tests pass."
+}

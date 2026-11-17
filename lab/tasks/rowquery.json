@@ -1,0 +1,21 @@
+{
+  "task_id": "rowquery",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/rowquery",
+    "commit": "0a6cfc8",
+    "commit_full": "0a6cfc8a27c8f14666cd1d67d2be9e004063a44f",
+    "exclude": []
+  },
+  "prompt": "Implement select(rows, where=None, order_by=None, limit=None) in src/rowquery/query.py, using the tokenizer in src/rowquery/lexer.py. rows is a list of dicts; select returns a new list of the selected dicts themselves (not copies) and does not change the list passed in.\nwhere (None = no filter) is an expression:\n  expr := term (OR term)* ; term := factor (AND factor)* ; factor := NOT factor | '(' expr ')' | operand cmp operand | operand IS [NOT] NULL\n  cmp is one of = != <> < <= > >=; an operand is a field name, a number, a 'string', true, false or null. Keywords are case-insensitive, field names are case-sensitive.\nSemantics follow SQL:\n- A missing field and a None value are both NULL. A comparison involving NULL is UNKNOWN.\n- Comparing values of different types (number, string, boolean) is UNKNOWN; booleans are not numbers. Ints and floats compare numerically. Booleans support only = and !=; other comparisons of booleans are UNKNOWN.\n- AND, OR and NOT use three-valued logic; IS NULL and IS NOT NULL are never UNKNOWN. A row is selected only if the condition is TRUE.\n- Any syntax error raises QueryError.\norder_by is a comma-separated list of field names, each optionally prefixed with - for descending order. NULLs come after all values when ascending and before all values when descending. The sort is stable. You may assume that the non-NULL values of one sort field have one type.\nlimit is None or an int >= 0 and is applied last.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/rowquery/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 14
+  },
+  "difficulty": "medium-hard",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: '' escape in strings (public); NOT of UNKNOWN stays UNKNOWN; = null is never true; True == 1 in Python; mixed types are UNKNOWN; AND binds tighter than OR, NOT tighter than AND; NULL placement in ascending/descending order; stable sort with multiple keys",
+  "task_summary": "Implement a small SQL-like WHERE/ORDER BY/LIMIT over lists of dicts with SQL NULL (three-valued) semantics, and fix a failing tokenizer test; done when all unit tests pass."
+}

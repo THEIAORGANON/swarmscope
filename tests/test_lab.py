@@ -511,3 +511,136 @@ def test_symlink_changes_are_in_the_diff(tmp_path):
     os.symlink("/etc/passwd", snap / "a.py")
     d = lab.final_diff(base, snap, run)
     assert [f["path"] for f in d["files"]] == ["a.py"] and "symlink -> /etc/passwd" in (run / "final.diff").read_text()
+
+
+# --- per-test outcomes for task calibration (4b) -------------------------------------------------------------
+
+VERBOSE_311 = """test_a (__main__.Hidden.test_a) ... ok
+test_b (__main__.Hidden.test_b) ... FAIL
+test_c (__main__.Hidden.test_c) ... ERROR
+test_d (__main__.Hidden.test_d) ... skipped 'later'
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.01s
+
+FAILED (failures=1, errors=1, skipped=1)
+"""
+VERBOSE_39 = """test_a (__main__.Hidden) ... ok
+test_b (__main__.Hidden)
+What b checks. ... FAIL
+test_c (pkg.mod.Other) ... expected failure
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.01s
+
+FAILED (failures=1, expected failures=1)
+"""
+
+
+@pytest.mark.parametrize("text,expected", [
+    (VERBOSE_311, {"Hidden.test_a": "ok", "Hidden.test_b": "FAIL", "Hidden.test_c": "ERROR",
+                   "Hidden.test_d": "skipped"}),
+    (VERBOSE_39, {"Hidden.test_a": "ok", "Hidden.test_b": "FAIL", "Other.test_c": "expected failure"}),
+    ("..F\n----\nRan 3 tests in 0.01s\n\nFAILED (failures=1)\n", {}),
+    # subTest, 3.9: the failing test has no status of its own, the next test is printed on the same line
+    ("test_a (__main__.T) ... test_b (__main__.T) ... ok\n\n" + "=" * 70 + "\nFAIL: test_a (__main__.T) (i=1)\n"
+     "-" * 70 + "\nTraceback\n\nRan 2 tests in 0.0s\n\nFAILED (failures=2)\n", {"T.test_a": "FAIL", "T.test_b": "ok"}),
+    # subTest, 3.11+: an empty status line, then one indented line per failing subtest
+    ("test_a (__main__.T.test_a) ... \n  test_a (__main__.T.test_a) (i=1) ... FAIL\ntest_b (__main__.T.test_b) ... ok\n"
+     "\n" + "=" * 70 + "\nFAIL: test_a (__main__.T.test_a) (i=1)\n" + "-" * 70 + "\nTraceback\n\nRan 2 tests in 0.0s\n\n"
+     "FAILED (failures=2)\n", {"T.test_a": "FAIL", "T.test_b": "ok"}),
+])
+def test_parse_cases_reads_both_unittest_formats(text, expected):
+    assert lab.parse_cases(text) == expected
+
+
+SUBTESTS = '''import unittest
+class T(unittest.TestCase):
+    def test_a(self):
+        for i in range(3):
+            with self.subTest(i=i):
+                self.assertEqual(i, 0)
+    def test_b(self):
+        pass
+unittest.main(verbosity=2)
+'''
+
+
+def test_hidden_suite_records_which_tests_failed_and_subtests_do_not_go_negative(tmp_path):
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "t.py").write_text(SUBTESTS)
+    r = lab.run_suite("hidden", f"{sys.executable} t.py", snap, tmp_path, expected=2, work_base=tmp_path)
+    # unittest says "Ran 2 tests ... FAILED (failures=2)": two subtests of one test; ran - failed would be 0 here
+    # and below 0 with a third failing subtest, so count passes per test instead
+    assert r["tests"] == 2 and r["passed"] == 1 and r["ok"] is False
+    assert r["cases"] == {"T.test_a": "FAIL", "T.test_b": "ok"} and r["not_passed"] == ["T.test_a"]
+
+
+def test_calibration_counts_valid_runs_per_task_and_failing_tests(tmp_path):
+    def rj(run_id, task, mode="A", valid=True, success=False, passed=5, not_passed=(), cost=0.1, probe=False):
+        return {"run_id": run_id, "task_id": task, "mode": mode, "valid": valid, "success": success,
+                "plan": {"probe": True} if probe else {}, "costs": {"claude_code_total_usd": cost},
+                "tests": {"hidden": {"passed": passed, "expected": 7, "not_passed": list(not_passed)}}}
+    runs = [rj("r1", "semver", success=True, passed=7),
+            rj("r2", "semver", passed=5, not_passed=["Hidden.test_caret", "Hidden.test_prerelease"]),
+            rj("r3", "semver", passed=6, not_passed=["Hidden.test_prerelease"]),
+            rj("r4", "semver", valid=False, success=True, passed=7),
+            rj("r5", "semver", mode="B", success=True, passed=7),
+            rj("r6", "cron", probe=True)]
+    t = lab.calibration(runs, "A")
+    assert set(t) == {"semver"}
+    s = t["semver"]
+    assert (s["valid"], s["invalid"], s["success"], s["passed"], s["expected"]) == (3, 1, 1, [7, 5, 6], 7)
+    assert s["not_passed"] == {"Hidden.test_caret": 1, "Hidden.test_prerelease": 2}
+    assert s["runs"] == ["r1", "r2", "r3"]
+
+
+def test_calib_command_prints_per_task_lines(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SWARMSCOPE_LAB", str(tmp_path))
+    d = tmp_path / "runs" / "abc"
+    d.mkdir(parents=True)
+    (d / "run.json").write_text(json.dumps({
+        "run_id": "abc", "task_id": "cron", "mode": "A", "valid": True, "success": False, "plan": {},
+        "costs": {"claude_code_total_usd": 0.25},
+        "tests": {"hidden": {"passed": 9, "expected": 10, "not_passed": ["Hidden.test_star_with_step_is_unrestricted"]}}}))
+    assert lab.main(["calib"]) == 0
+    out = capsys.readouterr().out
+    assert "cron" in out and "0/1 success" in out and "[9] of 10" in out and "$0.250" in out
+    assert "1x Hidden.test_star_with_step_is_unrestricted" in out
+
+
+def _tiny_task(root, mutant_new):
+    t = root / "tiny"
+    (t / "base" / "src").mkdir(parents=True)
+    (t / "base" / "tests").mkdir()
+    (t / "base" / "tests" / "__init__.py").write_text("")
+    (t / "base" / "src" / "m.py").write_text("def f(x):\n    raise NotImplementedError\n")
+    (t / "base" / "tests" / "test_m.py").write_text(
+        "import unittest\nfrom m import f\nclass T(unittest.TestCase):\n    def test_one(self):\n"
+        "        self.assertEqual(f(1), 2)\n")
+    (t / "ref" / "src").mkdir(parents=True)
+    (t / "ref" / "src" / "m.py").write_text("def f(x):\n    return x * 2\n")
+    (t / "hidden").mkdir()
+    (t / "hidden" / "test_hidden.py").write_text(
+        "import unittest\nfrom m import f\nclass Hidden(unittest.TestCase):\n    def test_zero(self):\n"
+        "        self.assertEqual(f(0), 0)\n    def test_neg(self):\n        self.assertEqual(f(-3), -6)\n"
+        "unittest.main(verbosity=2)\n")
+    (t / "task.json").write_text(json.dumps({"id": "tiny", "mutants": [
+        {"name": "m1", "edits": [{"file": "src/m.py", "old": "return x * 2", "new": mutant_new}]}]}))
+    manifest = {"public_tests": f"PYTHONPATH=src {sys.executable} -m unittest discover -s tests -t .",
+                "hidden_tests": {"cmd": f"PYTHONPATH=src {sys.executable} {{hidden}}/test_hidden.py",
+                                 "expected_tests": 2}}
+    return t, manifest
+
+
+def test_task_repos_are_deterministic_and_validation_catches_a_weak_hidden_suite(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "lab", "tasks"))
+    import build_tasks
+    t, manifest = _tiny_task(tmp_path, "return x + x if x else 0")     # equivalent: no hidden test can catch it
+    a = build_tasks.build_repo(t / "base", tmp_path / "r1")
+    b = build_tasks.build_repo(t / "base", tmp_path / "r2")
+    assert a == b
+    assert any("tiny/m1" in p for p in build_tasks.validate(t, manifest))
+    t2, manifest = _tiny_task(tmp_path / "second", "return x * 2 if x > 0 else x")   # wrong for -3: caught
+    assert build_tasks.validate(t2, manifest) == []

@@ -1,0 +1,21 @@
+{
+  "task_id": "buildgraph",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/buildgraph",
+    "commit": "acd6711",
+    "commit_full": "acd6711eff5ca86f826f15f468a28fa1b96a6322",
+    "exclude": []
+  },
+  "prompt": "Add src/buildgraph/plan.py with plan(graph, changed, built, goals=None) for the Graph in src/buildgraph/graph.py.\n- changed: paths of source files that changed; built: names of targets that are already built. Both are any iterables.\n- The considered targets are the goals and everything they depend on, directly or not; goals=None means every target in the graph. A goal or dependency that names an unknown target raises MissingTargetError.\n- If the considered targets contain a dependency cycle, raise CycleError(cycle), where cycle lists the targets along the cycle with each one depending on the next, starts with the alphabetically smallest target of the cycle and repeats it at the end: ['b', 'c', 'b'] means b depends on c and c depends on b. This applies even if nothing needs to be rebuilt.\n- A considered target needs a rebuild if it is phony, is not in built, has an input in changed, or depends on a target that needs a rebuild.\n- Return the names of the targets that need a rebuild, each after every one of its dependencies that is in the list; whenever several targets could come next, take the alphabetically smallest.\nOne test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/buildgraph/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 11
+  },
+  "difficulty": "medium",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: dependents are transitive (public); smallest ready target first is not the same as level order; phony targets propagate; cycle canonical rotation and direction; cycle raised even when nothing changed; goals limit the considered set; unknown dependency raises even when not rebuilt",
+  "task_summary": "Add an incremental rebuild planner (dependency propagation, phony targets, deterministic order, canonical cycles) and fix a failing dependents test; done when all unit tests pass."
+}

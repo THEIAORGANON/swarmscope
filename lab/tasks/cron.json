@@ -1,0 +1,21 @@
+{
+  "task_id": "cron",
+  "manifest_version": 2,
+  "set": "calib-1",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/cron",
+    "commit": "b68ce2c",
+    "commit_full": "b68ce2cd4554aefdbc008e18e6f0728fcf0cfa02",
+    "exclude": []
+  },
+  "prompt": "Implement next_run(expr, after) in src/cronexpr/schedule.py: the first time strictly after the naive datetime `after` (whole minutes: seconds and microseconds 0) at which the cron expression fires. Follow classic Vixie cron:\n- Five whitespace-separated fields: minute 0-59, hour 0-23, day of month 1-31, month 1-12, day of week 0-7 where both 0 and 7 are Sunday.\n- Each field is a comma-separated list of parts; a part is *, a value, or a range a-b (inclusive), optionally followed by /step; a/step means from a to the highest value of the field. Months may be given as names JAN-DEC and days of week as SUN-SAT, case-insensitive, also in ranges.\n- Day of month and day of week: if both fields are restricted, a day matches when either of them matches; if one of them is unrestricted, only the other one counts. A field counts as unrestricted when it starts with *, so */2 is unrestricted.\n- An invalid expression (wrong number of fields, value out of range, unknown name, step 0, range going backwards, any other syntax error) raises ValueError. If the expression does not fire within 5 years after `after`, raise ValueError.\nExtend parse_field in src/cronexpr/fields.py as needed. One test in tests/ fails; fix the bug behind it.\nAdd tests for the new behaviour. Run all tests with: PYTHONPATH=src python3 -m unittest discover -s tests -t .\n",
+  "public_tests": "PYTHONPATH=src python3 -m unittest discover -s tests -t .",
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/cron/hidden",
+    "cmd": "PYTHONPATH=src python3 {hidden}/test_hidden.py",
+    "expected_tests": 10
+  },
+  "difficulty": "medium",
+  "notes": "calibration candidate (4b), stdlib only, built by lab/tasks/build_tasks.py; traps: inclusive ranges (public); day-of-month OR day-of-week when both restricted; */n counts as unrestricted; 7 is Sunday; a/step runs to the field maximum; strictly after, ignoring seconds; 31st and 29 Feb; impossible dates must not hang",
+  "task_summary": "Implement next run time for Vixie-style cron expressions (steps, names, day-of-month/day-of-week OR rule, leap years) and fix a failing range test; done when all unit tests pass."
+}

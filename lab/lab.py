@@ -11,6 +11,7 @@ of the final snapshot after the session, and one run.json.
   python lab/lab.py run    --task T --mode A
   python lab/lab.py batch  --task T --modes A,B --repeats 1 --seed 1
   python lab/lab.py summary
+  python lab/lab.py calib  [--mode A] [--json]   per task: successes, hidden tests passed, which ones failed
 
 Runner side (the agent can neither read nor write it): $SWARMSCOPE_LAB or ~/Downloads/swarmscope-lab
   config/          CLAUDE_CONFIG_DIR (log in once; agents copied from the repo, nothing else)
@@ -725,6 +726,33 @@ def parse_unittest(text):
     return int(ran[-1]), sum(counts.values())
 
 
+# unittest's verbose output: "test_x (pkg.Class.test_x) ... ok" (3.11+) or "test_x (pkg.Class) ... ok" (up to 3.10);
+# a docstring, if any, sits on its own line before " ... ". With subTest the status line is missing or empty
+# (3.9 prints the next test on the same line), so FAIL:/ERROR: headers of the failure report have the last word.
+_TEST = r"(test\w*) \(([\w.]+)\)"
+_STATUS = re.compile(_TEST + r"(?:\n[^\n]*?)? \.\.\. (ok|FAIL|ERROR|skipped|expected failure|unexpected success)")
+_FAILURE = re.compile(r"^(FAIL|ERROR): " + _TEST, re.M)
+
+
+def _case(name, where):
+    cls = where[:-len(name) - 1] if where.endswith("." + name) else where
+    return f"{cls.rsplit('.', 1)[-1]}.{name}"
+
+
+def parse_cases(text):
+    """{"Class.test_name": status} from unittest's verbose output ({} when it is not verbose). status: ok, FAIL,
+    ERROR, skipped, expected failure, unexpected success, or unknown; only ok is a pass."""
+    cases = {}
+    for name, where in re.findall(_TEST + r" \.\.\. ", text):
+        cases.setdefault(_case(name, where), "unknown")
+    for name, where, status in _STATUS.findall(text):
+        if cases.get(_case(name, where)) in (None, "unknown"):
+            cases[_case(name, where)] = status
+    for status, name, where in _FAILURE.findall(text):
+        cases[_case(name, where)] = status
+    return cases
+
+
 TEST_ENV_ALLOW = re.compile(r"^(PATH|LANG|LC_[A-Z_]+|TZ|TMPDIR)$")
 
 
@@ -779,10 +807,15 @@ def run_suite(name, cmd, snapshot, run_dir, expected=None, timeout=300, hidden_d
     text = (r["out"] or "") + (r["err"] or "")
     ran, failed = parse_unittest(text)
     report = ran is not None and failed is not None
-    passed = (ran - failed) if report else None
+    cases = parse_cases(text)
+    if report and len(cases) == ran:             # per-test outcomes: subTest failures cannot push this below 0
+        passed = sum(1 for st in cases.values() if st == "ok")
+    else:
+        passed = max(ran - failed, 0) if report else None
     ok = (r["code"] == 0 and report and failed == 0 and ran > 0 and (expected is None or ran == expected))
     return {"cmd": cmd, "exit_code": r["code"], "timed_out": r["timed_out"], "report": report, "tests": ran,
             "expected": expected, "passed": passed, "ok": bool(ok), "seconds": r["s"], "sandbox": sandbox,
+            "cases": cases or None, "not_passed": sorted(k for k, st in cases.items() if st != "ok"),
             "tail": text[-1500:]}
 
 
@@ -1063,12 +1096,60 @@ def line(rj):
     adv = rj.get("advisor") or {}
     cost = (rj.get("costs") or {}).get("claude_code_total_usd")
     probe = (rj.get("plan") or {}).get("probe")
-    return (f"{rj['run_id']}  {rj['task_id']:<8} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
+    return (f"{rj['run_id']}  {rj['task_id']:<10} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
             f"hidden {h.get('passed', '-')}/{h.get('expected') or h.get('tests', '-')}  "
             f"${cost if cost is not None else float('nan'):.3f}  opus {adv.get('called', '-')} "
             f"(req {adv.get('requested', '-')}, vol {adv.get('voluntary', '-')})  "
             f"{(rj.get('session') or {}).get('wall_s', '-')} s  "
             f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}")
+
+
+def calibration(run_jsons, mode="A"):
+    """Per task: valid attempts in `mode`, how many succeeded, hidden tests passed per attempt and how often each
+    hidden test did not pass. Invalid attempts are counted separately and never mixed in."""
+    out = {}
+    for rj in run_jsons:
+        if rj.get("mode") != mode or (rj.get("plan") or {}).get("probe"):
+            continue
+        t = out.setdefault(rj.get("task_id"), {"valid": 0, "invalid": 0, "success": 0, "passed": [], "expected": None,
+                                               "not_passed": {}, "cost_usd": [], "runs": []})
+        if not rj.get("valid"):
+            t["invalid"] += 1
+            continue
+        h = (rj.get("tests") or {}).get("hidden") or {}
+        t["valid"] += 1
+        t["success"] += bool(rj.get("success"))
+        t["passed"].append(h.get("passed"))
+        t["expected"] = h.get("expected") or t["expected"]
+        t["runs"].append(rj.get("run_id"))
+        cost = (rj.get("costs") or {}).get("claude_code_total_usd")
+        if cost is not None:
+            t["cost_usd"].append(cost)
+        for name in h.get("not_passed") or []:
+            t["not_passed"][name] = t["not_passed"].get(name, 0) + 1
+    return out
+
+
+def cmd_calib(a):
+    runs = []
+    for p in sorted((lab_root() / "runs").glob("*/run.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            runs.append(json.loads(p.read_text()))
+        except Exception as e:
+            print(f"{p.parent.name}: unreadable ({e})")
+    table = calibration(runs, a.mode)
+    if a.json:
+        print(json.dumps(table, indent=2))
+        return 0
+    for task_id, t in sorted(table.items(), key=lambda kv: str(kv[0])):
+        cost = f"${sum(t['cost_usd']) / len(t['cost_usd']):.3f}" if t["cost_usd"] else "-"
+        print(f"{task_id:<11} {a.mode}: {t['success']}/{t['valid']} success  hidden {t['passed']} of "
+              f"{t['expected'] or '-'}  mean {cost}" + (f"  (+{t['invalid']} invalid)" if t["invalid"] else ""))
+        for name, n in sorted(t["not_passed"].items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"    {n}x {name}")
+    if not table:
+        print(f"no runs in mode {a.mode}")
+    return 0
 
 
 def cmd_setup(_):
@@ -1403,9 +1484,12 @@ def main(argv=None):
     b.add_argument("--repeats", type=int, default=1)
     b.add_argument("--seed", type=int, required=True)
     sub.add_parser("summary")
+    c = sub.add_parser("calib")
+    c.add_argument("--mode", default="A")
+    c.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch,
-            "summary": cmd_summary}[a.cmd](a) or 0
+            "calib": cmd_calib, "summary": cmd_summary}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":
