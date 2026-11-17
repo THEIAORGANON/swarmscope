@@ -51,7 +51,9 @@ REQUIRED_FLAGS = ["--disable-slash-commands", "--effort", "--settings", "--setti
                   "--output-format", "--permission-mode"]
 GIT_ENV = {"GIT_AUTHOR_NAME": "lab", "GIT_AUTHOR_EMAIL": "lab@localhost", "GIT_COMMITTER_NAME": "lab",
            "GIT_COMMITTER_EMAIL": "lab@localhost", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
-           "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z"}
+           "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+           # the runner's own git calls ignore the user's global/system config (signing, hooks, pagers)
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def lab_root():
@@ -132,13 +134,15 @@ def export_base(task, work):
     """Fresh repo with one deterministic commit holding the task's base tree minus excluded paths.
     No remote, no history: the agent cannot reach the source repo through git."""
     src = expand(task["source"]["repo"])
-    full = sh(["git", "-C", src, "rev-parse", task["source"]["commit"] + "^{commit}"])
+    genv = dict(os.environ, **GIT_ENV)
+    full = sh(["git", "-C", src, "rev-parse", task["source"]["commit"] + "^{commit}"], env=genv)
     if full["code"] != 0:
         raise SystemExit(f"base commit not found in {src}: {full['err'].strip()}")
     commit = full["out"].strip()
     if task["source"].get("commit_full") and task["source"]["commit_full"] != commit:
         raise SystemExit("task manifest commit_full does not match the source repo")
-    tar = subprocess.run(["git", "-C", src, "archive", "--format=tar", commit], capture_output=True, check=True).stdout
+    tar = subprocess.run(["git", "-C", src, "archive", "--format=tar", commit], capture_output=True, check=True,
+                         env=genv).stdout
     work.mkdir(parents=True)
     dropped = []
     with tarfile.open(fileobj=io.BytesIO(tar)) as tf:
@@ -153,8 +157,11 @@ def export_base(task, work):
         else:
             tf.extractall(work, members=members)
     env = dict(os.environ, **GIT_ENV)
-    for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"],
-                ["git", "commit", "-q", "-m", f"{task['task_id']}: base"]):
+    # commit.gpgsign=false is also written into the working copy: a signing prompt would hang the agent's own
+    # commits the same way in every mode
+    for cmd in (["git", "init", "-q", "-b", "main"], ["git", "config", "commit.gpgsign", "false"],
+                ["git", "config", "tag.gpgsign", "false"], ["git", "add", "-A"],
+                ["git", "commit", "-q", "--no-verify", "-m", f"{task['task_id']}: base"]):
         r = sh(cmd, cwd=work, env=env)
         if r["code"] != 0:
             raise SystemExit(f"{' '.join(cmd)} failed: {r['err']}")
@@ -390,9 +397,10 @@ def run_tests(cmd, cwd, timeout=300):
 def final_diff(work, base_commit, run_dir):
     sys.path.insert(0, str(REPO))
     import rules
-    sh(["git", "add", "-A"], cwd=work)
-    num = sh(["git", "-c", "core.quotepath=off", "diff", "--cached", "--numstat", base_commit], cwd=work)["out"]
-    patch = sh(["git", "-c", "core.quotepath=off", "diff", "--cached", "--binary", base_commit], cwd=work)["out"]
+    env = dict(os.environ, **GIT_ENV)
+    sh(["git", "add", "-A"], cwd=work, env=env)
+    num = sh(["git", "-c", "core.quotepath=off", "diff", "--cached", "--numstat", base_commit], cwd=work, env=env)["out"]
+    patch = sh(["git", "-c", "core.quotepath=off", "diff", "--cached", "--binary", base_commit], cwd=work, env=env)["out"]
     (run_dir / "final.diff").write_text(patch)
     files, totals = [], {"production": 0, "test": 0, "ignored": 0}
     for line in num.splitlines():
@@ -500,7 +508,14 @@ def attempt(task, mode, plan=None):
     def save():
         (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False, default=str))
 
-    rj["base"] = export_base(task, work)
+    try:
+        rj["base"] = export_base(task, work)
+    except (SystemExit, Exception) as e:
+        rj["completion_status"] = "not_started"
+        problems.append(f"base: {e}")
+        save()
+        print(f"{run_id}: could not prepare the base state: {e}")
+        return rj
     rj["task"] = {"file": task["_file"], "sha256": task["_sha256"], "prompt_sha256": sha256(task["prompt"])}
     pol = build_policy(modes, mode)
     policy_file = run_dir / "policy.json"
@@ -759,7 +774,7 @@ def cmd_batch(a):
                                     "order": [f"{x}#{y}" for x, y in order]})
         done.append(rj["run_id"])
         if rj.get("completion_status") == "not_started":
-            print("stopping the batch: preflight failed")
+            print("stopping the batch: attempt not started (see its run.json)")
             break
     (lab_root() / "runs" / f"batch-{batch_id}.json").write_text(json.dumps(
         {"batch_id": batch_id, "seed": a.seed, "task": task["task_id"], "order": order, "runs": done}, indent=2))

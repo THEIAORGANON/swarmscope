@@ -149,3 +149,22 @@ def test_builtin_plugins_are_clean_others_are_not():
     assert lab.not_clean({"plugins": [builtin], "skills": [], "mcp_servers": []}) == {}
     assert lab.not_clean({"plugins": [builtin, other]}) == {"plugins": [other]}
     assert lab.not_clean({"skills": ["built-in-browser"]}) == {"skills": ["built-in-browser"]}
+
+
+def test_user_git_signing_config_does_not_reach_the_base_commit(task, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / ".gitconfig").write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /bin/false\n"
+                                     "[core]\n\thooksPath = /nonexistent\n")
+    r = lab.attempt(task, "A")
+    assert r["completion_status"] != "not_started", r["integrity"]
+    work = lab.lab_root() / "w" / r["run_id"]
+    cfg = subprocess.run(["git", "config", "--local", "commit.gpgsign"], cwd=work, capture_output=True, text=True)
+    assert cfg.stdout.strip() == "false"
+
+
+def test_base_failure_is_recorded_not_raised(task):
+    task = dict(task, source=dict(task["source"], commit="no-such-commit"))
+    r = lab.attempt(task, "A")
+    assert r["completion_status"] == "not_started" and any(p.startswith("base:") for p in r["integrity"])
+    assert (lab.lab_root() / "runs" / r["run_id"] / "run.json").exists()
