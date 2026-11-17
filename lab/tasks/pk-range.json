@@ -21,12 +21,13 @@
   "test_env": {
     "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
     "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
-    "selection": "upstream addopts: -m 'not property' (property tests opt-in)"
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)",
+    "expected_tests_note": "counted on the Mac (screen 17.11): one test fewer than on Linux (packaging: glibc-only manylinux test skipped; Click: one more platform skip)"
   },
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-range/hidden",
     "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
-    "expected_tests": 63603,
+    "expected_tests": 63602,
     "bug_tests": [
       "tests/test_ranges.py::TestPrereleaseRegion::test_named_literal_prerelease_inside_union_bounds[None-False]",
       "tests/test_ranges.py::TestPrereleaseRegion::test_named_literal_prerelease_inside_union_bounds[None-True]",
