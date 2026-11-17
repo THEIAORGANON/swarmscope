@@ -652,8 +652,29 @@ SNAPSHOT_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".pytes
 
 
 def _files(d):
+    """Regular files and symlinks (a link is compared by its target, never followed)."""
     d = Path(d)
-    return {str(p.relative_to(d)): p for p in d.rglob("*") if p.is_file() and not p.is_symlink()}
+    return {str(p.relative_to(d)): p for p in d.rglob("*") if p.is_symlink() or p.is_file()}
+
+
+def _content(p):
+    return ("symlink -> " + os.readlink(p) + "\n").encode() if p.is_symlink() else p.read_bytes()
+
+
+def escaping_links(root):
+    """Symlinks under root whose target (resolved) lies outside root, or that cannot be resolved safely."""
+    root = Path(root).resolve()
+    bad = []
+    for p in Path(root).rglob("*"):
+        if p.is_symlink():
+            try:
+                t = (p.parent / os.readlink(p)).resolve()
+            except (OSError, RuntimeError):
+                bad.append(str(p.relative_to(root)))
+                continue
+            if t != root and root not in t.parents:
+                bad.append(f"{p.relative_to(root)} -> {os.readlink(p)}")
+    return bad
 
 
 def final_diff(base_dir, snapshot, run_dir):
@@ -665,8 +686,8 @@ def final_diff(base_dir, snapshot, run_dir):
     a, b = _files(base_dir), _files(snapshot)
     files, totals, patch = [], {"production": 0, "test": 0, "ignored": 0}, []
     for path in sorted(set(a) | set(b)):
-        old = a[path].read_bytes() if path in a else b""
-        new = b[path].read_bytes() if path in b else b""
+        old = _content(a[path]) if path in a else b""
+        new = _content(b[path]) if path in b else b""
         if old == new:
             continue
         try:
@@ -728,6 +749,9 @@ def isolated(cmd, cwd, timeout):
         r = sh([sbx, "-f", str(prof), "/bin/sh", "-c", cmd], cwd=cwd, env=env, timeout=timeout)
         prof.unlink()
         return r, "seatbelt"
+    if not unsandboxed_tests_allowed():          # decided before anything runs: no sandbox, no run
+        return {"code": None, "out": "", "err": "not run: no sandbox available (sandbox-exec)", "s": 0.0,
+                "timed_out": False}, "unavailable"
     return sh(["/bin/sh", "-c", cmd], cwd=cwd, env=env, timeout=timeout), "none"
 
 
@@ -741,7 +765,12 @@ def run_suite(name, cmd, snapshot, run_dir, expected=None, timeout=300, hidden_d
     or the network. Hidden tests are copied in next to the code only now, after the agent has stopped."""
     base = Path(work_base) if work_base else run_dir
     d = base / f"_check-{run_dir.name}-{name}-{uuid.uuid4().hex[:4]}"
-    shutil.copytree(snapshot, d, ignore=SNAPSHOT_IGNORE)
+    bad = escaping_links(snapshot)
+    if bad:                                      # never copied, never run: a link out of the tree is not a solution
+        return {"cmd": cmd, "exit_code": None, "timed_out": False, "report": False, "tests": None,
+                "expected": expected, "passed": None, "ok": False, "seconds": 0.0, "sandbox": "not_run",
+                "refused": f"symlinks leave the snapshot: {bad[:5]}", "tail": ""}
+    shutil.copytree(snapshot, d, ignore=SNAPSHOT_IGNORE, symlinks=True)
     if hidden_dir:
         shutil.copytree(hidden_dir, d / ".hidden_tests")
         cmd = cmd.replace("{hidden}", shlex.quote(str(d / ".hidden_tests")))
@@ -814,7 +843,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
 
     try:
         rj["base"] = export_base(task, work)
-        shutil.copytree(work, run_dir / "base", ignore=SNAPSHOT_IGNORE)   # runner-side copy for the final diff
+        shutil.copytree(work, run_dir / "base", ignore=SNAPSHOT_IGNORE, symlinks=True)   # runner-side, for the diff
     except Exception as e:
         return stop(f"base: {e}")
     rj["task"] = {"file": task["_file"], "sha256": task["_sha256"], "prompt_sha256": sha256(prompt or task["prompt"]),
@@ -1004,8 +1033,12 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         tests["hidden"] = run_suite("hidden", h["cmd"], snapshot, run_dir, expected=h.get("expected_tests"),
                                     hidden_dir=hdir, work_base=wb)
     for k, t in tests.items():
-        if t["sandbox"] == "none" and not unsandboxed_tests_allowed():
+        if t["sandbox"] == "unavailable":
+            problems.append(f"{k} tests not run: no sandbox available")
+        elif t["sandbox"] == "none" and not unsandboxed_tests_allowed():
             problems.append(f"{k} tests ran without a sandbox (solution code had the runner's rights)")
+        if t.get("refused"):
+            rj.setdefault("flags", []).append(f"{k} tests refused: {t['refused']}")   # the solution's doing: failed, not invalid
         if not tests["hidden"]["report"]:
             problems.append("hidden tests produced no complete report")
         elif h.get("expected_tests") and tests["hidden"]["tests"] != h["expected_tests"]:

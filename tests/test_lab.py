@@ -18,6 +18,11 @@ FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_claude.py")
 KEY = "apikey_LABTEST_never_in_the_agent_env"
 
 
+@pytest.fixture(autouse=True)
+def _no_seatbelt_on_linux(monkeypatch):
+    monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # tests that need the opposite unset it
+
+
 def _git(cwd, *a):
     subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, env=dict(os.environ, **lab.GIT_ENV))
 
@@ -392,7 +397,8 @@ def test_suites_get_a_minimal_environment(tmp_path, monkeypatch):
 def test_unsandboxed_tests_are_an_integrity_problem(task, monkeypatch):
     monkeypatch.delenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS")
     r = lab.attempt(task, "A")
-    assert r["valid"] is False and any("without a sandbox" in p for p in r["integrity"])
+    assert r["valid"] is False and any("tests not run: no sandbox available" in p for p in r["integrity"])
+    assert r["tests"]["hidden"]["sandbox"] == "unavailable" and r["success"] is False
 
 
 def test_seatbelt_profile_denies_home_and_network(tmp_path):
@@ -457,3 +463,51 @@ def test_permission_denials_in_a_run_make_it_invalid(task, monkeypatch):
     r = lab.attempt(task, "A")
     assert r["valid"] is False and any("permission denial" in p for p in r["integrity"])
     assert r["config"]["permission_mode"] == "acceptEdits" and r["loaded"]["permissionMode"] == "acceptEdits"
+
+
+# --- review 3: nothing reaches the test run before the sandbox does ------------------------------------
+
+def test_link_out_of_the_snapshot_is_never_copied_or_run(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("runner secret")
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    os.symlink(outside, snap / "data")
+    os.symlink("/etc/hosts", snap / "hosts")
+    marker = tmp_path / "ran"
+    r = lab.run_suite("hidden", f"touch {marker}; cat data/secret.txt; echo 'Ran 1 test in 0s'; echo; echo OK",
+                      snap, tmp_path, work_base=tmp_path)
+    assert r["ok"] is False and r["sandbox"] == "not_run" and "data ->" in r["refused"] and "hosts ->" in r["refused"]
+    assert not marker.exists() and "runner secret" not in r["tail"]
+    assert not any(p.name.startswith("_check-") for p in tmp_path.iterdir())     # nothing was even copied
+
+
+def test_links_inside_the_snapshot_stay_links(tmp_path):
+    snap = tmp_path / "snap"
+    (snap / "pkg").mkdir(parents=True)
+    (snap / "pkg" / "real.py").write_text("x = 1\n")
+    os.symlink("real.py", snap / "pkg" / "alias.py")
+    r = lab.run_suite("public", "test -L pkg/alias.py && echo 'Ran 1 test in 0s' && echo && echo OK", snap, tmp_path,
+                      work_base=tmp_path)
+    assert r["ok"] and lab.escaping_links(snap) == []
+
+
+def test_no_sandbox_means_no_run(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", raising=False)
+    monkeypatch.setattr(lab.shutil, "which", lambda name: None)                 # no sandbox-exec
+    marker = tmp_path / "ran"
+    d = tmp_path / "check"
+    d.mkdir()
+    r, kind = lab.isolated(f"touch {marker}", d, 10)
+    assert kind == "unavailable" and r["code"] is None and not marker.exists()
+
+
+def test_symlink_changes_are_in_the_diff(tmp_path):
+    base, snap, run = tmp_path / "base", tmp_path / "snap", tmp_path / "run"
+    for d in (base, snap, run):
+        d.mkdir()
+    (base / "a.py").write_text("x = 1\n")
+    os.symlink("/etc/passwd", snap / "a.py")
+    d = lab.final_diff(base, snap, run)
+    assert [f["path"] for f in d["files"]] == ["a.py"] and "symlink -> /etc/passwd" in (run / "final.diff").read_text()
