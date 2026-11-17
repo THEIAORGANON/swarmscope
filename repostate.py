@@ -18,6 +18,12 @@ listed in "skipped". Swarmscope's own folders are excluded. prune() removes obje
 
 Projects that are not git repositories get {"git": False}; rules then report "unknown" instead of
 guessing from mtimes.
+
+The repository's own configuration is never read: the hooks run with the user's rights and outside any
+agent sandbox, so a repo-local core.fsmonitor, filter driver, textconv or hook set by the agent must not run
+here. Every git call uses a throw-away GIT_DIR (only HEAD/refs, no config) with GIT_WORK_TREE = the project,
+the project's index copied in, its objects as read-only alternates, and no global/system config.
+The repository root and its git dir are found by walking up for ".git" in Python, not by asking git.
 """
 import fnmatch
 import os
@@ -32,19 +38,67 @@ SENSITIVE = [".env", ".env.*", "*.env", "*.pem", "*.key", "*.p12", "*.pfx", "*.k
 ALWAYS_EXCLUDE = [".swarmscope", ".claude"]
 
 
+# belt and braces on top of the empty GIT_DIR: nothing that can execute a program
+SAFE = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-c", "core.untrackedCache=false",
+        "-c", "core.splitIndex=false", "-c", "diff.external=", "-c", "core.attributesFile=" + os.devnull]
+_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+             "GIT_COMMON_DIR", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_EXTERNAL_DIFF",
+             "GIT_CEILING_DIRECTORIES")
+
+
 def _git(args, cwd, env=None, timeout=15, stdin=None):
-    r = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, timeout=timeout, input=stdin)
+    r = subprocess.run(["git", *SAFE, *args], cwd=cwd, env=env, capture_output=True, timeout=timeout, input=stdin)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")
     return r.stdout
 
 
-def _env(root, store, index=None):
-    objects = _git(["rev-parse", "--git-path", "objects"], root).decode().strip()
-    objects = objects if os.path.isabs(objects) else os.path.join(root, objects)
+def find_repo(cwd):
+    """(root, git_dir) by walking up for .git (a directory, or a "gitdir: <path>" file). No git call."""
+    d = os.path.realpath(cwd or ".")
+    while True:
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            return d, g
+        if os.path.isfile(g):
+            try:
+                line = open(g).read().strip()
+            except OSError:
+                return None
+            if line.startswith("gitdir:"):
+                gd = line[7:].strip()
+                return d, os.path.realpath(gd if os.path.isabs(gd) else os.path.join(d, gd))
+            return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _objects_dir(git_dir):
+    common = os.path.join(git_dir, "commondir")          # linked worktrees keep objects in the main git dir
+    if os.path.isfile(common):
+        c = open(common).read().strip()
+        git_dir = os.path.realpath(c if os.path.isabs(c) else os.path.join(git_dir, c))
+    return os.path.join(git_dir, "objects")
+
+
+def _fake_git_dir(tmpdir):
+    g = os.path.join(tmpdir, "gitdir")
+    if not os.path.isdir(g):
+        os.makedirs(os.path.join(g, "refs", "heads"))
+        os.makedirs(os.path.join(g, "objects"))
+        with open(os.path.join(g, "HEAD"), "w") as fh:
+            fh.write("ref: refs/heads/swarmscope\n")
+    return g
+
+
+def _env(root, git_dir, store, tmpdir, index=None):
     os.makedirs(store, exist_ok=True)
-    env = dict(os.environ, GIT_OBJECT_DIRECTORY=os.path.abspath(store),
-               GIT_ALTERNATE_OBJECT_DIRECTORIES=os.path.abspath(objects))
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_VARS}
+    env.update(GIT_DIR=_fake_git_dir(tmpdir), GIT_WORK_TREE=root, GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", GIT_OBJECT_DIRECTORY=os.path.abspath(store),
+               GIT_ALTERNATE_OBJECT_DIRECTORIES=os.path.abspath(_objects_dir(git_dir)), GIT_TERMINAL_PROMPT="0")
     if index:
         env["GIT_INDEX_FILE"] = index
     return env
@@ -58,20 +112,19 @@ def _sensitive(path):
 def snapshot(cwd, store, exclude=()):
     """{"git": True, "root", "tree", "skipped": [paths]} or {"git": False, "why"}.
     store: directory for Swarmscope's own git objects. exclude: extra paths relative to the root."""
-    try:
-        root = _git(["rev-parse", "--show-toplevel"], cwd).decode().strip()
-    except Exception as e:  # not a repo, git missing, timeout
-        return {"git": False, "why": str(e)[:120]}
+    found = find_repo(cwd)
+    if not found:
+        return {"git": False, "why": "not a git repository"}
+    root, git_dir = found
     tmpdir = tempfile.mkdtemp(prefix="swarmscope-idx-")
     try:
         idx = os.path.join(tmpdir, "index")
-        real = _git(["rev-parse", "--git-path", "index"], root).decode().strip()
-        real = real if os.path.isabs(real) else os.path.join(root, real)
+        real = os.path.join(git_dir, "index")
         if os.path.exists(real):
             shutil.copyfile(real, idx)          # reuse the stat cache: fast on big repos
-        env = _env(root, store, idx)
+        env = _env(root, git_dir, store, tmpdir, idx)
         skip_paths = list(ALWAYS_EXCLUDE) + [e for e in exclude if e]
-        _git(["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *skip_paths], root, env=env)
+        _git(["rm", "--cached", "-r", "-q", "-f", "--ignore-unmatch", "--", *skip_paths], root, env=env)
 
         def ours(p):
             return p and not any(p == x or p.startswith(x.rstrip("/") + "/") for x in skip_paths)
@@ -93,7 +146,7 @@ def snapshot(cwd, store, exclude=()):
             (skipped if big or _sensitive(p) else add).append(p)
         rm += [p for p in deleted if ours(p) and p not in rm]
         if rm:
-            _git(["rm", "--cached", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], root, env=env,
+            _git(["rm", "--cached", "-q", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], root, env=env,
                  stdin="\0".join(rm).encode())
         if add:
             _git(["add", "--pathspec-from-file=-", "--pathspec-file-nul"], root, env=env, timeout=30,
@@ -133,8 +186,15 @@ def diff(root, store, base_tree, cur_tree):
     """[{"path", "added", "deleted", "binary"}] between two snapshots."""
     if base_tree == cur_tree:
         return []
-    out = _git(["diff", "--numstat", "-z", "--no-renames", base_tree, cur_tree], root,
-               env=_env(root, store)).decode(errors="replace")
+    found = find_repo(root)
+    if not found:
+        raise RuntimeError("not a git repository")
+    tmpdir = tempfile.mkdtemp(prefix="swarmscope-diff-")
+    try:
+        out = _git(["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base_tree, cur_tree],
+                   found[0], env=_env(found[0], found[1], store, tmpdir)).decode(errors="replace")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     files = []
     for rec in out.split("\0"):
         if not rec.strip():

@@ -749,3 +749,25 @@ def test_project_file_still_works_without_trusted_file(tmp_path, monkeypatch):
     monkeypatch.delenv("SWARMSCOPE_POLICY_FILE", raising=False)
     p = rules.load_policy(str(proj))
     assert p["mode"] == "advise" and p["_source"]["kind"] == "project_file"
+
+
+# --- the observer never runs anything the repository configures --------------------------------------
+
+def test_snapshot_never_runs_repo_configured_programs(repo, tmp_path_factory):
+    """core.fsmonitor, a clean filter and diff textconv set by the agent in .git/config must not run: the
+    hook takes snapshots with the user's rights, outside the agent's sandbox."""
+    root, git = repo
+    marker = tmp_path_factory.mktemp("m") / "pwned"
+    evil = f"sh -c 'touch {marker}; cat'"
+    git("config", "core.fsmonitor", f"sh -c 'touch {marker}'")
+    git("config", "filter.evil.clean", evil)
+    git("config", "diff.evil.textconv", f"sh -c 'touch {marker}; cat \"$1\"' --")
+    (root / ".gitattributes").write_text("* filter=evil diff=evil\n")
+    store = str(tmp_path_factory.mktemp("store"))
+    base = repostate.snapshot(str(root), store)
+    (root / "a.py").write_text("changed\n")
+    (root / "b.py").write_text("new\n")
+    cur = repostate.snapshot(str(root), store)
+    d = repostate.diff(cur["root"], store, base["tree"], cur["tree"])
+    assert not marker.exists()
+    assert {x["path"] for x in d} == {"a.py", "b.py"}

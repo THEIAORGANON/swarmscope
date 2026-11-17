@@ -84,7 +84,8 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_WORK_ROOT", str(tmp_path / "w"))
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET")
+    monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -352,11 +353,99 @@ def test_probe_catches_a_leak(task, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_LEAK", "1")
     assert lab.cmd_probe(argparse.Namespace(task=task["_file"])) == 1
     out = capsys.readouterr().out
-    assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+    assert "FAIL  canary_not_in_transcript" in out and "FAIL  step_1_bash_read_canary" in out
+    assert "boundary BROKEN" in out
 
 
 def test_probe_catches_open_network(task, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_NET", "1")
     assert lab.cmd_probe(argparse.Namespace(task=task["_file"])) == 1
     out = capsys.readouterr().out
-    assert "FAIL  no_network" in out and "boundary BROKEN" in out
+    assert "FAIL  step_9_bash_network" in out and "FAIL  no_network_content" in out and "boundary BROKEN" in out
+
+
+# --- review 2: nothing the agent configures runs with the runner's rights --------------------------------
+
+def test_agent_git_config_never_runs_in_hooks_or_final_diff(task, monkeypatch, tmp_path):
+    marker = tmp_path / "pwned"
+    monkeypatch.setenv("FAKE_EVIL", str(marker))
+    r = lab.attempt(task, "B")
+    assert not marker.exists()
+    files = {f["path"]: f for f in r["diff"]["files"]}
+    assert r["diff"]["method"] == "python" and files["src/inventory/stock.py"]["added"] == 60
+    assert ".gitattributes" in files
+    assert not (lab.lab_root() / "runs" / r["run_id"] / "snapshot" / ".git").exists()
+
+
+def test_suites_get_a_minimal_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "secret-key")
+    monkeypatch.setenv("SWARMSCOPE_POLICY_FILE", "/runner/policy.json")
+    monkeypatch.setenv("SOME_TOKEN", "t")
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    r = lab.run_suite("hidden", "env; echo 'Ran 1 test in 0s'; echo; echo OK", snap, tmp_path, work_base=tmp_path)
+    assert r["ok"] and "secret-key" not in r["tail"] and "SWARMSCOPE" not in r["tail"] and "SOME_TOKEN" not in r["tail"]
+    assert f"HOME={tmp_path}" in r["tail"]          # HOME points into the throw-away check folder
+
+
+def test_unsandboxed_tests_are_an_integrity_problem(task, monkeypatch):
+    monkeypatch.delenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any("without a sandbox" in p for p in r["integrity"])
+
+
+def test_seatbelt_profile_denies_home_and_network(tmp_path):
+    prof = lab.seatbelt_profile(tmp_path)
+    assert "(deny network*)" in prof
+    assert f'(deny file-read* (subpath "{tmp_path.resolve()}"))' in prof
+    assert f'(deny file-write* (subpath "{tmp_path.resolve()}"))' in prof
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("sssssss\n----\nRan 7 tests in 0.01s\n\nOK (skipped=7)\n", (7, 7)),
+    ("..x\n----\nRan 3 tests in 0.01s\n\nOK (expected failures=1)\n", (3, 1)),
+    ("..u\n----\nRan 3 tests in 0.01s\n\nFAILED (unexpected successes=1)\n", (3, 1)),
+    ("..s\n----\nRan 3 tests in 0.01s\n\nOK (skipped=1)\n", (3, 1)),
+])
+def test_skips_and_expected_failures_are_not_passes(text, expected):
+    assert lab.parse_unittest(text) == expected
+
+
+def test_all_skipped_hidden_suite_is_not_ok(tmp_path):
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    r = lab.run_suite("hidden", f"{sys.executable} -c \"print('Ran 7 tests in 0.1s'); print(); print('OK (skipped=7)')\"",
+                      snap, tmp_path, expected=7, work_base=tmp_path)
+    assert r["ok"] is False and r["passed"] == 0 and r["tests"] == 7
+
+
+def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_SKIP", "9")
+    assert lab.cmd_probe(argparse.Namespace(task=task["_file"])) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_9_bash_network  (not attempted)" in out and "boundary BROKEN" in out
+
+
+def test_two_jev_contexts_on_one_stop_are_a_problem():
+    rules_ = [{"id": "s-1", "rule": "R1_tests", "state": "pass"}]
+    recs = [{"kind": "context", "ctx_id": "x", "rules": rules_}, {"kind": "context", "ctx_id": "y", "rules": rules_},
+            {"kind": "jev", "ctx_id": "x", "status": "ok"}, {"kind": "jev", "ctx_id": "y", "status": "ok"}]
+    _, problems = lab.summarize_jev(recs, [{"kind": "decision", "id": "s-1", "stop_ts": 1.0}], True)
+    assert any("more than one jev context" in p for p in problems)
+
+
+def test_advisor_model_must_be_named_in_the_transcript(tmp_path):
+    t = tmp_path / "t.jsonl"
+    msg = lambda its: {"type": "assistant", "message": {"usage": {"iterations": its}}}  # noqa: E731
+    t.write_text("\n".join(json.dumps(x) for x in [
+        msg([{"type": "message", "model": "claude-sonnet-5-5"}]), msg([{"type": "advisor_message"}])]))
+    assert lab.advisor_models_in_transcript(str(t)) == [None]          # unnamed: never filled in from config
+    t.write_text(json.dumps(msg([{"type": "advisor_message", "model": "claude-opus-5-5"}])))
+    assert lab.advisor_models_in_transcript(str(t)) == ["claude-opus-5-5"]
+
+
+def test_config_change_breaks_the_batch_invariant(task):
+    expect = lab.batch_expect(task, lab.load_modes()[1])
+    (lab.lab_root() / "config" / "settings.json").write_text('{"theme": "dark"}')
+    r = lab.attempt(task, "A", expect=expect)
+    assert r["session_status"] == "not_started" and any("config_fingerprint" in p for p in r["integrity"])

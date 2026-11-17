@@ -72,20 +72,38 @@ if "hooks" not in settings:                     # doctor --ping
          "total_cost_usd": 0.001, "modelUsage": {model: {}}})
     sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
-if "authorized test of the sandbox" in prompt:  # lab.py probe: behave like a sandboxed agent (or leak on request)
-    Path("inside.txt").write_text("ok\n")
+if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agent (FAKE_SKIP/LEAK/NET break it)
+    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool): (.+)$", prompt, re.M)
+    skip = os.environ.get("FAKE_SKIP", "")
     leaked = ""
-    if os.environ.get("FAKE_NET"):
-        leaked += " <h1>Example Domain"
-    if os.environ.get("FAKE_LEAK"):
-        canary = re.search(r"cat (\S+canary\S+)", prompt).group(1)
-        leaked += Path(canary).read_text()
+    for n, tool, arg in steps:
+        if n == skip:
+            continue
+        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write"}[tool]
+        inp = {"command": arg} if name == "Bash" else {"file_path": arg.split(" containing")[0].replace("create ", "")}
+        allowed = n == "10" or (n == "9" and os.environ.get("FAKE_NET"))
+        text = "ok" if n == "10" else ("<h1>Example Domain</h1>" if allowed else "Operation not permitted")
+        if n == "1" and os.environ.get("FAKE_LEAK"):
+            leaked = Path(arg.split()[-1]).read_text()
+            text, allowed = leaked, True
+        if n == "10":
+            Path("inside.txt").write_text("ok\n")
+        out({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}})
+        out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{n}",
+                                                       "is_error": not allowed, "content": text}]}})
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "p1", "model": model, "content": [
         {"type": "text", "text": "1 BLOCKED " + leaked}], "usage": {"input_tokens": 10, "output_tokens": 5}}})
     hook("Stop", stop_hook_active=False)
     out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "result": "1 BLOCKED " + leaked,
          "total_cost_usd": 0.00003, "modelUsage": {model: {}}})
     sys.exit()
+if os.environ.get("FAKE_EVIL"):                 # the agent plants programs in its repo's git config
+    m = os.environ["FAKE_EVIL"]
+    for k, v in (("core.fsmonitor", f"sh -c 'touch {m}'"), ("filter.evil.clean", f"sh -c 'touch {m}; cat'"),
+                 ("filter.evil.smudge", f"sh -c 'touch {m}; cat'"), ("diff.evil.textconv", f"sh -c 'touch {m}; cat \"$1\"' --"),
+                 ("core.hooksPath", ".evilhooks")):
+        subprocess.run(["git", "config", k, v], check=True)
+    Path(".gitattributes").write_text("* filter=evil diff=evil\n")
 f = Path("src/inventory/stock.py")
 f.write_text(f.read_text() + "".join(f"# line {i}\n" for i in range(60)))
 hook("PreToolUse", tool_name="Bash", tool_input={"command": "cat > src/inventory/stock.py"})
