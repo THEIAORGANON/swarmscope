@@ -451,11 +451,17 @@ def advisor_for(modes, mode=None):
     return m["advisor"] if "advisor" in m else modes["common"]["advisor"]
 
 
+def effort_for(modes, mode=None):
+    """The reasoning effort of a mode: common.effort unless the mode sets "effort" itself (Am: medium)."""
+    m = modes["modes"].get(mode, {}) if mode else {}
+    return m.get("effort") or modes["common"]["effort"]
+
+
 def claude_cmd(modes, settings, mode=None):
     c = modes["common"]
     adv = advisor_for(modes, mode)
     cmd = [claude_bin(), "-p", "--output-format", "stream-json", "--verbose", "--model", c["model"],
-           *(["--advisor", adv] if adv else []), "--effort", c["effort"], "--settings", str(settings),
+           *(["--advisor", adv] if adv else []), "--effort", effort_for(modes, mode), "--settings", str(settings),
            "--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
            "--permission-mode", c["permission_mode"]]
     return cmd + list(c.get("extra_args", []))
@@ -723,7 +729,7 @@ def overhead(path):
 
 # --- result: snapshot, diff, tests --------------------------------------------------------------------------
 
-SNAPSHOT_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".pytest_cache", ".hypothesis")
+SNAPSHOT_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".pytest_cache", ".hypothesis", ".lab-meta")
 
 
 def _files(d):
@@ -1011,7 +1017,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
                       "modes_file_sha256": modes_sha, "modes_version": modes.get("version")}
     rj["config_fingerprint"] = config_fingerprint(cfg)
     rj["config"] = {"model": modes["common"]["model"], "advisor": advisor_for(modes, mode),
-                    "effort_requested": modes["common"]["effort"], "permission_mode": modes["common"]["permission_mode"],
+                    "effort_requested": effort_for(modes, mode), "permission_mode": modes["common"]["permission_mode"],
                     "policy": pol, "policy_sha256": file_sha(policy_file), "settings_sha256": file_sha(settings),
                     "argv": cmd, "env_passed": sorted(env), "env_dropped": dropped,
                     "timeout_s": modes["common"]["timeout_s"], "work_root": str(work.parent),

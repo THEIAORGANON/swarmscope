@@ -964,3 +964,14 @@ def test_feature_validation_allows_old_tests_the_feature_changes(tmp_path):
     (t / "task.json").write_text(json.dumps({"id": "feat", "kind": "historical",
                                              "bug_tests": ["tests/test_new.py::test_f", "tests/test_new.py::test_g"]}))
     assert any("feat/" in p for p in build_tasks.validate_historical(t, m))   # as a bug fix it is not valid
+
+
+def test_mode_can_set_its_own_effort(task):
+    modes, _ = lab.load_modes()
+    assert lab.effort_for(modes, "A") == "high" and lab.effort_for(modes, "Am") == "medium"
+    cmd = lab.claude_cmd(modes, "s.json", "Am")
+    assert cmd[cmd.index("--effort") + 1] == "medium" and "--advisor" in cmd
+    r = lab.attempt(task, "Am")
+    assert r["config"]["effort_requested"] == "medium" and r["valid"] is True, r["integrity"]
+    a = lab.attempt(task, "A")
+    assert lab.experiment_key(a) != lab.experiment_key(r)
