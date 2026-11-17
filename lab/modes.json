@@ -1,5 +1,5 @@
 {
-  "version": "m-3",
+  "version": "m-4",
   "common": {
     "model": "claude-sonnet-5-5",
     "advisor": "claude-opus-5-5",
@@ -27,7 +27,7 @@
       "enabled": true,
       "include_task": false
     },
-    "_why_permission_mode": "bypassPermissions auto-approved sandbox network requests (probe 17.11, Claude Code 2.1.326): example.com reachable. acceptEdits + autoAllowBashIfSandboxed: edits and sandboxed Bash run, anything that needs approval is refused in -p."
+    "_why_permission_mode": "bypassPermissions auto-approved sandbox network requests (probe 17.11, Claude Code 2.1.326): example.com reachable. acceptEdits + autoAllowBashIfSandboxed: edits and sandboxed Bash run, anything that needs approval is refused in -p. acceptEdits alone refused interpreters (python3 -m unittest) in -p; settings add permissions.allow [\"Bash\"] (m-4)."
   },
   "modes": {
     "A": {

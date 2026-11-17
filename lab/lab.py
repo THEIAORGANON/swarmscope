@@ -398,7 +398,10 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
         rules += [f"{tool}(/{p}/**)" for p in denied]       # "//abs/path" form for absolute paths
     settings = {
         "hooks": hooks,
-        "permissions": {"deny": rules},
+        # acceptEdits auto-allows only "safe" sandboxed commands: interpreters (python3 -m unittest) needed approval
+        # and were refused in -p (runs 17.11). Bash is allowed outright; it still runs inside the sandbox, and the
+        # sandbox's network requests are a separate approval that nobody grants in -p (checked by probe).
+        "permissions": {"allow": ["Bash"], "deny": rules},
         "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
                     "filesystem": {"denyRead": ["~/"] + denied, "allowRead": [str(work)] + allow_read,
                                    "allowWrite": [str(work)]},

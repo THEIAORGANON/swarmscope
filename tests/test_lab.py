@@ -136,6 +136,7 @@ def test_settings_sandbox_and_deny_rules(task):
         assert p in sb["filesystem"]["denyRead"]
         assert f"Read(/{p}/**)" in s["permissions"]["deny"] and f"Edit(/{p}/**)" in s["permissions"]["deny"]
     assert "Read(~/**)" in s["permissions"]["deny"]
+    assert s["permissions"]["allow"] == ["Bash"]          # interpreters must run without an approval nobody can give
 
 
 def test_working_copy_hides_the_experiment(task):
