@@ -871,7 +871,13 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     problems += check_init(init, modes, work)
     if result:
         rj["result"] = {k: result.get(k) for k in ("subtype", "is_error", "total_cost_usd", "duration_ms",
-                                                   "duration_api_ms", "num_turns", "usage", "modelUsage", "session_id")}
+                                                   "duration_api_ms", "num_turns", "usage", "modelUsage", "session_id",
+                                                   "permission_denials")}
+        denials = result.get("permission_denials") or []
+        if denials and not (plan or {}).get("probe"):
+            # in a real run every refusal changes what the agent could do: never silently part of the data
+            problems.append(f"{len(denials)} permission denial(s): "
+                            + ", ".join(sorted({str(d.get('tool_name')) for d in denials if isinstance(d, dict)})))
         if sid and result.get("session_id") and result["session_id"] != sid:
             problems.append(f"result session_id {result['session_id']} != init {sid}")
     else:

@@ -1,11 +1,11 @@
 {
-  "version": "m-2",
+  "version": "m-3",
   "common": {
     "model": "claude-sonnet-5-5",
     "advisor": "claude-opus-5-5",
     "effort": "high",
     "claude_code": "2.1.326",
-    "permission_mode": "bypassPermissions",
+    "permission_mode": "acceptEdits",
     "timeout_s": 1200,
     "work_root": "/tmp/swarmscope-w",
     "allowed_domains": [],
@@ -26,7 +26,8 @@
     "jev": {
       "enabled": true,
       "include_task": false
-    }
+    },
+    "_why_permission_mode": "bypassPermissions auto-approved sandbox network requests (probe 17.11, Claude Code 2.1.326): example.com reachable. acceptEdits + autoAllowBashIfSandboxed: edits and sandboxed Bash run, anything that needs approval is refused in -p."
   },
   "modes": {
     "A": {

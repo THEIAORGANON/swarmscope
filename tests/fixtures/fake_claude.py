@@ -128,4 +128,5 @@ if not os.environ.get("FAKE_NO_STOP"):
         cost += 0.003 + 0.04 + 0.01
         hook("Stop", stop_hook_active=True)
 out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "total_cost_usd": cost,
-     "duration_ms": 1234, "num_turns": 3, "modelUsage": {model: {}, **({advisor: {}} if cost > 0.01 else {})}})
+     "duration_ms": 1234, "num_turns": 3,
+     "permission_denials": [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {}}] if os.environ.get("FAKE_DENY") else [], "modelUsage": {model: {}, **({advisor: {}} if cost > 0.01 else {})}})

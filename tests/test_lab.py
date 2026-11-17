@@ -85,7 +85,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -449,3 +449,10 @@ def test_config_change_breaks_the_batch_invariant(task):
     (lab.lab_root() / "config" / "settings.json").write_text('{"theme": "dark"}')
     r = lab.attempt(task, "A", expect=expect)
     assert r["session_status"] == "not_started" and any("config_fingerprint" in p for p in r["integrity"])
+
+
+def test_permission_denials_in_a_run_make_it_invalid(task, monkeypatch):
+    monkeypatch.setenv("FAKE_DENY", "1")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any("permission denial" in p for p in r["integrity"])
+    assert r["config"]["permission_mode"] == "acceptEdits" and r["loaded"]["permissionMode"] == "acceptEdits"
