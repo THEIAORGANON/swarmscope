@@ -4,99 +4,130 @@ a Stop or talks to Sonnet.
 
 Flow at every Stop of the main session (hook.py, after the rules gate has written its decisions):
   1. build a DecisionContext from the same facts the rules use (events, repo snapshots, advisor times)
-  2. append it to $SWARMSCOPE_DIR/jev/<session>.jsonl  (kind "context", linked to the rules decision ids)
-  3. start a detached worker that asks Jev and appends the answer (kind "jev"): Claude Code never waits
-     on the network. The worker writes a result for every context: ok | error | timeout | refusal | no_key.
-     A missing answer is never recorded as "skip".
+  2. append it to $SWARMSCOPE_DIR/jev/<session>.jsonl  (kind "context", linked to the rules decision ids,
+     carrying the exact request that will be sent)
+  3. start a detached worker that asks Jev and appends the answer (kind "jev"). Claude Code does not wait
+     on the network, only for the context to be written and the worker to start.
+Every context ends with a result: ok | invalid | model_mismatch | refusal | error | timeout | no_key |
+worker_failed, or missing_result once `--finalize` finds none. A missing answer is never a "skip".
 
-The rules' own decisions are NOT sent to Jev: shadow mode compares two independent judgements.
-Data sent (only when the project turns Jev on): counts, relative file paths, test/error/advisor facts,
-the first 120 characters of the user's task (redacted; "include_task_goal": false turns it off).
+Independence: Jev never sees the rules' verdicts. It does see some of the same inputs (change size, the
+critical-path classification), so the two judgements are independent algorithms, not independent data.
+
+Data sent by default: counts and booleans only. Opt in per project for more: "include_task" (the current
+turn's request, first 120 chars, redacted; a runner can set SWARMSCOPE_TASK_SUMMARY instead),
+"include_paths" (relative paths), "include_error_text" (redacted, 80 chars).
 Never sent: file contents, diffs, commands, the transcript.
+
+The key only ever goes to the TypeSafe endpoint below. Project config cannot change the endpoint; tests
+use SWARMSCOPE_JEV_TEST_ENDPOINT (process environment only, refused unless it is a loopback address).
 
 Enable in <project>/.claude/swarmscope-policy.json:
   {"mode": "observe", "jev": {"enabled": true}}
 Key: $TYPESAFE_API_KEY, or a file "typesafe_key" in $SWARMSCOPE_DIR or ~/.claude/swarmscope (chmod 600).
 
 CLI:
-  python jevshadow.py --show <session_id>       rules vs Jev, one line per checkpoint
-  python jevshadow.py --replay <session_id>     ask Jev again for every stored context (current question)
+  python jevshadow.py --show <session_id>          rules vs Jev per checkpoint
+  python jevshadow.py --finalize <session_id>      mark contexts with no result as missing_result
+  python jevshadow.py --replay <session_id> [--current-question]
+                                                   ask again (stored request by default); never replaces
+                                                   the original answers
 """
 import hashlib
 import json
+import math
 import os
 import pathlib
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-CONTEXT_VERSION = "dc-1"
-QUESTION_VERSION = "q-consult-1"
+CONTEXT_VERSION = "dc-2"
+QUESTION_VERSION = "q-consult-2"
 # The one policy question. Frozen per version: change the text → bump QUESTION_VERSION.
 QUESTIONS = {
     "consult_advisor": {
         "type": "noul",
-        "instructions": ("A coding agent has stopped and is about to hand its work back to the user. It can ask a "
-                         "stronger, more expensive reviewer model for a second opinion first; a review costs "
-                         "roughly as much as all of the agent's own work so far. Should it ask for the review "
-                         "now? Judge from the task, the size and kind of the code changes, the test evidence, "
-                         "repeated errors and earlier reviews."),
-        "criteria": {"true": "A review now is likely to catch a real problem that is worth its cost.",
-                     "false": "The evidence is sufficient, or a review now would add cost without benefit."},
+        "instructions": ("At this checkpoint in a coding task, would consulting a stronger advisor model be expected "
+                         "to improve the likelihood of satisfying the task requirements enough to justify its "
+                         "additional cost and latency? Base the judgment on the available task context, observed "
+                         "changes, test results, unresolved failures, and prior consultations."),
+        "criteria": {"true": "The expected improvement from consultation justifies its additional cost and latency.",
+                     "false": "The expected improvement from consultation does not justify its additional cost "
+                              "and latency."},
     },
 }
+
+ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+WORKER_GRACE_S = 30                              # beyond timeout_s before a context counts as missing_result
 
 DEFAULTS = {
     "enabled": False,
     "model": "jev-1.14.0",                       # pinned; never jev-latest in experiments
-    "base_url": "https://api.typesafe.ai",
-    "path": "/v1/systemone",
     "timeout_s": 10,
     "threshold": 0.5,                            # provisional; calibrate on pilot tasks, not experiment tasks
-    "include_task_goal": True,
+    "include_task": False,
+    "include_paths": False,
+    "include_error_text": False,
     "price_in_per_mtok": 0.042,                  # $/1M input tokens (output is free)
     "price_out_per_mtok": 0.0,
 }
 
 
 def config(pol):
-    """Jev settings for this project, or None when shadow mode is off."""
+    """Jev settings for this project, or None when shadow mode is off. Unknown keys (base_url…) are ignored."""
     user = (pol or {}).get("jev")
-    if not isinstance(user, dict) or not user.get("enabled"):
+    if not isinstance(user, dict) or user.get("enabled") is not True:
         return None
     cfg = dict(DEFAULTS)
     cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
     return cfg
 
 
-def config_hash(cfg):
-    blob = json.dumps({"cfg": {k: cfg[k] for k in sorted(cfg) if k not in ("base_url", "path")},
-                       "q": QUESTIONS, "ctx": CONTEXT_VERSION}, sort_keys=True)
-    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+def endpoint():
+    """The only place the key is sent. A test endpoint must come from the process environment and be local."""
+    test = os.environ.get("SWARMSCOPE_JEV_TEST_ENDPOINT")
+    if test:
+        host = urllib.parse.urlparse(test).hostname or ""
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return test
+    return ENDPOINT
+
+
+def _hash(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def config_hash(cfg, questions=None):
+    return _hash({"cfg": {k: cfg[k] for k in sorted(cfg)}, "q": questions or QUESTIONS, "ctx": CONTEXT_VERSION})
 
 
 def _redact(text):
-    from common import redact
+    from common import redact                    # no fallback: without redaction nothing free-text is sent
     return redact(text)
 
 
-def task_goal(events):
+def current_request(events):
+    """The user's request for the current turn (subagent hand-backs are not requests)."""
+    last = None
     for e in events:
         if e.get("agent_id") or e.get("event") != "UserPromptSubmit":
             continue
         p = str(e.get("prompt") or "").strip()
         if p and not p.startswith("<agent-message"):
-            return _redact(" ".join(p.split())[:120])
-    return None
+            last = p
+    return last
 
 
 # --- DecisionContext ------------------------------------------------------------------------------
 
-def build_context(events, pol, change, adv_times, now, has_tests, cfg):
+def build_context(events, pol, change, adv_times, now, has_tests, cfg, history_available=True):
     """Features for one checkpoint. Pure: same inputs → same context (tests rely on it)."""
     import rules
     f = rules.facts(events, pol)
@@ -115,12 +146,15 @@ def build_context(events, pol, change, adv_times, now, has_tests, cfg):
         changes = {"known": True, "production_files": len(prod),
                    "production_lines": sum(d["added"] + d["deleted"] for d in prod),
                    "test_files": len(tests), "test_lines": sum(d["added"] + d["deleted"] for d in tests),
-                   "paths": [d["path"] for d in src][:10], "critical_paths": critical[:5]}
+                   "critical_files": len(critical)}
+        if cfg.get("include_paths"):
+            changes["paths"] = [d["path"] for d in src][:10]
+            changes["critical_paths"] = critical[:5]
         since = change.get("since_advisor")
         if since is not None:
             sp = rules.prod_changes(since, pol) or []
-            changes["since_last_review"] = {"production_files": len(sp),
-                                            "production_lines": sum(d["added"] + d["deleted"] for d in sp)}
+            changes["since_last_consultation"] = {"production_files": len(sp),
+                                                  "production_lines": sum(d["added"] + d["deleted"] for d in sp)}
 
     src_times = change.get("src_times") or []
     t_change = max(src_times) if src_times else None
@@ -134,22 +168,31 @@ def build_context(events, pol, change, adv_times, now, has_tests, cfg):
 
     r2 = rules.r2_repeat_error(f, [], pol)
     errors = {"tool_failures": len(f["errors"]),
-              "repeated_unresolved": (r2.get("signals") or {}).get("count", 0),
-              "last_error": _redact(f["errors"][-1]["raw"][:80]) if f["errors"] else None}
+              "repeated_unresolved": (r2.get("signals") or {}).get("count", 0)}
+    if cfg.get("include_error_text"):
+        errors["last_error"] = _redact(f["errors"][-1]["raw"][:80]) if f["errors"] else None
 
     prod_times = change.get("prod_times") or src_times
     first_change = min(prod_times) if prod_times else None
-    advisor = {"reviews_so_far": len(adv),
-               "seconds_since_last_review": round(now - adv[-1]) if adv else None,
-               "reviewed_after_first_code_change": (any(t > first_change for t in adv)
-                                                    if first_change is not None else None)}
+    if history_available:
+        advisor = {"history_available": True, "consultations_so_far": len(adv),
+                   "seconds_since_last_consultation": round(now - adv[-1]) if adv else None,
+                   "consulted_after_first_code_change": (any(t > first_change for t in adv)
+                                                         if first_change is not None else None)}
+    else:
+        advisor = {"history_available": False}
 
     ctx = {"checkpoint_type": "before_delivery",
-           "session": {"elapsed_s": round(now - t0), "turn": f["turn"], "file_edits": len(f["edits"]),
+           "session": {"elapsed_s": round(now - t0), "turn": f["turn"], "edit_tool_calls": len(f["edits"]),
                        "shell_commands": len(f["bash"])},
            "changes": changes, "tests": tests, "errors": errors, "advisor": advisor}
-    if cfg.get("include_task_goal"):
-        ctx["task"] = task_goal(events)
+    summary = os.environ.get("SWARMSCOPE_TASK_SUMMARY")
+    if summary:
+        ctx["task"] = {"source": "runner_summary", "text": _redact(" ".join(summary.split())[:200])}
+    elif cfg.get("include_task"):
+        req = current_request(events)
+        ctx["task"] = {"source": "current_turn_request",
+                       "text": _redact(" ".join(req.split())[:120]) if req else None}
     return ctx
 
 
@@ -170,14 +213,24 @@ def load_key(base=None):
     return None
 
 
-def ask_jev(features, cfg, key, opener=None):
-    """One request. Returns a result dict; never raises, never contains the key."""
+def _probability(a):
+    """The noul probability, or None when the answer is not a finite number in [0, 1]."""
+    if not isinstance(a, dict) or a.get("type") != "noul":
+        return None
+    p = a.get("noul")
+    if isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) or not 0 <= p <= 1:
+        return None
+    return float(p)
+
+
+def ask_jev(request, cfg, key, opener=None):
+    """One request (`request` = the stored {"model", "state", "questions"}). Returns a result dict;
+    never raises, never contains the key."""
     opener = opener or urllib.request.urlopen
-    body = {"model": cfg["model"], "state": features, "questions": QUESTIONS}
-    req = urllib.request.Request(cfg["base_url"].rstrip("/") + cfg["path"], data=json.dumps(body).encode(),
-                                 method="POST", headers={"Authorization": f"Bearer {key}",
-                                                         "Content-Type": "application/json"})
-    res = {"question_version": QUESTION_VERSION, "requested_model": cfg["model"], "threshold": cfg["threshold"]}
+    url = endpoint()
+    req = urllib.request.Request(url, data=json.dumps(request).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    res = {"requested_model": request["model"], "threshold": cfg["threshold"], "endpoint": url}
     t0 = time.perf_counter()
     try:
         with opener(req, timeout=cfg["timeout_s"]) as r:
@@ -199,22 +252,29 @@ def ask_jev(features, cfg, key, opener=None):
         res.update(status="error", error=_clean(raw[:200], key))
         return res
     res["model"] = js.get("model")
-    res["usage"] = js.get("usage")
-    u = js.get("usage") or {}
-    if isinstance(u.get("cost"), (int, float)):
+    u = js.get("usage") if isinstance(js.get("usage"), dict) else None
+    res["usage"] = u
+    if u and isinstance(u.get("cost"), (int, float)) and not isinstance(u.get("cost"), bool):
         res["cost_usd"] = u["cost"]
-    else:
-        res["cost_usd_est"] = round((u.get("input_tokens") or 0) * cfg["price_in_per_mtok"] / 1e6 +
+    elif u and isinstance(u.get("input_tokens"), int):
+        res["cost_usd_est"] = round(u["input_tokens"] * cfg["price_in_per_mtok"] / 1e6 +
                                     (u.get("output_tokens") or 0) * cfg["price_out_per_mtok"] / 1e6, 10)
-    a = (js.get("answers") or {}).get("consult_advisor")
+    else:
+        res["cost_usd_est"] = None                           # unknown, not free
+    a = (js.get("answers") or {}).get("consult_advisor") if isinstance(js.get("answers"), dict) else None
     res["answer"] = a
-    if not isinstance(a, dict) or a.get("type") == "refusal" or not isinstance(a.get("noul"), (int, float)):
-        res["status"] = "refusal" if isinstance(a, dict) and a.get("type") == "refusal" else "error"
-        if res["status"] == "error":
-            res["error"] = "no consult_advisor probability in the answer"
+    if isinstance(a, dict) and a.get("type") == "refusal":
+        res["status"] = "refusal"
         return res
-    p = float(a["noul"])
-    res.update(status="ok", p_consult=p, would_consult=p >= cfg["threshold"])
+    p = _probability(a)
+    if p is None:
+        res.update(status="invalid", error="consult_advisor is not a noul probability in [0, 1]")
+        return res
+    res["p_consult"] = p
+    if res["model"] != request["model"]:
+        res.update(status="model_mismatch", error=f"asked for {request['model']}, got {res['model']}")
+        return res
+    res.update(status="ok", would_consult=p >= cfg["threshold"])
     return res
 
 
@@ -225,112 +285,190 @@ def _clean(text, key):
     return _redact(" ".join(t.split()))[:200]
 
 
-# --- hook entry point + worker ----------------------------------------------------------------------
+# --- journal ---------------------------------------------------------------------------------------
 
 def jev_file(base, sid):
     return pathlib.Path(base) / "jev" / f"{sid}.jsonl"
 
 
 def _append(path, rec):
+    """One JSON line, one write() on an O_APPEND descriptor: concurrent writers never interleave lines."""
+    path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:              # one short line per write: O_APPEND is atomic
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    data = (json.dumps(rec, ensure_ascii=False) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
-def _load(path):
-    out = []
+def load(path):
+    """(records, corrupt_line_count). Corrupt lines are reported, not silently dropped."""
+    out, bad = [], 0
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
+                if not line.strip():
+                    continue
                 try:
                     out.append(json.loads(line))
                 except ValueError:
-                    pass
+                    bad += 1
     except OSError:
         pass
-    return out
+    return out, bad
 
 
-def shadow(sid, base, events, pol, change, adv_times, now, has_tests, rule_records):
+def _load(path):
+    return load(path)[0]
+
+
+# --- hook entry point + worker ----------------------------------------------------------------------
+
+def shadow(sid, base, events, pol, change, adv_times, now, has_tests, rule_records, history_available=True):
     """Called by hook.py at Stop. Writes the context and starts the worker; returns the context id or None."""
     cfg = config(pol)
     if not cfg:
         return None
     path = jev_file(base, sid)
-    n = sum(1 for r in _load(path) if r.get("kind") == "context")
-    ctx_id = f"{sid[:8]}-c{n + 1}"
+    ctx_id = f"{sid[:8]}-{uuid.uuid4().hex[:10]}"
     decisions = [r for r in rule_records if r.get("kind") == "decision"]
+    features = build_context(events, pol, change, adv_times, now, has_tests, cfg, history_available)
+    request = {"model": cfg["model"], "state": features, "questions": QUESTIONS}
     rec = {"kind": "context", "ctx_id": ctx_id, "ts": now, "context_version": CONTEXT_VERSION,
            "checkpoint_type": "before_delivery", "turn": decisions[0].get("turn") if decisions else None,
            "policy_version": pol.get("policy_version"), "mode": pol.get("mode"),
            "rules": [{"id": r["id"], "rule": r["rule"], "state": r["state"], "action": r.get("action")}
                      for r in decisions],
            "jev": dict({k: v for k, v in cfg.items() if k != "enabled"}, question_version=QUESTION_VERSION,
-                       config_hash=config_hash(cfg)),
-           "features": build_context(events, pol, change, adv_times, now, has_tests, cfg)}
+                       questions_hash=_hash(QUESTIONS), config_hash=config_hash(cfg), endpoint=endpoint()),
+           "request": request, "request_hash": _hash(request)}
     _append(path, rec)
     if os.environ.get("SWARMSCOPE_JEV_SYNC") == "1":            # tests / debugging: answer inline
-        run_worker(str(path), ctx_id, cfg)
-    else:
+        run_worker(str(path), ctx_id)
+        return ctx_id
+    try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker", str(path), ctx_id],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, close_fds=True)
+    except Exception as e:
+        _append(path, {"kind": "jev", "ctx_id": ctx_id, "ts": time.time(), "status": "worker_failed",
+                       "error": _clean(f"{type(e).__name__}: {e}", None)})
     return ctx_id
 
 
-def run_worker(path, ctx_id, cfg=None, replay=False):
+def _context(path, ctx_id):
+    return next((r for r in _load(path) if r.get("kind") == "context" and r.get("ctx_id") == ctx_id), None)
+
+
+def run_worker(path, ctx_id, replay=False, current_question=False):
+    """Ask Jev for one stored context and append exactly one result record."""
     path = pathlib.Path(path)
-    ctx = next((r for r in _load(path) if r.get("kind") == "context" and r.get("ctx_id") == ctx_id), None)
+    ctx = _context(path, ctx_id)
     if ctx is None:
         return None
-    if cfg is None:
+    rec = {"kind": "jev", "ctx_id": ctx_id}
+    try:
         cfg = dict(DEFAULTS)
         cfg.update({k: v for k, v in (ctx.get("jev") or {}).items() if k in DEFAULTS})
-    base = path.parent.parent
-    key = load_key(str(base))
-    if not key:
-        res = {"question_version": QUESTION_VERSION, "requested_model": cfg["model"], "status": "no_key",
-               "threshold": cfg["threshold"]}
-    else:
-        res = ask_jev(ctx["features"], cfg, key)
-    rec = dict(res, kind="jev", ctx_id=ctx_id, ts=time.time())
+        request = dict(ctx["request"])
+        if current_question:
+            request["questions"] = QUESTIONS
+        rec.update(question_version=QUESTION_VERSION if current_question else ctx["jev"].get("question_version"),
+                   request_hash=_hash(request), same_request=_hash(request) == ctx.get("request_hash"))
+        key = load_key(str(path.parent.parent))
+        if not key:
+            rec.update(status="no_key", requested_model=request["model"], threshold=cfg["threshold"])
+        else:
+            rec.update(ask_jev(request, cfg, key))
+    except Exception as e:
+        rec.update(status="worker_failed", error=_clean(f"{type(e).__name__}: {e}", None))
+    rec["ts"] = time.time()
     if replay:
         rec["replay"] = True
     _append(path, rec)
     return rec
 
 
+def finalize(path, now=None):
+    """Mark every context that has no original result and is older than its timeout + grace as missing_result.
+    Idempotent. The runner calls it after waiting for the workers."""
+    now = now or time.time()
+    recs = _load(path)
+    answered = {r["ctx_id"] for r in recs if r.get("kind") == "jev" and not r.get("replay")}
+    out = []
+    for c in (r for r in recs if r.get("kind") == "context"):
+        limit = (c.get("jev") or {}).get("timeout_s", DEFAULTS["timeout_s"]) + WORKER_GRACE_S
+        if c["ctx_id"] not in answered and now - c.get("ts", now) >= limit:
+            rec = {"kind": "jev", "ctx_id": c["ctx_id"], "ts": now, "status": "missing_result", "final": True}
+            _append(path, rec)
+            out.append(rec)
+    return out
+
+
+def pending(path):
+    recs = _load(path)
+    answered = {r["ctx_id"] for r in recs if r.get("kind") == "jev" and not r.get("replay")}
+    return [c["ctx_id"] for c in recs if c.get("kind") == "context" and c["ctx_id"] not in answered]
+
+
 # --- CLI -----------------------------------------------------------------------------------------
 
-def _rules_verdict(ctx):
-    asked = [r["rule"] for r in ctx.get("rules", []) if r.get("action") == "consult_advisor"
+APPLIED = {"requested": "requested from Sonnet", "advised": "shown to the user", "triggered": "logged only",
+           "deferred": "deferred (background agents)", "limited": "not applied (block limit)"}
+
+
+def describe_rules(ctx, decisions):
+    """Three separate facts: which consult rules fired, whether that was applied, whether the advisor was
+    then called (outcome/followup from the decision log)."""
+    fired = [r for r in ctx.get("rules", []) if r.get("action") == "consult_advisor"
              and r["state"] not in ("pass", "skipped")]
-    return ("consult (" + ",".join(asked) + ")") if asked else "no consult"
+    if not fired:
+        return "no consult rule fired"
+    results = {d["id"]: d for d in decisions if d.get("kind") in ("outcome", "followup")}
+    parts = []
+    for r in fired:
+        res = results.get(r["id"])
+        called = {"observed": "advisor called", "not_observed": "advisor not called",
+                  "unverified": "advisor call unverified"}.get((res or {}).get("outcome"), "result pending")
+        parts.append(f"{r['rule']} fired · {APPLIED.get(r['state'], r['state'])} · {called}")
+    return "; ".join(parts)
 
 
 def show(sid, base):
-    recs = _load(jev_file(base, sid))
+    path = jev_file(base, sid)
+    recs, bad = load(path)
     if not recs:
         print(f"no jev records for {sid}")
         return
-    answers = {}
+    decisions = _load(pathlib.Path(base) / "decisions" / f"{sid}.jsonl")
+    orig, replays = {}, {}
     for r in recs:
         if r.get("kind") == "jev":
-            answers.setdefault(r["ctx_id"], []).append(r)
+            (replays.setdefault(r["ctx_id"], []) if r.get("replay") else orig.setdefault(r["ctx_id"], [])).append(r)
     for c in (r for r in recs if r.get("kind") == "context"):
-        f = c["features"]
-        ch = f.get("changes", {})
-        facts = (f"prod {ch.get('production_files', '?')}f/{ch.get('production_lines', '?')}l · "
-                 f"tests {f['tests']['last_result']} · reviews {f['advisor']['reviews_so_far']}")
-        line = f"{c['ctx_id']:<14} rules: {_rules_verdict(c):<22} "
-        for a in answers.get(c["ctx_id"], []) or [{"status": "pending"}]:
-            tag = " (replay)" if a.get("replay") else ""
-            if a["status"] == "ok":
-                line += f"jev: p={a['p_consult']:.2f} → {'consult' if a['would_consult'] else 'no consult'}" \
-                        f" [{a.get('latency_ms')} ms]{tag}  "
-            else:
-                line += f"jev: {a['status']}{tag}  "
-        print(line + "\n" + " " * 15 + facts)
+        f = c["features"] if "features" in c else c["request"]["state"]
+        ch, adv = f.get("changes", {}), f.get("advisor", {})
+        print(f"{c['ctx_id']}  turn {c.get('turn')}  {c['jev'].get('question_version')}")
+        print(f"  rules: {describe_rules(c, decisions)}")
+        a = (orig.get(c["ctx_id"]) or [None])[0]
+        if a is None:
+            print("  jev:   pending (no result yet)")
+        elif a["status"] == "ok":
+            print(f"  jev:   p={a['p_consult']:.2f} → {'consult' if a['would_consult'] else 'no consult'} "
+                  f"at {a['threshold']} [{a.get('latency_ms')} ms]")
+        else:
+            print(f"  jev:   {a['status']}" + (f" ({a['error']})" if a.get("error") else ""))
+        for rp in replays.get(c["ctx_id"], []):
+            same = "same request" if rp.get("same_request") else rp.get("question_version")
+            p = f"p={rp['p_consult']:.2f}" if isinstance(rp.get("p_consult"), float) else rp["status"]
+            print(f"  replay ({same}): {p}")
+        print(f"  facts: prod {ch.get('production_files', '?')} files / {ch.get('production_lines', '?')} lines · "
+              f"tests {f['tests']['last_result']} · consultations so far "
+              f"{adv.get('consultations_so_far', 'unknown') if adv.get('history_available') else 'unknown'}")
+    if bad:
+        print(f"WARNING: {bad} corrupt line(s) in {path}")
 
 
 def main(argv):
@@ -341,10 +479,15 @@ def main(argv):
     if len(argv) == 2 and argv[0] == "--show":
         show(argv[1], BASE)
         return 0
-    if len(argv) == 2 and argv[0] == "--replay":
+    if len(argv) == 2 and argv[0] == "--finalize":
+        for r in finalize(jev_file(BASE, argv[1])):
+            print(r["ctx_id"], r["status"])
+        print("pending:", pending(jev_file(BASE, argv[1])) or "none")
+        return 0
+    if len(argv) >= 2 and argv[0] == "--replay":
         path = jev_file(BASE, argv[1])
         for c in [r for r in _load(path) if r.get("kind") == "context"]:
-            r = run_worker(str(path), c["ctx_id"], replay=True)
+            r = run_worker(str(path), c["ctx_id"], replay=True, current_question="--current-question" in argv)
             print(c["ctx_id"], r.get("status"), r.get("p_consult"))
         return 0
     print(__doc__)

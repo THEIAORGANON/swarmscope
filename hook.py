@@ -12,9 +12,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from common import redact  # noqa: E402  (shared with jevshadow.py)
-except Exception:                               # the hook never fails, even with a broken install
+except Exception:                               # broken install: never log unmasked text, mask all of it
     def redact(text):
-        return text
+        return "[not logged: redaction unavailable]" if text else text
 
 
 _HEREDOC_BODY = re.compile(r"(<<-?[ \t]*(['\"]?)(\w+)\2[^\n]*\n)(.*?)(\n[ \t]*\3[ \t]*(?=\n|$)|\Z)", re.S)
@@ -222,18 +222,21 @@ def run_gate(d, sid, ev, pol, change, BASE, advisor_activity, load_events, rules
     if out:
         sys.stdout.write(json.dumps(out))
         sys.stdout.flush()
-    return jev_shadow(sid, BASE, events, pol, change, adv.get("times") or [], ev["ts"], has_tests, records)
+    return jev_shadow(sid, BASE, events, pol, change, adv.get("times") or [], ev["ts"], has_tests, records,
+                      bool(tp and os.path.exists(tp)))
 
 
-def jev_shadow(sid, BASE, events, pol, change, adv_times, now, has_tests, records):
+def jev_shadow(sid, BASE, events, pol, change, adv_times, now, has_tests, records, history_available):
     """Jev shadow mode: records what Jev would decide here. Runs after the gate has answered and can never
-    change it; the network call happens in a detached worker. Returns the time spent here (ms) or None."""
+    change it; the network call happens in a detached worker. Returns the time spent here (ms) or None:
+    Claude Code does not wait on the network, but it does wait for this (context write + worker start)."""
     if not (pol.get("jev") or {}).get("enabled"):
         return None
     t0 = time.time()
     try:
         import jevshadow
-        jevshadow.shadow(sid, str(BASE), events, pol, change, adv_times, now, has_tests, records)
+        jevshadow.shadow(sid, str(BASE), events, pol, change, adv_times, now, has_tests, records,
+                         history_available)
     except Exception:
         pass
     return round((time.time() - t0) * 1000, 1)
