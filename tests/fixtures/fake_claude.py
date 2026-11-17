@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fake Claude Code for runner tests: real hooks, scripted agent, init fields from lab/modes.json.
 FAKE_SKILLS=<json>  report skills in init      FAKE_NO_STOP=1  never call the Stop hook
-FAKE_SLEEP=<s>      sleep before finishing      FAKE_MODEL=<id> report another lead model"""
+FAKE_SLEEP=<s>      sleep before finishing      FAKE_MODEL=<id> report another lead model
+FAKE_RATE_LIMIT=1   the account is out of its 5-hour limit: the model is never reached (as seen on 17.11)"""
 import json
 import os
 import re
@@ -60,6 +61,15 @@ out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model"
      "claude_code_version": MODES["claude_code"], "skills": json.loads(os.environ.get("FAKE_SKILLS", "[]")),
      "slash_commands": [], "plugins": [{"name": "cc-plugin-telemetry", "path": "builtin",
                                         "source": "cc-plugin-telemetry@builtin"}]})
+if os.environ.get("FAKE_RATE_LIMIT"):            # what Claude Code 2.1.326 wrote when the 5-hour window was used up
+    out({"type": "rate_limit_event", "session_id": sid, "rate_limit_info": {
+        "status": "rejected", "resetsAt": 1794933000, "rateLimitType": "five_hour", "overageStatus": "rejected",
+        "overageDisabledReason": "out_of_credits"}})
+    out({"type": "assistant", "session_id": sid, "message": {"model": "<synthetic>", "role": "assistant",
+                                                           "content": [{"type": "text", "text": "limit reached"}]}})
+    out({"type": "result", "subtype": "success", "is_error": True, "session_id": sid, "total_cost_usd": 0,
+         "num_turns": 1, "modelUsage": {}, "permission_denials": [], "terminal_reason": "api_error"})
+    sys.exit(1)
 if "hooks" not in settings:                     # doctor --ping
     if "advisor tool" in prompt:
         tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m0", "model": model, "content": [

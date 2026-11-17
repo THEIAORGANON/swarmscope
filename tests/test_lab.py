@@ -90,7 +90,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -644,3 +644,24 @@ def test_task_repos_are_deterministic_and_validation_catches_a_weak_hidden_suite
     assert any("tiny/m1" in p for p in build_tasks.validate(t, manifest))
     t2, manifest = _tiny_task(tmp_path / "second", "return x * 2 if x > 0 else x")   # wrong for -3: caught
     assert build_tasks.validate(t2, manifest) == []
+
+
+def test_rate_limited_session_is_invalid_and_stops_the_batch(task, monkeypatch, capsys):
+    """17.11: with the 5-hour window used up, Claude Code exits in ~3 s with is_error and $0. That is no attempt
+    at the task: it must not count as a failed A run (0/11), and the batch must not burn through the rest."""
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "1")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and r["success"] is False and r["session_status"] == "api_error"
+    assert any("rate limit rejected (five_hour" in p for p in r["integrity"])
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "3", "--seed", "1"]) == 1
+    out = capsys.readouterr().out
+    assert "stopping the batch: api_error" in out and out.count("session running") == 2      # one attempt per call
+
+
+def test_calibration_ignores_old_runs_that_never_reached_the_model():
+    old = {"run_id": "4df49f778f", "task_id": "semver", "mode": "A", "valid": True, "success": False, "plan": {},
+           "session_status": "success:is_error", "costs": {"claude_code_total_usd": 0.0},
+           "result": {"subtype": "success", "is_error": True, "total_cost_usd": 0, "modelUsage": {}},
+           "tests": {"hidden": {"passed": 0, "expected": 11, "not_passed": ["Hidden.test_or"]}}}
+    t = lab.calibration([old], "A")["semver"]
+    assert (t["valid"], t["invalid"], t["not_passed"]) == (0, 1, {})

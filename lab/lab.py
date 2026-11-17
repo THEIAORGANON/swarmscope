@@ -467,6 +467,25 @@ def parse_stream(path):
     return init, result, bad
 
 
+def api_failure(result, rate_limits=()):
+    """Why the session never reached the model (rate limit, out of credits, API error), or None. Such a run says
+    nothing about the task: it is invalid, never a failed attempt."""
+    rejected = [r for r in rate_limits if (r.get("rate_limit_info") or {}).get("status") == "rejected"]
+    if rejected:
+        info = rejected[-1]["rate_limit_info"]
+        return (f"rate limit rejected ({info.get('rateLimitType')}, resets at "
+                f"{time.strftime('%H:%M', time.localtime(info['resetsAt'])) if info.get('resetsAt') else '?'})")
+    if result and result.get("is_error") and (result.get("terminal_reason") == "api_error"
+                                              or not result.get("modelUsage")):
+        return f"API error ({result.get('terminal_reason') or 'no model usage'})"
+    return None
+
+
+def rate_limit_events(path):
+    recs, _ = jl(path)
+    return [r for r in recs or [] if r.get("type") == "rate_limit_event"]
+
+
 # --- advisor: calls, results and which block they answer -------------------------------------------------
 
 def advisor_calls(transcript):
@@ -937,7 +956,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     if result:
         rj["result"] = {k: result.get(k) for k in ("subtype", "is_error", "total_cost_usd", "duration_ms",
                                                    "duration_api_ms", "num_turns", "usage", "modelUsage", "session_id",
-                                                   "permission_denials")}
+                                                   "permission_denials", "terminal_reason")}
         denials = result.get("permission_denials") or []
         if denials and not (plan or {}).get("probe"):
             # in a real run every refusal changes what the agent could do: never silently part of the data
@@ -949,6 +968,10 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         problems.append("no result message in stream")
     rj["session_status"] = ("timeout" if sess["timed_out"] else (result or {}).get("subtype") or
                             f"exit_{sess['exit_code']}") + ("" if not (result or {}).get("is_error") else ":is_error")
+    failure = api_failure(result, rate_limit_events(run_dir / "stream.jsonl"))
+    if failure:
+        rj["session_status"] = "api_error"
+        problems.append(f"the model was not reached: {failure}")
 
     # observation logs: wait for Jev workers, then close open decisions
     hook_env = dict(os.environ, SWARMSCOPE_DIR=str(sw), SWARMSCOPE_POLICY_FILE=str(policy_file))
@@ -1113,7 +1136,8 @@ def calibration(run_jsons, mode="A"):
             continue
         t = out.setdefault(rj.get("task_id"), {"valid": 0, "invalid": 0, "success": 0, "passed": [], "expected": None,
                                                "not_passed": {}, "cost_usd": [], "runs": []})
-        if not rj.get("valid"):
+        # runs recorded before api_failure() existed can be marked valid although the model was never reached
+        if not rj.get("valid") or rj.get("session_status") == "api_error" or api_failure(rj.get("result")):
             t["invalid"] += 1
             continue
         h = (rj.get("tests") or {}).get("hidden") or {}
@@ -1449,8 +1473,9 @@ def cmd_batch(a):
                                  "success": rj.get("success")})
         manifest["valid"] &= bool(rj.get("valid"))
         mpath.write_text(json.dumps(manifest, indent=2))
-        if rj.get("session_status") == "not_started":
-            print("stopping the batch: attempt not started (see its run.json)")
+        if rj.get("session_status") in ("not_started", "api_error"):
+            print(f"stopping the batch: {rj['session_status']} (see {rj['run_id']}/run.json: "
+                  f"{'; '.join(rj.get('integrity') or [])})")
             break
     return 0 if manifest["valid"] else 1
 
