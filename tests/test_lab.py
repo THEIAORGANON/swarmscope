@@ -91,7 +91,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -824,3 +824,55 @@ def test_task_can_raise_the_test_suite_timeout(task, monkeypatch):
     lab.attempt(dict(task, tests_timeout_s=900), "A")
     lab.attempt(task, "A")
     assert seen[:2] == [("public", 900), ("hidden", 900)] and seen[2:] == [("public", 300), ("hidden", 300)]
+
+
+# --- no web: WebFetch/WebSearch denied everywhere, and any use invalidates the run ------------------------------
+
+def test_settings_deny_web_tools(task):
+    r = lab.attempt(task, "A")
+    settings = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    assert {"WebFetch", "WebSearch"} <= set(settings["permissions"]["deny"])
+    assert r["valid"] is True and r["observation"]["web_tool_uses"] == 0
+
+
+@pytest.mark.parametrize("where,tool", [("main", "WebFetch"), ("sub", "WebSearch")])
+def test_web_tool_use_in_session_or_subagent_invalidates_the_run(task, monkeypatch, where, tool):
+    monkeypatch.setenv("FAKE_WEB", where)
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any(f"web tool used 1 time(s): ['{tool}']" in p for p in r["integrity"])
+
+
+def test_hidden_bug_tests_and_regressions_are_reported_apart(task, monkeypatch):
+    """Historical tasks: the base fails some known tests (the bug); the rest of the fix's suite checks regressions."""
+    spy_real = lab.run_suite
+
+    def fake_suite(name, cmd, *a, **kw):
+        r = spy_real(name, cmd, *a, **kw)
+        if name == "hidden":
+            r.update(report=True, ok=False, not_passed=["t.py::test_bug[2]", "t.py::test_other"])
+        return r
+    monkeypatch.setattr(lab, "run_suite", fake_suite)
+    t = json.loads(json.dumps(task))
+    t["hidden_tests"]["bug_tests"] = ["t.py::test_bug[1]", "t.py::test_bug[2]"]
+    r = lab.attempt(t, "A")
+    h = r["tests"]["hidden"]
+    assert h["bug_tests"] == {"total": 2, "not_passed": ["t.py::test_bug[2]"]}
+    assert h["regressions"] == ["t.py::test_other"]
+    c = next(iter(lab.calibration([r], "A").values()))
+    assert c["bug_fixed"] == [False] and c["regressions"] == [1]
+
+
+def test_screen_runs_batches_side_by_side(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_SLEEP", "1")
+    assert lab.main(["screen", "--tasks", f"{task['_file']},{task['_file']}", "--seed", "3", "--jobs", "2"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("started ") == 2 and out.count("VALID") == 2 and "2/2 batches all valid" in out
+    batches = list((lab.lab_root() / "batches").glob("*.json"))
+    assert len(batches) == 2 and len({b.name for b in batches}) == 2
+
+
+def test_screen_stops_starting_batches_after_an_api_failure(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "1")
+    assert lab.main(["screen", "--tasks", ",".join([task["_file"]] * 3), "--seed", "3", "--jobs", "1"]) == 1
+    out = capsys.readouterr().out
+    assert out.count("started ") == 1 and "not started:" in out

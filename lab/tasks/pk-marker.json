@@ -16,12 +16,23 @@
     "pr_created": "2026-11-10"
   },
   "prompt": "Combining markers with & and | adds one nesting level per operation:\n\n```python\nfrom packaging.markers import Marker\na, b, c = (Marker(f'os_name == \"{x}\"') for x in \"abc\")\nstr((a & b) & c)    # '(os_name == \"a\" and os_name == \"b\") and os_name == \"c\"'\n\nimport functools, operator\nm = functools.reduce(operator.and_, [Marker(f'os_name == \"{i}\"') for i in range(2000)])\nstr(m)              # RecursionError\n```\n\nChaining the same operator must keep the marker flat, so long chains work:\n- (a & b) & c prints 'os_name == \"a\" and os_name == \"b\" and os_name == \"c\"'; the same for |;\n- a parenthesized group of the same operator is spliced in too: Marker('(os_name == \"a\" or os_name == \"b\")') | c prints 'os_name == \"a\" or os_name == \"b\" or os_name == \"c\"';\n- a group of the other operator keeps its parentheses: with ab = Marker('os_name == \"a\" or os_name == \"b\"'), str(ab & c & c) is '(os_name == \"a\" or os_name == \"b\") and os_name == \"c\" and os_name == \"c\"', and str(c | (c & c)) is 'os_name == \"c\" or (os_name == \"c\" and os_name == \"c\")';\n- a chain of 2000 markers built with & or | prints without parentheses, and survives Marker(str(m)) == m and a pickle round trip.\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
-  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
   "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)"
+  },
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-marker/hidden",
-    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
-    "expected_tests": 63617
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 63617,
+    "bug_tests": [
+      "tests/test_markers.py::test_chain_keeps_mixed_groups",
+      "tests/test_markers.py::test_chaining_associativity_and_str",
+      "tests/test_markers.py::test_long_chain_round_trips[and_]",
+      "tests/test_markers.py::test_long_chain_round_trips[or_]"
+    ]
   },
   "difficulty": "unknown (historical upstream bug)",
   "notes": "packaging PR #1510; hidden = the fix's whole tests/ directory; bug tests failing on base: 4",

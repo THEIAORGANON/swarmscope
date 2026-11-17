@@ -16,12 +16,27 @@
     "pr_created": "2026-11-02"
   },
   "prompt": "SpecifierSet accepts an iterable of Specifier objects, but a list of plain strings builds a broken object:\n\n```python\n>>> from packaging.specifiers import Specifier, SpecifierSet\n>>> good = SpecifierSet([Specifier(\">=1.0\")])\n>>> bad = SpecifierSet([\">=1.0\"])\n>>> str(bad), good == bad, hash(good) == hash(bad)\n('>=1.0', True, False)\n>>> bad.contains(\"1.5\")\nAttributeError: 'str' object has no attribute '_spec'\n>>> SpecifierSet([42])     # accepted silently\n```\n\nExpected: each str element of the iterable is parsed as one specifier, exactly like Specifier(element) (so an invalid element, including \">=1.0,<2.0\" as a single element, raises InvalidSpecifier). The result equals, hashes and prints like SpecifierSet(<the same string>) and works with contains() and the rest. An element that is neither a Specifier nor a str raises TypeError.\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
-  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
   "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)"
+  },
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-specset/hidden",
-    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
-    "expected_tests": 63584
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 63584,
+    "bug_tests": [
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_accepts_plain_strings[!=1.0.*]",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_accepts_plain_strings[===foobar]",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_accepts_plain_strings[>=1.0]",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_accepts_plain_strings[~=1.4.5]",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_invalid_string_element[>=1.0,<2.0]",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_invalid_string_element[not a spec]",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_plain_strings_are_usable",
+      "tests/test_specifiers.py::TestSpecifierSet::test_iterable_rejects_non_specifier_elements"
+    ]
   },
   "difficulty": "unknown (historical upstream bug)",
   "notes": "packaging PR #1485; hidden = the fix's whole tests/ directory; bug tests failing on base: 8",

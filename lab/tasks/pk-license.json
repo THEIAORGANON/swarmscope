@@ -16,12 +16,22 @@
     "pr_created": "2026-09-14"
   },
   "prompt": "canonicalize_license_expression() spells case variants of one LicenseRef identifier after the variant that happens to come last:\n\n```python\nfrom packaging.licenses import canonicalize_license_expression as c\nc(\"licenseref-MIT AND LicenseRef-mit\")   # 'LicenseRef-mit AND LicenseRef-mit'\nc(\"LicenseRef-mit OR licenseref-MIT\")    # 'LicenseRef-MIT OR LicenseRef-MIT'\n```\n\nThe output should not depend on what comes later in the expression. Expected: every case variant of the same LicenseRef identifier takes the spelling of its first occurrence (with the prefix written LicenseRef-):\n\n- \"licenseref-MIT AND LicenseRef-mit\" -> \"LicenseRef-MIT AND LicenseRef-MIT\"\n- \"LicenseRef-mit OR licenseref-MIT\" -> \"LicenseRef-mit OR LicenseRef-mit\"\n- \"(LICENSEREF-Foo OR licenseref-foo) AND MIT AND LicenseRef-FOO\" -> \"(LicenseRef-Foo OR LicenseRef-Foo) AND MIT AND LicenseRef-Foo\"\n- \"licenseref-public-domain\" -> \"LicenseRef-public-domain\"\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
-  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
   "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)"
+  },
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-license/hidden",
-    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
-    "expected_tests": 62466
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 62466,
+    "bug_tests": [
+      "tests/test_licenses.py::test_licenseref_case_variants_use_first_spelling[(LICENSEREF-Foo OR licenseref-foo) AND MIT AND LicenseRef-FOO-(LicenseRef-Foo OR LicenseRef-Foo) AND MIT AND LicenseRef-Foo]",
+      "tests/test_licenses.py::test_licenseref_case_variants_use_first_spelling[LicenseRef-mit OR licenseref-MIT-LicenseRef-mit OR LicenseRef-mit]",
+      "tests/test_licenses.py::test_licenseref_case_variants_use_first_spelling[licenseref-MIT AND LicenseRef-mit-LicenseRef-MIT AND LicenseRef-MIT]"
+    ]
   },
   "difficulty": "unknown (historical upstream bug)",
   "notes": "packaging PR #1412; hidden = the fix's whole tests/ directory; bug tests failing on base: 3",

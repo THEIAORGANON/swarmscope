@@ -16,12 +16,22 @@
     "pr_created": "2026-11-11"
   },
   "prompt": "VersionRange.union() loses an explicitly named pre-release when that literal also lies inside the other operand's bounds:\n\n```python\nfrom packaging.specifiers import SpecifierSet\n\nordinary = SpecifierSet(\">=1,<2\").to_range()\nnamed = SpecifierSet(\"===1.5a1\").to_range()\nlist((ordinary | named).filter([\"1.5a1\", \"1.6\"]))   # ['1.6'], expected ['1.5a1', '1.6']\nlist((named | ordinary).filter([\"1.5a1\", \"1.6\"]))   # same\n```\n\nNaming a pre-release literally (===1.5a1) opts it in when the literal lies outside the other range's bounds; it must also work when it lies inside them, in either union order. Details that must keep holding:\n- the literal spelling matters: naming 1.5a1 does not admit the input string \"1.5a01\", and other pre-releases such as 1.5a2 stay excluded;\n- an explicit pre-release policy still decides: with prereleases=False on both ranges no pre-release is admitted, with prereleases=True all are;\n- the opt-in survives later narrowing, e.g. (ordinary | named) & (>=1.4) and (ordinary | named) - (>=1.7);\n- a literal that was excluded (e.g. ordinary - named) does not become an opt-in when that result is united with ordinary bounds again.\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
-  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
   "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)"
+  },
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-range/hidden",
-    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
-    "expected_tests": 63603
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 63603,
+    "bug_tests": [
+      "tests/test_ranges.py::TestPrereleaseRegion::test_named_literal_prerelease_inside_union_bounds[None-False]",
+      "tests/test_ranges.py::TestPrereleaseRegion::test_named_literal_prerelease_inside_union_bounds[None-True]",
+      "tests/test_ranges.py::TestPrereleaseRegion::test_overlapping_literal_opt_in_survives_narrowing"
+    ]
   },
   "difficulty": "unknown (historical upstream bug)",
   "notes": "packaging PR #1511; hidden = the fix's whole tests/ directory; bug tests failing on base: 3",

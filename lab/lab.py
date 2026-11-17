@@ -11,6 +11,7 @@ of the final snapshot after the session, and one run.json.
   python lab/lab.py run    --task T --mode A
   python lab/lab.py batch  --task T --modes A,B --repeats 1 --seed 1
   python lab/lab.py summary
+  python lab/lab.py screen --tasks T1,T2,... --seed S [--jobs 3] [--modes A] [--repeats 1]   batches side by side
   python lab/lab.py calib  [--mode A] [--json]   per task: successes, hidden tests passed, which ones failed
 
 Runner side (the agent can neither read nor write it): $SWARMSCOPE_LAB or ~/Downloads/swarmscope-lab
@@ -397,6 +398,9 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
     for tool in ("Read", "Edit"):
         rules.append(f"{tool}(~/**)")
         rules += [f"{tool}(/{p}/**)" for p in denied]       # "//abs/path" form for absolute paths
+    # no web from the main session or any subagent (the docs agent declares both): Bash's network is the sandbox's
+    # business, but WebFetch and WebSearch run outside it; for historical tasks the upstream fix is public
+    rules += list(WEB_TOOLS)
     settings = {
         "hooks": hooks,
         # acceptEdits auto-allows only "safe" sandboxed commands: interpreters (python3 -m unittest) needed approval
@@ -505,6 +509,27 @@ def rate_limit_events(path):
 
 
 # --- advisor: calls, results and which block they answer -------------------------------------------------
+
+WEB_TOOLS = ("WebFetch", "WebSearch")
+
+
+def web_tool_uses(transcript):
+    """Web tool calls in the session and its subagents' transcripts: [(file, tool name)]. Any of them makes a run
+    invalid, whether or not it was refused."""
+    sys.path.insert(0, str(REPO))
+    import costs
+    files = [transcript] + sorted(costs._subagent_files(transcript).values())
+    hits = []
+    for f in files:
+        recs, _ = jl(f)
+        for r in recs or []:
+            for b in ((r.get("message") or {}).get("content") or []) if isinstance(r.get("message"), dict) else []:
+                if not isinstance(b, dict) or b.get("type") not in ("tool_use", "server_tool_use"):
+                    continue
+                if b.get("name") in WEB_TOOLS or b.get("name") in ("web_search", "web_fetch"):
+                    hits.append((Path(f).name, b.get("name")))
+    return hits
+
 
 def advisor_calls(transcript):
     """Every advisor call in the transcript, its result matched by tool_use_id: returned | failed | no_result."""
@@ -1111,6 +1136,10 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
             problems.append(f"cost mismatch: claude code {cc:.4f} vs costs.py {c['total_usd']:.4f}")
         rj["models_seen"], p = check_models(result, c, modes, mode)
         problems += p
+        web = web_tool_uses(tp)
+        rj["observation"]["web_tool_uses"] = len(web)
+        if web:
+            problems.append(f"web tool used {len(web)} time(s): {sorted({n for _, n in web})}")
         named = advisor_models_in_transcript(tp)
         adv = advisor_for(modes, mode)
         if named and named != [adv]:
@@ -1152,6 +1181,11 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
             problems.append("hidden tests changed during the run")
         tests["hidden"] = run_suite("hidden", h["cmd"], snapshot, run_dir, expected=h.get("expected_tests"),
                                     timeout=suite_timeout, hidden_dir=hdir, work_base=wb)
+        bug = set(h.get("bug_tests") or [])       # historical tasks: the tests that fail on the base
+        if bug and tests["hidden"]["report"]:
+            np_ = set(tests["hidden"]["not_passed"] or [])
+            tests["hidden"]["bug_tests"] = {"total": len(bug), "not_passed": sorted(np_ & bug)}
+            tests["hidden"]["regressions"] = sorted(np_ - bug)
     for k, t in tests.items():
         if t["sandbox"] == "unavailable":
             problems.append(f"{k} tests not run: no sandbox available")
@@ -1228,6 +1262,9 @@ def calibration(run_jsons, mode="A", batch=None):
         t["passed"].append(h.get("passed"))
         t["expected"] = h.get("expected") or t["expected"]
         t["runs"].append(rj.get("run_id"))
+        if "bug_tests" in h:                     # historical tasks: was the bug fixed, did anything else break
+            t.setdefault("bug_fixed", []).append(not h["bug_tests"]["not_passed"])
+            t.setdefault("regressions", []).append(len(h.get("regressions") or []))
         cost = (rj.get("costs") or {}).get("claude_code_total_usd")
         if cost is not None:
             t["cost_usd"].append(cost)
@@ -1255,6 +1292,8 @@ def cmd_calib(a):
         print(f"{key:<20} {a.mode}: {t['success']}/{t['valid']} success  hidden {t['passed']} of "
               f"{t['expected'] or '-'}  mean {cost}" + (f"  (+{t['invalid']} invalid)" if t["invalid"] else "")
               + (f"  batches {', '.join(t['batches'])}" if t["batches"] else ""))
+        if "bug_fixed" in t:
+            print(f"    bug fixed {sum(t['bug_fixed'])}/{len(t['bug_fixed'])}  regressions per run {t['regressions']}")
         if seen[t["task_id"]] > 1:
             print(f"    ! {t['task_id']} has {seen[t['task_id']]} experiment versions (task, tests, modes, policy, "
                   f"models or Claude Code changed); they are not pooled")
@@ -1547,7 +1586,7 @@ def cmd_batch(a):
     modes = [m.strip() for m in a.modes.split(",") if m.strip()]
     order = [(m, r + 1) for m in modes for r in range(a.repeats)]
     random.Random(a.seed).shuffle(order)
-    batch_id = time.strftime("%Y%m%d-%H%M%S")
+    batch_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]   # unique when batches run side by side
     expect = batch_expect(task, modes_sha)
     manifest = {"batch_id": batch_id, "seed": a.seed, "task": task["task_id"], "order": order, "expect": expect,
                 "runs": [], "valid": True}
@@ -1567,6 +1606,49 @@ def cmd_batch(a):
                   f"{'; '.join(rj.get('integrity') or [])})")
             break
     return 0 if manifest["valid"] else 1
+
+
+def cmd_screen(a):
+    """Screening: one batch per task, up to --jobs of them at the same time (separate processes, each with its
+    own runs, work dirs and batch manifest). Faster wall time for picking tasks; final mode comparisons should
+    still run as ordinary batches. Stops starting new batches after an API failure or a batch that did not start."""
+    tasks = [t.strip() for t in a.tasks.split(",") if t.strip()]
+    for t in tasks:
+        load_task(t)                              # unknown task: fail before anything starts
+    logs = lab_root() / "batches" / "screen"
+    logs.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    pending, running, results, stop = list(enumerate(tasks)), [], {}, None
+    while pending or running:
+        while pending and len(running) < a.jobs and not stop:
+            i, t = pending.pop(0)
+            log = logs / f"{stamp}-{i:02d}-{Path(t).stem}.log"
+            f = open(log, "w")
+            p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "batch", "--task", t, "--modes",
+                                  a.modes, "--repeats", str(a.repeats), "--seed", str(a.seed)],
+                                 stdout=f, stderr=subprocess.STDOUT, env=os.environ.copy())
+            running.append((i, t, p, f, log))
+            print(f"started {t} (log {log})", flush=True)
+            time.sleep(2)
+        if stop and pending:
+            print(f"not started: {', '.join(t for _, t in pending)} ({stop})")
+            pending = []
+        time.sleep(1)
+        for item in list(running):
+            i, t, p, f, log = item
+            if p.poll() is None:
+                continue
+            f.close()
+            running.remove(item)
+            text = log.read_text()
+            results[i] = p.returncode
+            for ln in text.splitlines():
+                if re.search(r"\b(VALID|INVALID)\b|stopping the batch", ln):
+                    print(f"  {ln}", flush=True)
+            if "stopping the batch" in text:
+                stop = "a batch stopped: API failure or not started"
+    print(f"screen done: {sum(1 for c in results.values() if c == 0)}/{len(results)} batches all valid")
+    return 0 if results and all(c == 0 for c in results.values()) and not stop else 1
 
 
 def cmd_summary(_):
@@ -1597,6 +1679,12 @@ def main(argv=None):
     b.add_argument("--modes", default="A,B")
     b.add_argument("--repeats", type=int, default=1)
     b.add_argument("--seed", type=int, required=True)
+    sc = sub.add_parser("screen")
+    sc.add_argument("--tasks", required=True, help="comma-separated task ids or manifest paths")
+    sc.add_argument("--modes", default="A")
+    sc.add_argument("--repeats", type=int, default=1)
+    sc.add_argument("--seed", type=int, required=True)
+    sc.add_argument("--jobs", type=int, default=3)
     sub.add_parser("summary")
     c = sub.add_parser("calib")
     c.add_argument("--mode", default="A")
@@ -1604,7 +1692,7 @@ def main(argv=None):
     c.add_argument("--batch", help="only this batch id")
     a = ap.parse_args(argv)
     return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch,
-            "calib": cmd_calib, "summary": cmd_summary}[a.cmd](a) or 0
+            "calib": cmd_calib, "screen": cmd_screen, "summary": cmd_summary}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":
