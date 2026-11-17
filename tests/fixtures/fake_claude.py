@@ -75,9 +75,11 @@ hook("UserPromptSubmit", prompt=prompt)
 if "authorized test of the sandbox" in prompt:  # lab.py probe: behave like a sandboxed agent (or leak on request)
     Path("inside.txt").write_text("ok\n")
     leaked = ""
+    if os.environ.get("FAKE_NET"):
+        leaked += " <h1>Example Domain"
     if os.environ.get("FAKE_LEAK"):
         canary = re.search(r"cat (\S+canary\S+)", prompt).group(1)
-        leaked = Path(canary).read_text()
+        leaked += Path(canary).read_text()
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "p1", "model": model, "content": [
         {"type": "text", "text": "1 BLOCKED " + leaked}], "usage": {"input_tokens": 10, "output_tokens": 5}}})
     hook("Stop", stop_hook_active=False)

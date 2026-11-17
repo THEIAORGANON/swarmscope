@@ -84,7 +84,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_WORK_ROOT", str(tmp_path / "w"))
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -128,7 +128,8 @@ def test_settings_sandbox_and_deny_rules(task):
     r = lab.attempt(task, "A")
     s = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
     sb = s["sandbox"]
-    assert sb["enabled"] and sb["allowUnsandboxedCommands"] is False and sb["network"]["allowedDomains"] == []
+    assert sb["enabled"] and sb["allowUnsandboxedCommands"] is False
+    assert sb["network"]["allowedDomains"] == [lab.NO_NETWORK]          # [] left the network open
     assert "~/" in sb["filesystem"]["denyRead"]
     for p in (str(lab.lab_root().resolve()), lab.expand(task["hidden_tests"]["dir"]), lab.expand(task["source"]["repo"])):
         assert p in sb["filesystem"]["denyRead"]
@@ -352,3 +353,10 @@ def test_probe_catches_a_leak(task, monkeypatch, capsys):
     assert lab.cmd_probe(argparse.Namespace(task=task["_file"])) == 1
     out = capsys.readouterr().out
     assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+
+
+def test_probe_catches_open_network(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_NET", "1")
+    assert lab.cmd_probe(argparse.Namespace(task=task["_file"])) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  no_network" in out and "boundary BROKEN" in out

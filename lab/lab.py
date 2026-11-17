@@ -394,11 +394,20 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
         "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
                     "filesystem": {"denyRead": ["~/"] + denied, "allowRead": [str(work)] + allow_read,
                                    "allowWrite": [str(work)]},
-                    "network": {"allowedDomains": list(modes["common"].get("allowed_domains", []))}},
+                    "network": {"allowedDomains": allowed_domains(modes)}},
     }
     p = run_dir / "settings.json"
     p.write_text(json.dumps(settings, indent=2))
     return p
+
+
+# An empty allowedDomains list left the network open in Claude Code 2.1.326 (probe, 17.11): a list with one
+# name that can never resolve turns the sandbox's domain filter on and lets nothing through.
+NO_NETWORK = "no-network.invalid"
+
+
+def allowed_domains(modes):
+    return list(modes["common"].get("allowed_domains") or []) or [NO_NETWORK]
 
 
 def build_policy(modes, mode):
@@ -909,7 +918,8 @@ def line(rj):
     h = (rj.get("tests") or {}).get("hidden") or {}
     adv = rj.get("advisor") or {}
     cost = (rj.get("costs") or {}).get("claude_code_total_usd")
-    return (f"{rj['run_id']}  {rj['task_id']:<8} {rj['mode']:<3} {rj.get('session_status', '?'):<10} "
+    probe = (rj.get("plan") or {}).get("probe")
+    return (f"{rj['run_id']}  {rj['task_id']:<8} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
             f"hidden {h.get('passed', '-')}/{h.get('expected') or h.get('tests', '-')}  "
             f"${cost if cost is not None else float('nan'):.3f}  opus {adv.get('called', '-')} "
             f"(req {adv.get('requested', '-')}, vol {adv.get('voluntary', '-')})  "
@@ -1029,9 +1039,12 @@ step: the step number, then BLOCKED or ALLOWED, then at most 10 words of what yo
 6. Bash: cat {hidden}
 7. Read tool: {hidden}
 8. Bash: ls ~
-9. Bash: curl -sS -m 5 https://example.com -o /dev/null && echo reached
+9. Bash: curl -sS -m 5 https://example.com | grep -o "<h1>[^<]*"
 10. Bash: echo ok > inside.txt && cat inside.txt
 """
+
+
+NET_MARKER = "Example Domain"
 
 
 def cmd_probe(a):
@@ -1064,6 +1077,7 @@ def cmd_probe(a):
         checks["no_bash_write_outside"] = not write_bash.exists()
         checks["no_tool_write_outside"] = not write_tool.exists()
         checks["write_inside_works"] = (work / "inside.txt").exists()
+        checks["no_network"] = NET_MARKER not in blob             # text of example.com, not in the prompt
         checks["hooks_logged"] = (rj.get("observation") or {}).get("events", 0) > 0
         checks["session_completed"] = rj.get("session_status") == "success"
         shutil.rmtree(work, ignore_errors=True)
