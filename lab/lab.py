@@ -47,7 +47,7 @@ DROP_ENV = re.compile(r"^(SWARMSCOPE_|TYPESAFE_|CLAUDECODE$|CLAUDE_CODE_ENTRYPOI
                       r"ANTHROPIC_MODEL$|ANTHROPIC_DEFAULT_|ANTHROPIC_SMALL_FAST_MODEL$|CLAUDE_CONFIG_DIR$)")
 # marketplace catalogs Claude Code downloads on first start: metadata, not installed plugins
 MARKETPLACE_CATALOG = ("known_marketplaces.json:", "marketplaces/")
-REQUIRED_FLAGS = ["--effort", "--settings", "--setting-sources", "--strict-mcp-config",
+REQUIRED_FLAGS = ["--disable-slash-commands", "--effort", "--settings", "--setting-sources", "--strict-mcp-config",
                   "--output-format", "--permission-mode"]
 GIT_ENV = {"GIT_AUTHOR_NAME": "lab", "GIT_AUTHOR_EMAIL": "lab@localhost", "GIT_COMMITTER_NAME": "lab",
            "GIT_COMMITTER_EMAIL": "lab@localhost", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
@@ -215,12 +215,12 @@ def preflight(work, cfg):
                   "enabledPlugins"):
             if k in st:
                 problems.append(f"config settings.json sets '{k}': remove it (the runner sets everything)")
-    for sub in ("commands", "skills", "output-styles"):
+    for sub in ("commands", "output-styles"):
         if inv[sub]:
             problems.append(f"config dir has {sub}: {inv[sub][:3]}")
-    installed = [f for f in inv["plugins"] if not f.startswith(MARKETPLACE_CATALOG)]
-    if installed:
-        problems.append(f"config dir has plugin files beyond marketplace catalogs: {installed[:3]}")
+    # skills and plugins: Claude Code syncs account skills and a plugin store into the config dir by itself.
+    # Runs pass --disable-slash-commands; what counts is what the session reports as loaded (init message),
+    # checked after launch. The files are recorded in the inventory.
     above = instruction_files_above(work)
     if above:
         problems.append(f"instruction/settings files in or above the working copy: {above}")
@@ -274,7 +274,8 @@ def claude_cmd(modes, settings):
     c = modes["common"]
     cmd = [claude_bin(), "-p", "--output-format", "stream-json", "--verbose", "--model", c["model"],
            "--advisor", c["advisor"], "--effort", c["effort"], "--settings", str(settings),
-           "--setting-sources", "user", "--strict-mcp-config", "--permission-mode", c["permission_mode"]]
+           "--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
+           "--permission-mode", c["permission_mode"]]
     return cmd + list(c.get("extra_args", []))
 
 
@@ -521,8 +522,9 @@ def attempt(task, mode, plan=None):
         rj["loaded"] = {k: init.get(k) for k in ("model", "cwd", "tools", "mcp_servers", "agents", "slash_commands",
                                                "skills", "plugins", "permissionMode", "apiKeySource", "claude_code_version",
                                                "output_style", "memory_paths") if k in init}
-        if init.get("mcp_servers"):
-            problems.append(f"MCP servers loaded: {init['mcp_servers']}")
+        for k in ("mcp_servers", "skills", "plugins"):
+            if init.get(k):
+                problems.append(f"{k} loaded in the session: {str(init[k])[:300]}")
         if init.get("cwd") and Path(init["cwd"]).resolve() != work.resolve():
             problems.append(f"session cwd {init['cwd']} is not the working copy")
     else:
@@ -668,7 +670,7 @@ def cmd_doctor(a):
     print(f"flags        {'all in --help' if not missing else 'MISSING from --help ' + ' '.join(missing)}"
           + "  (--advisor is hidden from --help; --ping checks the real command line)")
     ok &= not missing
-    probe = lab / "w" / "_doctor"
+    probe = lab / "w" / f"_doctor-{uuid.uuid4().hex[:6]}"
     probe.mkdir(parents=True, exist_ok=True)
     pf = preflight(probe, cfg)
     print(f"isolation    {'ok' if pf['ok'] else 'PROBLEMS'}")
@@ -711,6 +713,12 @@ def cmd_doctor(a):
             adv = {k: v for k, v in init.items() if "advis" in k.lower() or "effort" in k.lower()}
             print(f"loaded       model {init.get('model')} · permission {init.get('permissionMode')} · "
                   f"mcp {init.get('mcp_servers')} · agents {init.get('agents')}")
+            for k in ("skills", "plugins", "slash_commands", "memory_paths", "output_style"):
+                print(f"             {k}: {str(init.get(k))[:300]}")
+            loaded = [k for k in ("mcp_servers", "skills", "plugins") if init.get(k)]
+            if loaded:
+                print(f"             NOT CLEAN: {', '.join(loaded)} loaded")
+                ok = False
             print(f"             advisor/effort fields in init: {adv or 'none reported'}")
             print(f"             init keys: {', '.join(sorted(init.keys()))}")
     shutil.rmtree(probe, ignore_errors=True)

@@ -4,7 +4,7 @@ import json, os, sys, subprocess, uuid, time, re
 from pathlib import Path
 a = sys.argv[1:]
 if "--version" in a: print("9.9.9 (Claude Code, fake)"); sys.exit()
-if "--help" in a: print("--advisor --effort --settings --setting-sources --strict-mcp-config --output-format --permission-mode"); sys.exit()
+if "--help" in a: print("--disable-slash-commands --effort --settings --setting-sources --strict-mcp-config --output-format --permission-mode"); sys.exit()
 prompt = sys.stdin.read()
 settings = json.load(open(a[a.index("--settings")+1]))
 cwd = os.getcwd(); sid = str(uuid.uuid4())
@@ -21,7 +21,7 @@ def hook(ev, **kw):
     cmd = settings["hooks"][ev][0]["hooks"][0]["command"]
     r = subprocess.run(cmd, shell=True, input=json.dumps(d), capture_output=True, text=True)
     return json.loads(r.stdout) if r.stdout.strip() else None
-out({"type":"system","subtype":"init","session_id":sid,"cwd":cwd,"model":"claude-sonnet-5-5","tools":["Bash","Edit"],"mcp_servers":[],"agents":["search"],"permissionMode":"bypassPermissions"})
+out({"type":"system","subtype":"init","session_id":sid,"cwd":cwd,"model":"claude-sonnet-5-5","tools":["Bash","Edit"],"mcp_servers":[],"agents":["search"],"permissionMode":"bypassPermissions","skills":json.loads(os.environ.get("FAKE_SKILLS","[]")),"plugins":[]})
 if "hooks" not in settings:
     out({"type":"result","subtype":"success","is_error":False,"session_id":sid,"result":"OK","total_cost_usd":0.001,"modelUsage":{"claude-sonnet-5-5":{}}}); sys.exit()
 hook("UserPromptSubmit", prompt=prompt)

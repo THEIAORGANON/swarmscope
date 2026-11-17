@@ -118,12 +118,21 @@ def test_marketplace_catalogs_and_home_settings_are_not_problems(task):
     (home_claude / "settings.json").write_text('{"hooks": {}}')
     work = lab.lab_root() / "w" / "x"
     work.mkdir(parents=True)
+    (cfg / "skills" / "synced" / "acct").mkdir(parents=True)          # account skills Claude Code syncs itself
+    (cfg / "skills" / "synced" / "acct" / "SKILL.md").write_text("x")
     pf = lab.preflight(work, cfg)
     assert pf["ok"], pf["problems"]
-    (cfg / "plugins" / "installed_plugins.json").write_text("{}")
+    assert pf["config"]["skills"]                                       # recorded, checked at launch instead
     (home_claude / "CLAUDE.md").write_text("consult the advisor")
     pf = lab.preflight(work, cfg)
-    assert any("plugin files" in p for p in pf["problems"]) and any(".claude/CLAUDE.md" in p for p in pf["problems"])
+    assert any(".claude/CLAUDE.md" in p for p in pf["problems"])
+
+
+def test_skills_loaded_in_the_session_are_an_integrity_problem(task, monkeypatch):
+    monkeypatch.setenv("FAKE_SKILLS", '["built-in-browser"]')
+    r = lab.attempt(task, "A")
+    assert any("skills loaded" in p for p in r["integrity"])
+    assert "--disable-slash-commands" in r["config"]["argv"]
 
 
 def test_doctor_ping_runs_the_real_command_line(task, capsys):
