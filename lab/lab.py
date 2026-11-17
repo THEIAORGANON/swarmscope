@@ -235,6 +235,20 @@ def preflight(work, cfg):
     return {"ok": not problems, "problems": problems, "config": inv, "instruction_files_above": above}
 
 
+def not_clean(init):
+    """What the session loaded beyond Claude Code itself: MCP servers, skills, non-builtin plugins.
+    Builtin plugins (path "builtin", source "...@builtin") ship with Claude Code and are the same everywhere."""
+    out = {}
+    for k in ("mcp_servers", "skills"):
+        if init.get(k):
+            out[k] = init[k]
+    foreign = [p for p in init.get("plugins") or []
+               if not (isinstance(p, dict) and (p.get("path") == "builtin" or str(p.get("source", "")).endswith("@builtin")))]
+    if foreign:
+        out["plugins"] = foreign
+    return out
+
+
 def agent_env(cfg):
     env, dropped = {}, []
     for k, v in os.environ.items():
@@ -522,9 +536,8 @@ def attempt(task, mode, plan=None):
         rj["loaded"] = {k: init.get(k) for k in ("model", "cwd", "tools", "mcp_servers", "agents", "slash_commands",
                                                "skills", "plugins", "permissionMode", "apiKeySource", "claude_code_version",
                                                "output_style", "memory_paths") if k in init}
-        for k in ("mcp_servers", "skills", "plugins"):
-            if init.get(k):
-                problems.append(f"{k} loaded in the session: {str(init[k])[:300]}")
+        for k, v in not_clean(init).items():
+            problems.append(f"{k} loaded in the session: {str(v)[:300]}")
         if init.get("cwd") and Path(init["cwd"]).resolve() != work.resolve():
             problems.append(f"session cwd {init['cwd']} is not the working copy")
     else:
@@ -713,11 +726,13 @@ def cmd_doctor(a):
             adv = {k: v for k, v in init.items() if "advis" in k.lower() or "effort" in k.lower()}
             print(f"loaded       model {init.get('model')} · permission {init.get('permissionMode')} · "
                   f"mcp {init.get('mcp_servers')} · agents {init.get('agents')}")
-            for k in ("skills", "plugins", "slash_commands", "memory_paths", "output_style"):
-                print(f"             {k}: {str(init.get(k))[:300]}")
-            loaded = [k for k in ("mcp_servers", "skills", "plugins") if init.get(k)]
-            if loaded:
-                print(f"             NOT CLEAN: {', '.join(loaded)} loaded")
+            builtin = [p.get("name") for p in init.get("plugins") or [] if isinstance(p, dict)]
+            print(f"             skills: {init.get('skills')} · slash_commands: {init.get('slash_commands')}")
+            print(f"             plugins (builtin are fine): {builtin}")
+            print(f"             memory: {init.get('memory_paths')} · output_style: {init.get('output_style')}")
+            extra = not_clean(init)
+            if extra:
+                print(f"             NOT CLEAN: {str(extra)[:400]}")
                 ok = False
             print(f"             advisor/effort fields in init: {adv or 'none reported'}")
             print(f"             init keys: {', '.join(sorted(init.keys()))}")

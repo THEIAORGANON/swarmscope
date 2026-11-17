@@ -141,3 +141,11 @@ def test_doctor_ping_runs_the_real_command_line(task, capsys):
     out = capsys.readouterr().out
     assert "'OK'" in out and "advisor/effort fields in init" in out
     assert "ready" in out.splitlines()[-1]
+
+
+def test_builtin_plugins_are_clean_others_are_not():
+    builtin = {"name": "cc-plugin-telemetry", "path": "builtin", "source": "cc-plugin-telemetry@builtin"}
+    other = {"name": "x", "path": "/u/.claude/plugins/x", "source": "x@market"}
+    assert lab.not_clean({"plugins": [builtin], "skills": [], "mcp_servers": []}) == {}
+    assert lab.not_clean({"plugins": [builtin, other]}) == {"plugins": [other]}
+    assert lab.not_clean({"skills": ["built-in-browser"]}) == {"skills": ["built-in-browser"]}
