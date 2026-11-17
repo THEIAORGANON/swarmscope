@@ -138,7 +138,10 @@ def validate_historical(task_dir, manifest):
             good = (p["code"] == 0 and h["code"] != 0 and h["ran"] == expected
                     and set(h["not_passed"]) == set(meta["bug_tests"]) and h["failed"] == len(meta["bug_tests"]))
         else:
-            good = p["code"] == 0 and h["code"] == 0 and h["failed"] == 0 and h["ran"] == expected
+            # a feature may change behaviour the base's own tests asserted (those tests change with it), so only the
+            # feature's suite has to pass on the reference
+            good = ((meta.get("feature") or p["code"] == 0) and h["code"] == 0 and h["failed"] == 0
+                    and h["ran"] == expected)
         rows.append(f"    {'ok ' if good else 'BAD'} {name:<5} public {p['ran']}/{p['failed']} failed  hidden "
                     f"{h['ran']}/{h['failed']} failed  {', '.join(h['not_passed'])[:110]}")
         if name == "fix" and h["ran"] != expected:

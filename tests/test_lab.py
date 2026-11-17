@@ -936,3 +936,31 @@ def test_historical_validation_needs_a_full_report_failing_exactly_the_bug_tests
     (t / "task.json").write_text(json.dumps({"id": "hist", "kind": "historical",
                                              "bug_tests": ["tests/test_bug.py::test_neg", "tests/test_old.py::test_one"]}))
     assert any("hist/base" in p for p in build_tasks.validate_historical(t, wrong))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")
+def test_feature_validation_allows_old_tests_the_feature_changes(tmp_path):
+    """A feature may change behaviour the base's own tests asserted: the reference only has to pass the feature's
+    suite. The base has to fail it (here at import, since the new function does not exist yet)."""
+    sys.path.insert(0, os.path.join(ROOT, "lab", "tasks"))
+    import build_tasks
+    t = tmp_path / "feat"
+    (t / "base" / "src").mkdir(parents=True)
+    (t / "base" / "tests").mkdir()
+    (t / "base" / "src" / "m.py").write_text("def f(x):\n    raise TypeError(x)\n")
+    (t / "base" / "tests" / "test_old.py").write_text(
+        "import pytest\nfrom m import f\ndef test_rejects():\n    with pytest.raises(TypeError):\n        f(1)\n")
+    (t / "ref" / "src").mkdir(parents=True)
+    (t / "ref" / "src" / "m.py").write_text("def f(x):\n    return x\ndef g():\n    return 2\n")
+    (t / "hidden" / "tests").mkdir(parents=True)
+    (t / "hidden" / "tests" / "test_new.py").write_text(
+        "from m import f, g\ndef test_f():\n    assert f(1) == 1\ndef test_g():\n    assert g() == 2\n")
+    (t / "task.json").write_text(json.dumps({"id": "feat", "kind": "historical", "feature": True,
+                                             "bug_tests": ["tests/test_new.py::test_f", "tests/test_new.py::test_g"]}))
+    py = f"PYTHONPATH=src {sys.executable} -m pytest -q -p no:cacheprovider tests"
+    m = {"public_tests": py, "hidden_tests": {"expected_tests": 2,
+                                               "cmd": "rm -rf tests && cp -R {hidden}/tests tests && " + py}}
+    assert build_tasks.validate_historical(t, m) == []
+    (t / "task.json").write_text(json.dumps({"id": "feat", "kind": "historical",
+                                             "bug_tests": ["tests/test_new.py::test_f", "tests/test_new.py::test_g"]}))
+    assert any("feat/" in p for p in build_tasks.validate_historical(t, m))   # as a bug fix it is not valid
