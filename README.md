@@ -109,6 +109,27 @@ Options: `model` (pinned, default `jev-1.14.0`), `threshold` (default 0.5, provi
 
 Key: put it in `typesafe_key` in the swarmscope folder (`chmod 600`), or set `TYPESAFE_API_KEY`. It is only ever sent to `https://api.typesafe.ai/v1/systemone`, and the project's config cannot change that. It is never written to events, decisions or Jev records. `python jevshadow.py --show <session_id>` prints, per checkpoint, which consult rules fired, whether that was applied, whether the advisor was then called, and what Jev said. `--replay <session_id>` sends the stored requests again, or the current question with `--current-question`. Replays are kept apart and never replace the original answers. `python jev_probe.py` makes a one-off test call.
 
+## Lab runner (experimental)
+
+`lab/lab.py` runs the escalation experiment one attempt at a time:
+- a fresh copy of the task's base commit outside the home folder (no history, no remote, experiment files excluded);
+- Claude Code with its own `CLAUDE_CONFIG_DIR` and an allow-listed environment, hooks passed with `--settings`;
+- Bash in Claude Code's OS sandbox (home folder unreadable, writes only in the copy, no network), Read/Edit denied outside the copy;
+- the policy and Jev settings come from a runner-side file (`SWARMSCOPE_POLICY_FILE`); the hook logs the sha of the policy it used;
+- tests run on separate copies of the final snapshot;
+- one `run.json` per attempt, with `valid` (infrastructure), `session_status` and `verdict` kept apart.
+
+```bash
+python lab/lab.py setup                                  # then log in once with the printed config dir
+python lab/lab.py doctor --ping --advisor-check          # CLI, isolation, real command line, one advisor call
+python lab/lab.py probe                                  # boundary test: the agent tries to read/write outside
+python lab/lab.py batch --task smoke1 --modes A,B --repeats 1 --seed 1
+python lab/lab.py summary
+```
+
+Modes live in `lab/modes.json` (A = rules and Jev only record, B = Rules Engine b-5 enforces), tasks in `lab/tasks/`.
+Every mode gets the same hooks, logs, sandbox and checks; only the policy differs.
+
 ## Prompting the advisor
 
 Sonnet chooses when to call the advisor. This line in `CLAUDE.md` makes the three checkpoints more likely:

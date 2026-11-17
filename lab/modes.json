@@ -1,0 +1,42 @@
+{
+  "version": "m-4",
+  "common": {
+    "model": "claude-sonnet-5-5",
+    "advisor": "claude-opus-5-5",
+    "effort": "high",
+    "claude_code": "2.1.326",
+    "permission_mode": "acceptEdits",
+    "timeout_s": 1200,
+    "work_root": "/tmp/swarmscope-w",
+    "allowed_domains": [],
+    "expected_agents": [
+      "claude",
+      "docs",
+      "Explore",
+      "general-purpose",
+      "grep",
+      "Plan",
+      "search",
+      "statusline-setup",
+      "web-fetch"
+    ],
+    "subagent_models": [
+      "claude-haiku-5-5"
+    ],
+    "jev": {
+      "enabled": true,
+      "include_task": false
+    },
+    "_why_permission_mode": "bypassPermissions auto-approved sandbox network requests (probe 17.11, Claude Code 2.1.326): example.com reachable. acceptEdits + autoAllowBashIfSandboxed: edits and sandboxed Bash run, anything that needs approval is refused in -p. acceptEdits alone refused interpreters (python3 -m unittest) in -p; settings add permissions.allow [\"Bash\"] (m-4)."
+  },
+  "modes": {
+    "A": {
+      "policy_mode": "observe",
+      "about": "Sonnet + advisor decides itself; rules and Jev only record"
+    },
+    "B": {
+      "policy_mode": "enforce",
+      "about": "Rules Engine b-5 enforces R1/R2/R3 via the Stop hook; Jev records"
+    }
+  }
+}
