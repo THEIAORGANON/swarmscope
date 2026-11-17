@@ -1,0 +1,29 @@
+{
+  "task_id": "ck-progress",
+  "manifest_version": 2,
+  "set": "calib-2-historical",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/ck-progress",
+    "commit": "0a11be6",
+    "commit_full": "0a11be6f08332ad4d6f058a3c8d14614c9da4d96",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pallets/click",
+    "base_sha": "8b44edfff7d9a6c895fa804148c16b3a0bc9efb5",
+    "fix_sha": "150d1071d69c5cdad7de78590013ffe56cf9e3bb",
+    "pr": 3769,
+    "pr_created": "2026-08-15"
+  },
+  "prompt": "click.progressbar with show_pos=True and an update_min_steps that does not divide the length never shows completion:\n\n```python\nimport time\nimport click\n\nwith click.progressbar(range(20), show_pos=True, update_min_steps=7) as bar:\n    for i in bar:\n        time.sleep(0.1)\n```\n\nThe final output is \"  [####################################]  14/20\" instead of \"20/20\" (the percentage display shows 100%). Whatever the update_min_steps (dividing the length, not dividing it, or larger than it), and both when iterating the bar and when calling bar.update(1) length times on a bar created with length=20, the bar must end with pos == 20, finished, and \"20/20\" in its output.\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
+  "tests_timeout_s": 900,
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/ck-progress/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
+    "expected_tests": 1941
+  },
+  "difficulty": "unknown (historical upstream bug)",
+  "notes": "click PR #3769; hidden = the fix's whole tests/ directory; bug tests failing on base: 6",
+  "task_summary": "Make click.progressbar land on its final position when update_min_steps does not divide the length; done when the test suite passes."
+}

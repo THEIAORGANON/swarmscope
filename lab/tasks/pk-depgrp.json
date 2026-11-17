@@ -1,0 +1,29 @@
+{
+  "task_id": "pk-depgrp",
+  "manifest_version": 2,
+  "set": "calib-2-historical",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/pk-depgrp",
+    "commit": "d8965f3",
+    "commit_full": "d8965f353217750e28c901e5def0276f6fe38715",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pypa/packaging",
+    "base_sha": "8e21512a575ff7cab33e15f77d5f67f278271f07",
+    "fix_sha": "8efde605cc2666f4ab75e028b578b395ba288401",
+    "pr": 1519,
+    "pr_created": "2026-11-13"
+  },
+  "prompt": "A dependency group that includes itself under a different spelling is reported as a cycle between two groups:\n\n```python\nfrom packaging.dependency_groups import resolve_dependency_groups\nresolve_dependency_groups({\"a\": [{\"include-group\": \"A\"}]}, \"a\")\n# ExceptionGroup ... CyclicDependencyGroup: Cyclic dependency group include while resolving a: A -> a, a -> A\n```\n\n\"A\" and \"a\" are the same group after name normalization, so this is a self-include and must be reported as one, with the normalized name: \"... while resolving a: a includes itself\". The same holds for {\"a.b\": [{\"include-group\": \"A_B\"}]} (normalized name a-b) and any other spelling that normalizes to the group's own name.\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "tests_timeout_s": 900,
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-depgrp/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 63750
+  },
+  "difficulty": "unknown (historical upstream bug)",
+  "notes": "packaging PR #1519; hidden = the fix's whole tests/ directory; bug tests failing on base: 4",
+  "task_summary": "Fix the dependency-groups cycle diagnostic for a group that includes itself under another spelling; done when the test suite passes."
+}

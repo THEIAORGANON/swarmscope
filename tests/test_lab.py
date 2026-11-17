@@ -771,6 +771,12 @@ def test_a0_and_a_are_different_experiments_for_calib():
     ("ERROR tests/test_deprecations.py\n!!!!!! Interrupted: 1 error during collection !!!!!!\n"
      "31000 deselected, 1 error in 2.09s\n", 1, 1, 0, ["tests/test_deprecations.py"]),
     ("2083 passed, 24 skipped, 31000 deselected, 1 xfailed in 4.87s\n", 2083, 0, 2083, []),
+    # parametrized ids with spaces and brackets in the message
+    ("FAILED tests/t.py::test_l[(LICENSEREF-Foo OR licenseref-foo) AND MIT-x] - AssertionError: assert [1] == [2]\n"
+     "FAILED tests/t.py::test_o[envvar1-'--units' (env var: 'UNITS')] - assert 2 == 2\nFAILED tests/t.py::test_p[a b]\n"
+     "3 failed, 5 passed in 0.1s\n", 8, 3, 5,
+     ["tests/t.py::test_l[(LICENSEREF-Foo OR licenseref-foo) AND MIT-x]", "tests/t.py::test_o[envvar1-'--units' (env var: 'UNITS')]",
+      "tests/t.py::test_p[a b]"]),
 ])
 def test_parse_pytest_summary_and_failing_ids(text, tests, failed, passed, ids):
     p = lab.parse_pytest(text)
@@ -805,3 +811,16 @@ def test_hidden_pytest_suite_counts_and_ids(tmp_path):
     r = lab.run_suite("hidden", f"{sys.executable} -m pytest -q -p no:cacheprovider tests", snap, tmp_path,
                       expected=3, work_base=tmp_path)
     assert r["ok"] is True and r["passed"] == 3 and r["not_passed"] == []
+
+
+def test_task_can_raise_the_test_suite_timeout(task, monkeypatch):
+    seen = []
+    real = lab.run_suite
+
+    def spy(name, cmd, *a, **kw):
+        seen.append((name, kw.get("timeout")))
+        return real(name, cmd, *a, **kw)
+    monkeypatch.setattr(lab, "run_suite", spy)
+    lab.attempt(dict(task, tests_timeout_s=900), "A")
+    lab.attempt(task, "A")
+    assert seen[:2] == [("public", 900), ("hidden", 900)] and seen[2:] == [("public", 300), ("hidden", 300)]

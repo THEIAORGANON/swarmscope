@@ -11,7 +11,12 @@ Runner side only (the agent can read none of it): $SWARMSCOPE_LAB or ~/Downloads
   tasks-src/<id>/ref/        reference solution, laid over base
   tasks/<id>/                git repo built from base/ (source.repo in lab/tasks/<id>.json)
 
-Validation, per task: base fails the public and the hidden tests; base+ref passes both with exactly
+Historical upstream bugs (task.json "kind": "historical"): base/ is the upstream tree before the fix, ref/ the
+fix's changed source files, hidden/tests the fix's whole test directory; validation checks that base fails
+only the bug's tests (task.json "bug_tests") and base+ref passes everything, and prints the number of passing
+tests on this machine when it differs from expected_tests.
+
+Validation, per (synthetic) task: base fails the public and the hidden tests; base+ref passes both with exactly
 expected_tests hidden tests; every mutant passes the public tests and fails at least one hidden test.
 Hidden tests must not use subTest (unittest would count failing subtests as extra failures).
 """
@@ -102,13 +107,47 @@ def _run(cmd, cwd):
     r = subprocess.run(cmd, shell=True, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
     text = r.stdout + r.stderr
     ran, failed = lab.parse_unittest(text)
+    if ran is None and lab.parse_pytest(text):
+        p = lab.parse_pytest(text)
+        return {"code": r.returncode, "ran": p["tests"], "failed": p["failed"], "not_passed": p["not_passed"],
+                "text": text}
     cases = lab.parse_cases(text)
     return {"code": r.returncode, "ran": ran, "failed": failed, "not_passed": sorted(k for k, v in cases.items()
                                                                                     if v != "ok"), "text": text}
 
 
+def validate_historical(task_dir, manifest):
+    """Upstream bug: base passes its own suite and fails the fix's suite only on the bug's tests; base + the fix's
+    source passes the fix's whole suite with exactly expected_tests passing tests (counted on this machine)."""
+    meta = json.loads((task_dir / "task.json").read_text())
+    hidden = manifest["hidden_tests"]["cmd"].replace("{hidden}", ".hidden_tests")
+    expected = manifest["hidden_tests"]["expected_tests"]
+    problems, rows = [], []
+    for name, ref in (("base", False), ("fix", True)):
+        d = _variant(task_dir, ref, None)
+        try:
+            p, h = _run(manifest["public_tests"], d), _run(hidden, d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        if name == "base":
+            good = p["code"] == 0 and h["code"] != 0 and set(h["not_passed"]) <= set(meta["bug_tests"])
+        else:
+            good = p["code"] == 0 and h["code"] == 0 and h["failed"] == 0 and h["ran"] == expected
+        rows.append(f"    {'ok ' if good else 'BAD'} {name:<5} public {p['ran']}/{p['failed']} failed  hidden "
+                    f"{h['ran']}/{h['failed']} failed  {', '.join(h['not_passed'])[:110]}")
+        if name == "fix" and h["ran"] != expected:
+            rows.append(f"    expected_tests on this machine: {h['ran']} (manifest: {expected})")
+        if not good:
+            problems.append(f"{task_dir.name}/{name}: public exit {p['code']}, hidden exit {h['code']}\n"
+                            + h["text"][-1500:])
+    print("\n".join(rows))
+    return problems
+
+
 def validate(task_dir, manifest):
     meta = json.loads((task_dir / "task.json").read_text())
+    if meta.get("kind") == "historical":
+        return validate_historical(task_dir, manifest)
     if "subTest" in (task_dir / "hidden" / "test_hidden.py").read_text():
         return [f"{task_dir.name}: hidden tests use subTest"]
     public = manifest["public_tests"]

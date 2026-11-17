@@ -1,0 +1,29 @@
+{
+  "task_id": "ck-envvar",
+  "manifest_version": 2,
+  "set": "calib-2-historical",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/ck-envvar",
+    "commit": "e585afb",
+    "commit_full": "e585afbed7364c1dc3376a06e390a9b42b8284bb",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pallets/click",
+    "base_sha": "bb695aaecdef95832d167fc1d508921745aa824e",
+    "fix_sha": "8c73ff134480f436faa0d041bd19aaf949aac22c",
+    "pr": 3884,
+    "pr_created": "2026-10-06"
+  },
+  "prompt": "An option with show_envvar=True renders some envvar values badly. With option = click.Option([\"--units\"], envvar=..., show_envvar=True, required=True) and no value given, the error hint is:\n\n| envvar | now | expected |\n| --- | --- | --- |\n| None | Error: Missing option '--units'. | (unchanged) |\n| \"\" | Error: Missing option '--units' (env var: ''). | Error: Missing option '--units'. |\n| [] | Error: Missing option '--units' (env var: '[]'). | Error: Missing option '--units'. |\n| [\"WEATHER_UNITS\", \"UNITS\"] (or a tuple) | ... (env var: '['WEATHER_UNITS', 'UNITS']'). | ... (env var: 'WEATHER_UNITS', 'UNITS'). |\n| [\"UNITS\"] | ... (env var: '['UNITS']'). | ... (env var: 'UNITS'). |\n| \"UNITS\" | ... (env var: 'UNITS'). | (unchanged) |\n\nThe help screen (--help) shows \"--units TEXT  [env var: ]\" for envvar=\"\" and envvar=[]. An empty envvar (\"\" or []) must behave exactly like envvar=None, in help and in error hints, including with auto_envvar_prefix (prefix WEATHER: \"[env var: WEATHER_UNITS]\").\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
+  "tests_timeout_s": 900,
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/ck-envvar/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
+    "expected_tests": 2083
+  },
+  "difficulty": "unknown (historical upstream bug)",
+  "notes": "click PR #3884; hidden = the fix's whole tests/ directory; bug tests failing on base: 9",
+  "task_summary": "Fix how Click shows an option's envvar in help and error hints when envvar is a sequence or empty; done when the test suite passes."
+}

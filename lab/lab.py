@@ -686,7 +686,7 @@ def overhead(path):
 
 # --- result: snapshot, diff, tests --------------------------------------------------------------------------
 
-SNAPSHOT_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".pytest_cache")
+SNAPSHOT_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".pytest_cache", ".hypothesis")
 
 
 def _files(d):
@@ -764,7 +764,8 @@ def parse_pytest(text):
     for n, k in re.findall(r"(\d+) ((?:subtests? )?[a-z]+)", found[-1]):
         k = {"error": "errors", "warning": "warnings"}.get(k, k)
         counts[k] = counts.get(k, 0) + int(n)
-    ids = sorted({m for m in re.findall(r"^(?:FAILED|ERROR) (\S+)", text, re.M)})
+    # a parametrized id can contain spaces ("test_x[a OR b]"): up to the "]" before " - message" or the line end
+    ids = sorted(set(re.findall(r"^(?:FAILED|ERROR) (\S*?\[.*?\]|\S+)(?= - |$)", text, re.M)))
     bad = counts.get("failed", 0) + counts.get("errors", 0)
     return {"tests": counts.get("passed", 0) + bad, "failed": bad, "passed": counts.get("passed", 0),
             "counts": counts, "not_passed": ids}
@@ -1140,15 +1141,17 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     rj["diff"] = final_diff(run_dir / "base", snapshot, run_dir)
     tests = {}
     wb = work_root(modes)
+    suite_timeout = int(task.get("tests_timeout_s", 300))     # large upstream suites (packaging: ~63k tests)
     if task.get("public_tests"):
-        tests["public"] = run_suite("public", task["public_tests"], snapshot, run_dir, work_base=wb)
+        tests["public"] = run_suite("public", task["public_tests"], snapshot, run_dir, timeout=suite_timeout,
+                                    work_base=wb)
     h = task.get("hidden_tests")
     if h:
         hdir = expand(h["dir"])
         if tree_sha(hdir) != rj["task"]["hidden_tests_sha256"]:
             problems.append("hidden tests changed during the run")
         tests["hidden"] = run_suite("hidden", h["cmd"], snapshot, run_dir, expected=h.get("expected_tests"),
-                                    hidden_dir=hdir, work_base=wb)
+                                    timeout=suite_timeout, hidden_dir=hdir, work_base=wb)
     for k, t in tests.items():
         if t["sandbox"] == "unavailable":
             problems.append(f"{k} tests not run: no sandbox available")
