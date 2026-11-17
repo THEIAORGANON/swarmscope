@@ -2,6 +2,7 @@
 import json
 import os
 import pathlib
+import re
 import time
 from collections import Counter
 
@@ -10,6 +11,20 @@ EVENTS = BASE / "events"
 META = BASE / "meta"
 
 SPAWN_TOOLS = {"Task", "Agent"}
+
+_SECRET_KV = re.compile(r"(?i)\b(api[_-]?key|apikey|secret|client[_-]?secret|token|access[_-]?token|passw(?:or)?d|pwd|"
+                        r"access[_-]?key|private[_-]?key)(\s*[:=]\s*)(['\"]?)([^\s'\"$({][^\s'\"]{5,})")
+_SECRET_TOKENS = re.compile(r"sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
+                            r"|apikey_[A-Za-z0-9_]{20,}|xox[abprs]-[\w\-]{10,}|eyJ[\w\-]{10,}\.[\w\-]{10,}\.[\w\-]{10,}"
+                            r"|-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)
+
+
+def redact(text):
+    """Logged text never keeps literal secrets: key=value pairs and well-known token formats are masked."""
+    if not text:
+        return text
+    t = _SECRET_TOKENS.sub("***", str(text))
+    return _SECRET_KV.sub(lambda m: m.group(1) + m.group(2) + m.group(3) + "***", t)
 
 
 def ensure_dirs():

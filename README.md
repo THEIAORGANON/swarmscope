@@ -93,6 +93,22 @@ Turn it on per project with `.claude/swarmscope-policy.json`:
 
 Enforce blocks at most twice per turn and waits while background subagents run. If anything inside the engine fails, Claude stops normally. To see what a project will report before a live run, use `python rules.py --check <project>`: it shows the registered hook events, the policy mode, whether snapshots work and whether tests were found. Run the checks with `python -m pytest tests`.
 
+## Jev shadow mode (experimental, off by default)
+
+Asks [Jev](https://openrouter.ai/docs/guides/community/jev.md), TypeSafe's decision model, whether consulting the advisor now would be worth its cost. It asks at every Stop, where the rules also decide. It only records the answer. It never changes a rules decision, blocks a Stop or tells Sonnet anything. Jev never sees the rules' verdicts, but it does get some of the same inputs (change size, critical files), so the two are independent algorithms, not independent data.
+
+At each Stop the hook writes a DecisionContext to `jev/<session>.jsonl`, linked to that Stop's rules decision ids and holding the exact request that will be sent. Then it starts a detached worker that calls Jev and appends the answer. Claude Code doesn't wait for the network, only for the context to be written and the worker to start (logged as `jev_shadow_ms` in `overhead/`, ~15 ms on Linux, ~100 ms on macOS). Each context ends with one result: `ok` (probability, plus would-consult at the threshold), `invalid`, `model_mismatch`, `refusal`, `error`, `timeout`, `no_key` or `worker_failed`. If none arrives, `python jevshadow.py --finalize <session_id>` marks it `missing_result`. A missing answer never counts as "skip".
+
+By default only counts and booleans are sent. Opt in for more: `include_task` (the current turn's request, 120 chars, redacted), `include_paths` (relative paths), `include_error_text` (80 chars, redacted). A runner can set `SWARMSCOPE_TASK_SUMMARY` to send its own task summary instead. Never sent: file contents, diffs, commands, the transcript.
+
+```json
+{"mode": "observe", "jev": {"enabled": true}}
+```
+
+Options: `model` (pinned, default `jev-1.14.0`), `threshold` (default 0.5, provisional: calibrate it on tasks you won't use to judge the policy), `timeout_s`, and the opt-ins above. The question is versioned (`q-consult-2`). Each record carries the model, question version and hashes of the question, the config and the request.
+
+Key: put it in `typesafe_key` in the swarmscope folder (`chmod 600`), or set `TYPESAFE_API_KEY`. It is only ever sent to `https://api.typesafe.ai/v1/systemone`, and the project's config cannot change that. It is never written to events, decisions or Jev records. `python jevshadow.py --show <session_id>` prints, per checkpoint, which consult rules fired, whether that was applied, whether the advisor was then called, and what Jev said. `--replay <session_id>` sends the stored requests again, or the current question with `--current-question`. Replays are kept apart and never replace the original answers. `python jev_probe.py` makes a one-off test call.
+
 ## Prompting the advisor
 
 Sonnet chooses when to call the advisor. This line in `CLAUDE.md` makes the three checkpoints more likely:
