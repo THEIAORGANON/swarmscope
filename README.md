@@ -93,6 +93,22 @@ Turn it on per project with `.claude/swarmscope-policy.json`:
 
 Enforce blocks at most twice per turn and waits while background subagents run. If anything inside the engine fails, Claude stops normally. To see what a project will report before a live run, use `python rules.py --check <project>`: it shows the registered hook events, the policy mode, whether snapshots work and whether tests were found. Run the checks with `python -m pytest tests`.
 
+## Jev shadow mode (experimental, off by default)
+
+Asks [Jev](https://openrouter.ai/docs/guides/community/jev.md), TypeSafe's decision model, the same question the rules answer at every Stop: should Sonnet consult the advisor now? It only records the answer. It never changes a rules decision, blocks a Stop or tells Sonnet anything. The rules' own verdicts are not sent to Jev, so the two judgements stay independent.
+
+At each Stop the hook writes a DecisionContext to `jev/<session>.jsonl`, linked to that Stop's rules decision ids. Then it starts a detached worker that calls Jev and appends the answer, so Claude Code never waits on the network (~15 ms in the hook). Every context gets a result: `ok` (with the probability and the would-consult verdict at the threshold), `error`, `timeout`, `refusal` or `no_key`. A missing answer is never counted as "skip".
+
+What is sent: counts, relative file paths, test, error and advisor facts, and the first 120 characters of the task (redacted; set `"include_task_goal": false` to drop it). Never sent: file contents, diffs, commands, the transcript.
+
+```json
+{"mode": "observe", "jev": {"enabled": true}}
+```
+
+Options: `model` (pinned, default `jev-1.14.0`), `threshold` (default 0.5, provisional: calibrate it on tasks you won't use to judge the policy), `timeout_s`, `include_task_goal`. The question text is versioned (`q-consult-1`) and every record carries the model, question version and a config hash.
+
+Key: put it in `typesafe_key` in the swarmscope folder (`chmod 600`), or set `TYPESAFE_API_KEY`. It is never written to events, decisions or Jev records. `python jevshadow.py --show <session_id>` prints rules vs Jev per checkpoint. `--replay <session_id>` asks Jev again for every stored context. `python jev_probe.py` makes a one-off test call.
+
 ## Prompting the advisor
 
 Sonnet chooses when to call the advisor. This line in `CLAUDE.md` makes the three checkpoints more likely:

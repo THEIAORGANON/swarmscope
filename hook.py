@@ -10,13 +10,13 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from common import redact  # noqa: E402  (shared with jevshadow.py)
+except Exception:                               # the hook never fails, even with a broken install
+    def redact(text):
+        return text
 
 
-_SECRET_KV = re.compile(r"(?i)\b(api[_-]?key|apikey|secret|client[_-]?secret|token|access[_-]?token|passw(?:or)?d|pwd|"
-                        r"access[_-]?key|private[_-]?key)(\s*[:=]\s*)(['\"]?)([^\s'\"$({][^\s'\"]{5,})")
-_SECRET_TOKENS = re.compile(r"sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
-                            r"|xox[abprs]-[\w\-]{10,}|eyJ[\w\-]{10,}\.[\w\-]{10,}\.[\w\-]{10,}"
-                            r"|-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)
 _HEREDOC_BODY = re.compile(r"(<<-?[ \t]*(['\"]?)(\w+)\2[^\n]*\n)(.*?)(\n[ \t]*\3[ \t]*(?=\n|$)|\Z)", re.S)
 
 
@@ -26,14 +26,6 @@ def _sensitive_path(path):
         return bool(path) and repostate._sensitive(str(path))
     except Exception:
         return False
-
-
-def redact(text):
-    """Logged text never keeps literal secrets: key=value pairs and well-known token formats are masked."""
-    if not text:
-        return text
-    t = _SECRET_TOKENS.sub("***", str(text))
-    return _SECRET_KV.sub(lambda m: m.group(1) + m.group(2) + m.group(3) + "***", t)
 
 
 def log_cmd(c):
@@ -210,8 +202,10 @@ def policy(d, sid, ev):
               "before_advisor": before if times else None,
               "skipped": cur.get("skipped") or []}
     t1 = _t.time()
-    run_gate(d, sid, ev, pol, change, BASE, lambda _: adv, load_events, rules, cwd, base)
-    overhead["gate_ms"] = round((_t.time() - t1) * 1000, 1)
+    jev_ms = run_gate(d, sid, ev, pol, change, BASE, lambda _: adv, load_events, rules, cwd, base)
+    overhead["gate_ms"] = round((_t.time() - t1) * 1000 - (jev_ms or 0), 1)
+    if jev_ms is not None:
+        overhead["jev_shadow_ms"] = jev_ms
     overhead["total_ms"] = round((_t.time() - t0) * 1000, 1)
     rules.append_log(str(BASE / "overhead" / f"{sid}.jsonl"), [overhead])
 
@@ -220,12 +214,29 @@ def run_gate(d, sid, ev, pol, change, BASE, advisor_activity, load_events, rules
     tp = d.get("transcript_path")
     adv = advisor_activity(tp) if tp else {"times": []}
     logf = str(BASE / "decisions" / f"{sid}.jsonl")
-    records, out = rules.gate(load_events(sid), d, pol, change, adv.get("times") or [], rules.load_log(logf),
-                              rules.project_has_tests(base.get("root") or cwd, pol), sid, now=ev["ts"],
-                              transcript_ok=bool(tp and os.path.exists(tp)))
+    events = load_events(sid)
+    has_tests = rules.project_has_tests(base.get("root") or cwd, pol)
+    records, out = rules.gate(events, d, pol, change, adv.get("times") or [], rules.load_log(logf),
+                              has_tests, sid, now=ev["ts"], transcript_ok=bool(tp and os.path.exists(tp)))
     rules.append_log(logf, records)
     if out:
         sys.stdout.write(json.dumps(out))
+        sys.stdout.flush()
+    return jev_shadow(sid, BASE, events, pol, change, adv.get("times") or [], ev["ts"], has_tests, records)
+
+
+def jev_shadow(sid, BASE, events, pol, change, adv_times, now, has_tests, records):
+    """Jev shadow mode: records what Jev would decide here. Runs after the gate has answered and can never
+    change it; the network call happens in a detached worker. Returns the time spent here (ms) or None."""
+    if not (pol.get("jev") or {}).get("enabled"):
+        return None
+    t0 = time.time()
+    try:
+        import jevshadow
+        jevshadow.shadow(sid, str(BASE), events, pol, change, adv_times, now, has_tests, records)
+    except Exception:
+        pass
+    return round((time.time() - t0) * 1000, 1)
 
 try:
     main()
