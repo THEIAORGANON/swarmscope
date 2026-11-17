@@ -223,10 +223,20 @@ def _probability(a):
     return float(p)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib can re-send the Authorization header to the new host."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None                                  # → HTTPError with the 3xx status, recorded as an error
+
+
+def _open(req, timeout):
+    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
 def ask_jev(request, cfg, key, opener=None):
     """One request (`request` = the stored {"model", "state", "questions"}). Returns a result dict;
-    never raises, never contains the key."""
-    opener = opener or urllib.request.urlopen
+    never raises, never contains the key. Redirects are not followed (a 3xx is an error)."""
+    opener = opener or _open
     url = endpoint()
     req = urllib.request.Request(url, data=json.dumps(request).encode(), method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})

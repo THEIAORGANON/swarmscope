@@ -76,6 +76,46 @@ def test_key_goes_only_to_the_endpoint():
     assert seen == [jevshadow.ENDPOINT]
 
 
+def test_redirect_is_not_followed_so_the_key_cannot_leave(monkeypatch):
+    """A 302 from the endpoint must not carry the Authorization header to another host."""
+    got = []
+
+    class Thief(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):                            # urllib turns a redirected POST into a GET
+            got.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def do_POST(self):
+            got.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    thief = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Thief)
+    threading.Thread(target=thief.serve_forever, daemon=True).start()
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(302)                  # urllib follows 302 for POST and keeps the header
+            self.send_header("Location", f"http://127.0.0.1:{thief.server_address[1]}/steal")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    red = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+    threading.Thread(target=red.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("SWARMSCOPE_JEV_TEST_ENDPOINT", f"http://127.0.0.1:{red.server_address[1]}/v1/systemone")
+        r = jevshadow.ask_jev(REQ, CFG, KEY)
+        assert r["status"] == "error" and r["http_status"] == 302 and got == []
+    finally:
+        red.shutdown()
+        thief.shutdown()
+
+
 def test_default_context_is_structured_only():
     ctx = jevshadow.build_context(EVENTS, POL, CHANGE, [], 70.0, True, CFG)
     assert ctx == jevshadow.build_context(EVENTS, POL, CHANGE, [], 70.0, True, CFG)
