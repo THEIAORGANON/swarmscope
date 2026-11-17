@@ -467,17 +467,28 @@ def parse_stream(path):
     return init, result, bad
 
 
+API_FAILURES = ("api_error", "api_interrupted")
+
+
 def api_failure(result, rate_limits=()):
-    """Why the session never reached the model (rate limit, out of credits, API error), or None. Such a run says
-    nothing about the task: it is invalid, never a failed attempt."""
-    rejected = [r for r in rate_limits if (r.get("rate_limit_info") or {}).get("status") == "rejected"]
+    """(status, reason) when the session ended on an API failure, else None. Decided by the terminal result only:
+    a rejected rate-limit event in a session that still finished normally changes nothing.
+      api_error        the model was never reached (is_error, no model usage): says nothing about the task
+      api_interrupted  the API failed after work had begun (is_error, terminal_reason api_error, model usage)
+    Both are invalid attempts, never failed ones, and both stop a batch (the next attempt would hit the same wall)."""
+    if not result or not result.get("is_error"):
+        return None
+    rejected = [r["rate_limit_info"] for r in rate_limits
+                if (r.get("rate_limit_info") or {}).get("status") == "rejected"]
+    why = result.get("terminal_reason") or "is_error"
     if rejected:
-        info = rejected[-1]["rate_limit_info"]
-        return (f"rate limit rejected ({info.get('rateLimitType')}, resets at "
-                f"{time.strftime('%H:%M', time.localtime(info['resetsAt'])) if info.get('resetsAt') else '?'})")
-    if result and result.get("is_error") and (result.get("terminal_reason") == "api_error"
-                                              or not result.get("modelUsage")):
-        return f"API error ({result.get('terminal_reason') or 'no model usage'})"
+        info = rejected[-1]
+        when = time.strftime("%H:%M", time.localtime(info["resetsAt"])) if info.get("resetsAt") else "?"
+        why = f"rate limit rejected ({info.get('rateLimitType')}, resets at {when})"
+    if not result.get("modelUsage"):
+        return "api_error", f"the model was not reached: {why}"
+    if result.get("terminal_reason") == "api_error":
+        return "api_interrupted", f"the API failed after work had begun: {why}"
     return None
 
 
@@ -754,12 +765,13 @@ _FAILURE = re.compile(r"^(FAIL|ERROR): " + _TEST, re.M)
 
 
 def _case(name, where):
+    """Full id module.Class.test: one-named tests in different modules stay apart."""
     cls = where[:-len(name) - 1] if where.endswith("." + name) else where
-    return f"{cls.rsplit('.', 1)[-1]}.{name}"
+    return f"{cls}.{name}"
 
 
 def parse_cases(text):
-    """{"Class.test_name": status} from unittest's verbose output ({} when it is not verbose). status: ok, FAIL,
+    """{"module.Class.test_name": status} from unittest's verbose output ({} when it is not verbose). status: ok, FAIL,
     ERROR, skipped, expected failure, unexpected success, or unknown; only ok is a pass."""
     cases = {}
     for name, where in re.findall(_TEST + r" \.\.\. ", text):
@@ -882,7 +894,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     problems = rj["integrity"]
 
     def save():
-        rj["valid"] = not problems and rj.get("session_status") not in (None, "not_started")
+        rj["valid"] = not problems and rj.get("session_status") not in (None, "not_started", "running")
         (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False, default=str))
 
     def stop(why):
@@ -968,10 +980,13 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         problems.append("no result message in stream")
     rj["session_status"] = ("timeout" if sess["timed_out"] else (result or {}).get("subtype") or
                             f"exit_{sess['exit_code']}") + ("" if not (result or {}).get("is_error") else ":is_error")
-    failure = api_failure(result, rate_limit_events(run_dir / "stream.jsonl"))
+    limits = rate_limit_events(run_dir / "stream.jsonl")
+    if limits:
+        rj["rate_limit_events"] = [r.get("rate_limit_info") for r in limits]
+    failure = api_failure(result, limits)
     if failure:
-        rj["session_status"] = "api_error"
-        problems.append(f"the model was not reached: {failure}")
+        rj["session_status"], why = failure
+        problems.append(why)
 
     # observation logs: wait for Jev workers, then close open decisions
     hook_env = dict(os.environ, SWARMSCOPE_DIR=str(sw), SWARMSCOPE_POLICY_FILE=str(policy_file))
@@ -1127,17 +1142,35 @@ def line(rj):
             f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}")
 
 
-def calibration(run_jsons, mode="A"):
-    """Per task: valid attempts in `mode`, how many succeeded, hidden tests passed per attempt and how often each
-    hidden test did not pass. Invalid attempts are counted separately and never mixed in."""
+def experiment_key(rj):
+    """What must be equal for attempts to be pooled: task, hidden tests, modes, policy, models, Claude Code."""
+    cfg, task, ver = rj.get("config") or {}, rj.get("task") or {}, rj.get("versions") or {}
+    parts = [task.get("sha256"), task.get("hidden_tests_sha256"), ver.get("modes_file_sha256"),
+             cfg.get("policy_sha256"), cfg.get("model"), cfg.get("advisor"), cfg.get("effort_requested"),
+             ver.get("claude_code")]
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:8]
+
+
+def calibration(run_jsons, mode="A", batch=None):
+    """Per task and experiment version (experiment_key): valid attempts in `mode`, successes, hidden tests passed
+    per attempt and how often each hidden test did not pass. Only finished records count; invalid ones are
+    counted separately and never mixed in. A valid timeout with a recorded verdict is an outcome like any other."""
     out = {}
     for rj in run_jsons:
-        if rj.get("mode") != mode or (rj.get("plan") or {}).get("probe"):
+        plan = rj.get("plan") or {}
+        if rj.get("mode") != mode or plan.get("probe") or (batch and plan.get("batch_id") != batch):
             continue
-        t = out.setdefault(rj.get("task_id"), {"valid": 0, "invalid": 0, "success": 0, "passed": [], "expected": None,
-                                               "not_passed": {}, "cost_usd": [], "runs": []})
-        # runs recorded before api_failure() existed can be marked valid although the model was never reached
-        if not rj.get("valid") or rj.get("session_status") == "api_error" or api_failure(rj.get("result")):
+        if not (rj.get("finished_at") and rj.get("verdict")):
+            continue                                   # still running or the runner died: not an attempt yet
+        t = out.setdefault(f"{rj.get('task_id')}@{experiment_key(rj)}", {
+            "task_id": rj.get("task_id"), "valid": 0, "invalid": 0, "success": 0, "passed": [], "expected": None,
+            "not_passed": {}, "cost_usd": [], "runs": [], "batches": []})
+        b = plan.get("batch_id")
+        if b and b not in t["batches"]:
+            t["batches"].append(b)
+        # records written before api_failure() existed can say valid although the model was never reached
+        if (not rj.get("valid") or rj.get("session_status") in API_FAILURES
+                or (api_failure(rj.get("result")) or ("",))[0] == "api_error"):
             t["invalid"] += 1
             continue
         h = (rj.get("tests") or {}).get("hidden") or {}
@@ -1161,14 +1194,21 @@ def cmd_calib(a):
             runs.append(json.loads(p.read_text()))
         except Exception as e:
             print(f"{p.parent.name}: unreadable ({e})")
-    table = calibration(runs, a.mode)
+    table = calibration(runs, a.mode, a.batch)
     if a.json:
         print(json.dumps(table, indent=2))
         return 0
-    for task_id, t in sorted(table.items(), key=lambda kv: str(kv[0])):
+    seen = {}
+    for key in table:
+        seen[table[key]["task_id"]] = seen.get(table[key]["task_id"], 0) + 1
+    for key, t in sorted(table.items(), key=lambda kv: str(kv[0])):
         cost = f"${sum(t['cost_usd']) / len(t['cost_usd']):.3f}" if t["cost_usd"] else "-"
-        print(f"{task_id:<11} {a.mode}: {t['success']}/{t['valid']} success  hidden {t['passed']} of "
-              f"{t['expected'] or '-'}  mean {cost}" + (f"  (+{t['invalid']} invalid)" if t["invalid"] else ""))
+        print(f"{key:<20} {a.mode}: {t['success']}/{t['valid']} success  hidden {t['passed']} of "
+              f"{t['expected'] or '-'}  mean {cost}" + (f"  (+{t['invalid']} invalid)" if t["invalid"] else "")
+              + (f"  batches {', '.join(t['batches'])}" if t["batches"] else ""))
+        if seen[t["task_id"]] > 1:
+            print(f"    ! {t['task_id']} has {seen[t['task_id']]} experiment versions (task, tests, modes, policy, "
+                  f"models or Claude Code changed); they are not pooled")
         for name, n in sorted(t["not_passed"].items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"    {n}x {name}")
     if not table:
@@ -1473,7 +1513,7 @@ def cmd_batch(a):
                                  "success": rj.get("success")})
         manifest["valid"] &= bool(rj.get("valid"))
         mpath.write_text(json.dumps(manifest, indent=2))
-        if rj.get("session_status") in ("not_started", "api_error"):
+        if rj.get("session_status") in ("not_started",) + API_FAILURES:
             print(f"stopping the batch: {rj['session_status']} (see {rj['run_id']}/run.json: "
                   f"{'; '.join(rj.get('integrity') or [])})")
             break
@@ -1512,6 +1552,7 @@ def main(argv=None):
     c = sub.add_parser("calib")
     c.add_argument("--mode", default="A")
     c.add_argument("--json", action="store_true")
+    c.add_argument("--batch", help="only this batch id")
     a = ap.parse_args(argv)
     return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch,
             "calib": cmd_calib, "summary": cmd_summary}[a.cmd](a) or 0
