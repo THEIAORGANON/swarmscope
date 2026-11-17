@@ -90,7 +90,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -721,3 +721,41 @@ def test_rate_limited_session_is_invalid_and_stops_the_batch(task, monkeypatch, 
     assert lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "3", "--seed", "1"]) == 1
     out = capsys.readouterr().out
     assert "stopping the batch: api_error" in out and out.count("session running") == 2      # one attempt per call
+
+
+# --- A0: Sonnet without the advisor -------------------------------------------------------------------------
+
+def test_a0_runs_without_the_advisor_flag_and_records_null(task, monkeypatch):
+    modes, _ = lab.load_modes()
+    assert lab.advisor_for(modes, "A") == "claude-opus-5-5" and lab.advisor_for(modes, "A0") is None
+    assert "--advisor" in lab.claude_cmd(modes, "s.json", "A")
+    assert "--advisor" not in lab.claude_cmd(modes, "s.json", "A0")
+    monkeypatch.setenv("FAKE_VOLUNTARY_ADVISOR", "1")     # would call it if it could: without --advisor it cannot
+    r = lab.attempt(task, "A0")
+    assert r["valid"] is True, r["integrity"]
+    assert r["config"]["advisor"] is None and "--advisor" not in r["config"]["argv"]
+    assert r["advisor"]["called"] == 0 and r["models_seen"] == ["claude-sonnet-5-5"]
+
+
+def test_a0_run_that_still_reaches_the_advisor_is_invalid(task, monkeypatch):
+    """If something (a profile advisorModel, a Claude Code default) gives the agent an advisor anyway, the A0 run
+    is not an A0 run."""
+    monkeypatch.setenv("FAKE_VOLUNTARY_ADVISOR", "1")
+    monkeypatch.setenv("FAKE_PROFILE_ADVISOR", "claude-opus-5-5")
+    r = lab.attempt(task, "A0")
+    assert r["valid"] is False
+    assert any("unexpected model ran: claude-opus-5-5" in p for p in r["integrity"])
+    assert any("advisor called 1 time(s) in a mode without an advisor" in p for p in r["integrity"])
+
+
+def test_a_with_a_voluntary_advisor_call_stays_valid(task, monkeypatch):
+    monkeypatch.setenv("FAKE_VOLUNTARY_ADVISOR", "1")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is True, r["integrity"]
+    assert r["advisor"]["called"] == 1 and r["advisor"]["voluntary"] == 1 and r["config"]["advisor"] == "claude-opus-5-5"
+
+
+def test_a0_and_a_are_different_experiments_for_calib():
+    a, a0 = _rj("x"), _rj("y")
+    a0["config"]["advisor"] = None
+    assert lab.experiment_key(a) != lab.experiment_key(a0)

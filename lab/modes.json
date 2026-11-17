@@ -1,5 +1,5 @@
 {
-  "version": "m-4",
+  "version": "m-5",
   "common": {
     "model": "claude-sonnet-5-5",
     "advisor": "claude-opus-5-5",
@@ -37,6 +37,11 @@
     "B": {
       "policy_mode": "enforce",
       "about": "Rules Engine b-5 enforces R1/R2/R3 via the Stop hook; Jev records"
+    },
+    "A0": {
+      "policy_mode": "observe",
+      "advisor": null,
+      "about": "Sonnet without the advisor (no --advisor; any advisor call or Opus use makes the run invalid); rules and Jev only record. Diagnostic: effect of the advisor being available, compared with A"
     }
   }
 }

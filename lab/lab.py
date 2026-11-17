@@ -429,10 +429,17 @@ def build_policy(modes, mode):
     return pol
 
 
-def claude_cmd(modes, settings):
+def advisor_for(modes, mode=None):
+    """The advisor model of a mode: common.advisor unless the mode sets "advisor" itself; null = no advisor (A0)."""
+    m = modes["modes"].get(mode, {}) if mode else {}
+    return m["advisor"] if "advisor" in m else modes["common"]["advisor"]
+
+
+def claude_cmd(modes, settings, mode=None):
     c = modes["common"]
+    adv = advisor_for(modes, mode)
     cmd = [claude_bin(), "-p", "--output-format", "stream-json", "--verbose", "--model", c["model"],
-           "--advisor", c["advisor"], "--effort", c["effort"], "--settings", str(settings),
+           *(["--advisor", adv] if adv else []), "--effort", c["effort"], "--settings", str(settings),
            "--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
            "--permission-mode", c["permission_mode"]]
     return cmd + list(c.get("extra_args", []))
@@ -860,10 +867,12 @@ def code_versions():
             "files_sha256": files, "bundle_sha256": sha256(json.dumps(files, sort_keys=True))}
 
 
-def check_models(result, costs_res, modes):
-    """Every model that actually ran (Claude Code's modelUsage + the transcript) must be one we asked for."""
+def check_models(result, costs_res, modes, mode=None):
+    """Every model that actually ran (Claude Code's modelUsage + the transcript) must be one we asked for.
+    In a mode without an advisor (A0) the advisor model is not allowed at all."""
     c = modes["common"]
-    allowed = {c["model"], c["advisor"]} | set(c.get("subagent_models", []))
+    adv = advisor_for(modes, mode)
+    allowed = {c["model"]} | ({adv} if adv else set()) | set(c.get("subagent_models", []))
     seen = set((result or {}).get("modelUsage") or {})
     if costs_res:
         for b in [costs_res["lead"], costs_res["advisor"]] + list(costs_res["subs"].values()):
@@ -872,8 +881,10 @@ def check_models(result, costs_res, modes):
     problems = [f"unexpected model ran: {m}" for m in sorted(seen - allowed)]
     if costs_res and costs_res["lead"].get("model") not in (None, c["model"]):
         problems.append(f"lead model {costs_res['lead'].get('model')} != {c['model']}")
-    if costs_res and costs_res["advisor"].get("model") not in (None, c["advisor"]):
-        problems.append(f"advisor model {costs_res['advisor'].get('model')} != {c['advisor']}")
+    if costs_res and costs_res["advisor"].get("model") not in (None, adv):
+        problems.append(f"advisor model {costs_res['advisor'].get('model')} != {adv}")
+    if costs_res and not adv and (costs_res["advisor"].get("usd") or costs_res["advisor"].get("model")):
+        problems.append("advisor used in a mode without an advisor")
     return sorted(seen), problems
 
 
@@ -923,13 +934,13 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         kf.write_text(key)
         os.chmod(kf, 0o600)
     env, dropped = agent_env(cfg, modes)
-    cmd = claude_cmd(modes, settings)
+    cmd = claude_cmd(modes, settings, mode)
     ver = sh([claude_bin(), "--version"], env=env)
     rj["versions"] = {"claude_code": (ver["out"] or ver["err"]).strip(), "claude_bin": claude_bin(),
                       "python": sys.version.split()[0], "python_exe": sys.executable, "swarmscope": code_versions(),
                       "modes_file_sha256": modes_sha, "modes_version": modes.get("version")}
     rj["config_fingerprint"] = config_fingerprint(cfg)
-    rj["config"] = {"model": modes["common"]["model"], "advisor": modes["common"]["advisor"],
+    rj["config"] = {"model": modes["common"]["model"], "advisor": advisor_for(modes, mode),
                     "effort_requested": modes["common"]["effort"], "permission_mode": modes["common"]["permission_mode"],
                     "policy": pol, "policy_sha256": file_sha(policy_file), "settings_sha256": file_sha(settings),
                     "argv": cmd, "env_passed": sorted(env), "env_dropped": dropped,
@@ -1055,7 +1066,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
     if rj["observation"]["transcript_ok"]:
         sys.path.insert(0, str(REPO))
         import costs
-        c = costs.session_costs(tp, advisor_model=modes["common"]["advisor"])
+        c = costs.session_costs(tp, advisor_model=advisor_for(modes, mode))
         rj["costs"] = {"claude_code_total_usd": (result or {}).get("total_cost_usd"),
                        "by_model": {"lead": {k: c["lead"].get(k) for k in ("model", "usd", "in", "out", "cr", "cw5", "cw1h")},
                                     "advisor": {k: c["advisor"].get(k) for k in ("model", "usd", "source", "in", "out", "cr")},
@@ -1065,11 +1076,12 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
         cc = rj["costs"]["claude_code_total_usd"]
         if cc is not None and abs(cc - c["total_usd"]) > 0.01:
             problems.append(f"cost mismatch: claude code {cc:.4f} vs costs.py {c['total_usd']:.4f}")
-        rj["models_seen"], p = check_models(result, c, modes)
+        rj["models_seen"], p = check_models(result, c, modes, mode)
         problems += p
         named = advisor_models_in_transcript(tp)
-        if named and named != [modes["common"]["advisor"]]:
-            problems.append(f"advisor_message models in transcript {named} != {modes['common']['advisor']}")
+        adv = advisor_for(modes, mode)
+        if named and named != [adv]:
+            problems.append(f"advisor_message models in transcript {named} != {adv}")
         blocks = blocks_from_log(drecs, stop_times)
         calls, per_block = attribute(advisor_calls(tp), blocks)
         consult_blocks = [b for b in per_block if b["requests_consult"]]
@@ -1084,6 +1096,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
                          "advisor_models_named": named, "blocks": per_block, "calls": calls}
         if calls and not named:
             problems.append("advisor called but no advisor_message.model in the transcript")
+        if calls and not adv:
+            problems.append(f"advisor called {len(calls)} time(s) in a mode without an advisor")
     save()
 
     # result: snapshot of the working copy, then each test suite on its own copy of the snapshot

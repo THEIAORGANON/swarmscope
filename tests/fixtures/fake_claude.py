@@ -2,6 +2,7 @@
 """Fake Claude Code for runner tests: real hooks, scripted agent, init fields from lab/modes.json.
 FAKE_SKILLS=<json>  report skills in init      FAKE_NO_STOP=1  never call the Stop hook
 FAKE_SLEEP=<s>      sleep before finishing      FAKE_MODEL=<id> report another lead model
+FAKE_VOLUNTARY_ADVISOR=1  call the advisor unasked   FAKE_PROFILE_ADVISOR=<id>  advisor without --advisor
 FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never reached (as on 17.11),
                     mid: the API fails after work began, warn: the session still finishes normally"""
 import json
@@ -25,7 +26,8 @@ if "--help" in a:
 prompt = sys.stdin.read()
 settings = json.load(open(a[a.index("--settings") + 1]))
 model = os.environ.get("FAKE_MODEL") or a[a.index("--model") + 1]
-advisor = a[a.index("--advisor") + 1]
+# no --advisor (mode A0): an advisor only if the profile slipped one in (FAKE_PROFILE_ADVISOR)
+advisor = a[a.index("--advisor") + 1] if "--advisor" in a else os.environ.get("FAKE_PROFILE_ADVISOR")
 cwd = os.getcwd()
 sid = str(uuid.uuid4())
 cfg = Path(os.environ["CLAUDE_CONFIG_DIR"])
@@ -128,6 +130,14 @@ tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1", "model": mo
                                                          "usage": {"input_tokens": 1000, "output_tokens": 100}}})
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 cost = 0.002 + 0.001
+if os.environ.get("FAKE_VOLUNTARY_ADVISOR") and advisor:    # the agent consults the advisor on its own
+    tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1a", "model": model, "content": [
+        {"type": "server_tool_use", "id": "srv9", "name": "advisor", "input": {}},
+        {"type": "advisor_tool_result", "tool_use_id": "srv9", "content": {"type": "advisor_redacted_result"}}],
+        "usage": {"input_tokens": 1000, "output_tokens": 100, "iterations": [
+            {"type": "message", "input_tokens": 1000, "output_tokens": 100},
+            {"type": "advisor_message", "model": advisor, "input_tokens": 10000, "output_tokens": 500}]}}})
+    cost += 0.003 + 0.04 + 0.01
 if not os.environ.get("FAKE_NO_STOP"):
     r = hook("Stop", stop_hook_active=False)
     if r and r.get("decision") == "block":
@@ -143,4 +153,4 @@ if not os.environ.get("FAKE_NO_STOP"):
         hook("Stop", stop_hook_active=True)
 out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "total_cost_usd": cost,
      "duration_ms": 1234, "num_turns": 3,
-     "permission_denials": [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {}}] if os.environ.get("FAKE_DENY") else [], "modelUsage": {model: {}, **({advisor: {}} if cost > 0.01 else {})}})
+     "permission_denials": [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {}}] if os.environ.get("FAKE_DENY") else [], "modelUsage": {model: {}, **({advisor: {}} if cost > 0.01 and advisor else {})}})
