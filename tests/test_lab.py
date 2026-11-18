@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 from pathlib import Path
 import json
+import time
 import os
 import subprocess
 import sys
@@ -92,7 +93,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -1020,6 +1021,27 @@ def test_quadruple_batch_gives_pairs_for_any_two_of_its_modes(task, monkeypatch,
     assert all(x["BJ"]["opus_usd"] and not x["B12"]["opus_usd"] for x in t["pairs"])
 
 
+def test_pairs_pilot_reports_only_its_tagged_batches_and_refuses_an_empty_selection(task, tmp_path, capsys):
+    # review of f03edc5: with an empty "batches" list, pairs --pilot reported over every batch
+    decl = tmp_path / "p.json"
+    decl.write_text(json.dumps({"pilot": "b-jev-1", "batches": []}))
+    assert lab.main(["pairs", "--pilot", str(decl), "--modes", "A,B"]) == 2      # nothing tagged yet
+    assert "refusing" in capsys.readouterr().out
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "1",
+                     "--paired"]) == 0                                              # not the pilot's
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "2",
+                     "--paired", "--pilot", "b-jev-1"]) == 0
+    tagged = [m for m in lab.load_manifests().values() if m.get("pilot") == "b-jev-1"]
+    assert len(tagged) == 1 and tagged[0]["seed"] == 2
+    capsys.readouterr()
+    assert lab.main(["pairs", "--pilot", str(decl), "--modes", "A,B", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {x["batch"] for row in out["rows"].values() for x in row["pairs"]} == {tagged[0]["batch_id"]}
+    with pytest.raises(SystemExit):                                                # a typo in the name
+        lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "1", "--seed", "3",
+                  "--pilot", "b-jev-l"])
+
+
 def test_pair_report_counts_only_valid_pairs_and_every_valid_run_cost():
     def rj(mode, rep_, usd, valid=True, success=True, batch="p1"):
         return {"run_id": f"{mode}{rep_}{batch}", "task_id": "pk-x", "mode": mode, "valid": valid, "success": success,
@@ -1246,6 +1268,56 @@ def test_bj_falls_back_to_the_rule_when_jev_is_unreachable(task, monkeypatch):
     assert gate and gate[0]["status"] in ("error", "timeout")
     assert any("jev answers not ok" in p for p in r["integrity"])     # a Jev failure is still reported
     assert r["decisions"]["r3_gate"]["fallback"] == 1 and r["decisions"]["r3_gate"]["yes"] == 0
+
+
+@pytest.fixture
+def jev_trickle(monkeypatch):
+    """A Jev endpoint that accepts the request and then sends its answer one byte a second: no socket operation
+    ever waits 10 s, so urllib's per-operation timeout never fires; only a deadline for the whole request does."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            try:
+                for _ in range(120):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(1)
+            except OSError:
+                pass
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("SWARMSCOPE_JEV_TEST_ENDPOINT", f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone")
+    yield
+    srv.shutdown()
+
+
+def test_bj_hanging_jev_times_out_inside_the_stop_budget_and_r3_blocks(task, monkeypatch, jev_trickle, tmp_path):
+    # review of f03edc5: the Stop hook had 10 s, as much as Jev may take; a hanging Jev got the hook killed before
+    # the fallback was written, and the Stop went through unblocked
+    kills = tmp_path / "hook_kills"
+    monkeypatch.setenv("FAKE_HOOK_KILLS", str(kills))
+    jev_s = lab.build_policy(lab.load_modes()[0], "BJ")["jev"]["timeout_s"]
+    t0 = time.time()
+    r = lab.attempt(task, "BJ")
+    settings = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    assert settings["hooks"]["Stop"][0]["hooks"][0]["timeout"] >= jev_s + 20
+    assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == 10
+    assert not kills.exists()                                         # the hook finished every time
+    gate = [x for x in _jev_recs(r) if x.get("kind") == "jev" and x.get("gating")]
+    assert gate and gate[0]["status"] == "timeout" and gate[0]["latency_ms"] < (jev_s + 2) * 1000
+    assert r["decisions"]["blocks"] == 1                              # r3_gate_on_error "enforce": the block happened
+    assert r["decisions"]["by_rule"]["R3_high_risk"].get("requested") == 1
+    assert r["decisions"]["r3_gate"]["fallback"] == 1
+    assert any("jev answers not ok" in p for p in r["integrity"])     # and the run is not counted as valid
+    assert time.time() - t0 < 120
 
 
 def test_b12_never_blocks_on_r3(task):

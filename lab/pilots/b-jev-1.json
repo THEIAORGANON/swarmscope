@@ -15,7 +15,8 @@
     "timeout_s": 10,
     "on_error": "R3 stands (r3_gate_on_error enforce); every Jev failure is reported and makes the run invalid",
     "asked": "synchronously, only at a Stop where R3 would block; at other Stops in shadow mode as before (one Jev context per Stop)",
-    "in_cost_and_time": "the session wall time includes the wait for Jev; Jev's own cost (jev_usd_est, about $0.0001 per run in b-cost-1) is reported beside the Claude Code cost, not added to it"
+    "in_cost_and_time": "the session wall time includes the wait for Jev; Jev's own cost (jev_usd_est, about $0.0001 per run in b-cost-1) is reported beside the Claude Code cost, not added to it",
+    "deadline": "timeout_s bounds the whole request (gated R3 call and shadow worker alike), not each socket operation; the Stop hook gets timeout_s + 30 s for snapshot, journals and the fallback block"
   },
   "primary_metric": "mean paired difference of claude_code_total_usd for BJ - B and BJ - B12, per task and per cell; every valid run counts, failed or not",
   "secondary": [
@@ -57,7 +58,7 @@
   "repeats": 2,
   "size": "7 tasks x 4 modes x 2 = 56 runs; about 4.5 h and $20-30 at b-cost-1 rates",
   "caveat": "R3 depends on Sonnet's own change, not on the task: a cell is what A showed, not a guarantee; the report gives R3 Stops per run",
-  "report": "python lab/lab.py pairs --pilot lab/pilots/b-jev-1.json --modes B,BJ (and BJ,B12; A,BJ)",
+  "report": "python lab/lab.py pairs --pilot lab/pilots/b-jev-1.json --modes B,BJ; --modes B12,BJ; --modes A,BJ (pairs reports the second mode minus the first)",
   "seeds": {
     "pkf-relations": 301,
     "calendar": 302,
@@ -76,5 +77,11 @@
     "orders",
     "pk-meta"
   ],
-  "batches": []
+  "batches": [],
+  "batch_tag": "batches are started with batch --pilot b-jev-1 (recorded in each manifest); pairs --pilot lab/pilots/b-jev-1.json reports exactly those",
+  "contrasts": [
+    "B,BJ (BJ-B)",
+    "B12,BJ (BJ-B12)",
+    "A,BJ (BJ-A)"
+  ]
 }

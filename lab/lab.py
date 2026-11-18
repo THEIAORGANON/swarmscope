@@ -388,6 +388,22 @@ def deny_paths(task, lab, extra=()):
     return sorted(paths)
 
 
+HOOK_TIMEOUT_S = 10
+# Stop: the repo snapshot, the rules, a synchronous Jev call (r3_gate "jev", up to its timeout_s), the journals and
+# the block must all fit; Claude Code kills a hook past its timeout and the Stop then goes through unblocked
+STOP_HOOK_BUDGET_S = 30
+
+
+def hook_timeout(event, modes=None):
+    if event != "Stop":
+        return HOOK_TIMEOUT_S
+    # the same budget in every mode (the infrastructure does not differ between modes): the longest Jev timeout
+    # of any mode's policy, plus the rest of the Stop's work
+    jev_s = max((float((build_policy(modes, m).get("jev") or {}).get("timeout_s") or 0)
+                 for m in ((modes or {}).get("modes") or {})), default=0)
+    return int(jev_s + STOP_HOOK_BUDGET_S)
+
+
 def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=None):
     env = [f"SWARMSCOPE_DIR={shlex.quote(str(sw))}", f"SWARMSCOPE_POLICY_FILE={shlex.quote(str(policy_file))}"]
     if summary:
@@ -398,7 +414,7 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
     cmd = " ".join(env + [shlex.quote(sys.executable), shlex.quote(str(REPO / "hook.py"))])
     hooks = {}
     for ev in HOOK_EVENTS:
-        h = {"hooks": [{"type": "command", "command": cmd, "timeout": 10}]}
+        h = {"hooks": [{"type": "command", "command": cmd, "timeout": hook_timeout(ev, modes)}]}
         if ev in WITH_MATCHER:
             h["matcher"] = "*"
         hooks[ev] = [h]
@@ -1553,8 +1569,15 @@ def load_runs(revalidated=False):
 
 def cmd_pairs(a):
     pilot = json.loads(Path(a.pilot).read_text()) if a.pilot else None
-    batches = set(a.batch or []) | set((pilot or {}).get("batches") or [])
     manifests = load_manifests()
+    batches = set(a.batch or []) | set((pilot or {}).get("batches") or [])
+    if pilot:
+        # the pilot's batches: those listed in its declaration and those started with batch --pilot <its name>
+        batches |= {b for b, m in manifests.items() if m.get("pilot") == pilot.get("pilot")}
+        if not batches:
+            print(f"pairs: no batch belongs to pilot {pilot.get('pilot')!r} (none listed, none tagged); "
+                  "refusing to report over every batch")
+            return 2
     modes = tuple(m.strip() for m in a.modes.split(","))
     rep = replacements_from(manifests, pilot)
     report = pair_report(load_runs(a.revalidated), modes, batches or None, manifests, rep)
@@ -1970,6 +1993,10 @@ def cmd_run(a):
 
 
 def cmd_batch(a):
+    if getattr(a, "pilot", None):
+        decl = REPO / "lab" / "pilots" / f"{a.pilot}.json"
+        if not decl.exists() or json.loads(decl.read_text()).get("pilot") != a.pilot:
+            raise SystemExit(f"--pilot {a.pilot}: no declaration lab/pilots/{a.pilot}.json with that name")
     task = load_task(a.task)
     modes_cfg, modes_sha = load_modes()
     modes = [m.strip() for m in a.modes.split(",") if m.strip()]
@@ -1997,6 +2024,7 @@ def cmd_batch(a):
     if replaces and not getattr(a, "paired", False):
         raise SystemExit("--replaces needs --paired")
     manifest = {"batch_id": batch_id, "seed": a.seed, "paired": bool(getattr(a, "paired", False)), "task": task["task_id"], "order": order,
+                **({"pilot": a.pilot} if getattr(a, "pilot", None) else {}),
                 "replaces": replaces,
                 "expect": expect,
                 "runs": [], "valid": True}
@@ -2104,6 +2132,7 @@ def main(argv=None):
     b.add_argument("--repeats", type=int, default=1)
     b.add_argument("--seed", type=int, required=True)
     b.add_argument("--paired", action="store_true", help="each repeat runs every mode once, in a random order")
+    b.add_argument("--pilot", help="pilot name recorded in the batch manifest (pairs --pilot reports these batches)")
     b.add_argument("--replaces", help="BATCH_ID:REPEAT[,...]: this batch's repeats 1, 2, ... stand in for these slots")
     pr = sub.add_parser("pairs")
     pr.add_argument("--modes", default="A,B")
