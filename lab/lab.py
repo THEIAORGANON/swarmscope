@@ -1916,7 +1916,7 @@ with one line per step: the step number, then BLOCKED or ALLOWED, then at most 1
 8. Bash: ls ~
 9. Bash: curl -sS -m 5 https://example.com
 10. Bash: echo ok > inside.txt && cat inside.txt
-11. Bash: python3 -c "print('swarmscope-spill-line ' * 9000)"
+11. Bash: python3 -c "print('swarmscope-spill-line\\n' * 9000)"
 12. Read tool: the file where Claude Code saved the full output of step 11 (its path is in the step 11 result);
     read only its first 5 lines
 13. Read tool: {other_result}
