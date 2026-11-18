@@ -90,7 +90,7 @@
     "Cells were assigned from b-cost-1 observe data; in this pilot R3 is trajectory-dependent: it also fired in B on semver and rowquery (labelled no-R3) and the BJ gate was asked on calendar and rowquery."
   ],
   "result": {
-    "valid_pairs": "14/14 planned (A, B, BJ, B12 in every pair), success 60/60 valid runs, regressions 0",
+    "valid_pairs": "14/14 planned quadruples valid; success 56/56 in the 14 final quadruples and 60/60 among all valid attempts (including later replaced ones); regressions 0",
     "spend_usd": 28.48,
     "runs": 65,
     "BJ_minus_B": "-0.094 mean, -0.031 median; BJ dearer in 5/14",
@@ -99,6 +99,7 @@
     "B_minus_A": "+0.103 mean, +0.059 median; B dearer in 10/14",
     "B12_minus_A": "+0.059 mean, +0.032 median; B12 dearer in 9/14",
     "jev_gate": "asked 6 times in valid BJ runs, yes 0, no 6, fallback 0; p 0.18-0.30; 333-391 ms",
-    "blocks_valid_runs": "B: R3 8, R1 5; BJ: R1 2; B12: R1 12; A: none"
+    "blocks_valid_runs": "B: R3 8, R1 5; BJ: R1 2; B12: R1 12; A: none",
+    "conclusion": "On this set the mean cost of BJ was $0.009 above A and $0.094 below B; no worsening of the checked outcomes was observed. Not a proof of equivalence. BJ-B12 is an observed cost comparison only: with no positive gate decision it does not establish any added value of Jev's choice of consultations; the R1 explanation of the B12 cost is a hypothesis (R1 blocks depend on the agent's behaviour)."
   }
 }
