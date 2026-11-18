@@ -558,6 +558,41 @@ def web_tool_uses(transcript):
     return hits
 
 
+def transcript_retries(transcript):
+    """Requests Claude Code retried mid-session (system api_error records with a retry attempt, e.g. the Mac
+    went to sleep: StreamSuspended). The usage of the aborted attempt is billed but need not reach the transcript."""
+    recs, _ = jl(transcript)
+    out = []
+    for r in recs or []:
+        if r.get("type") == "system" and r.get("subtype") == "api_error" and r.get("retryAttempt") is not None:
+            err = r.get("error") or {}
+            out.append({"ts": r.get("timestamp"), "attempt": r.get("retryAttempt"), "source": r.get("source"),
+                        "code": (err.get("connection") or {}).get("code") or err.get("message")})
+    return out
+
+
+def classify_cost_gap(result, c, retries, tol=0.01):
+    """Claude Code's total against the transcript reconstruction. Returns (status, details):
+    ok | retry_unrecorded (Claude Code is internally consistent, it counts more than the transcript only on models
+    that ran, never less on any model, and the session had retried requests: the reconstruction is incomplete, the
+    run stays valid; Claude Code's sum is the primary metric) | mismatch (the run is invalid)."""
+    cc = (result or {}).get("total_cost_usd")
+    if cc is None or abs(cc - c["total_usd"]) <= tol:
+        return "ok", None
+    mu = (result or {}).get("modelUsage") or {}
+    per_cc = {m: (u or {}).get("costUSD") for m, u in mu.items()}
+    per_tr = {}
+    for b in [c["lead"], c["advisor"]] + list(c["subs"].values()):
+        if b.get("model"):
+            per_tr[b["model"]] = per_tr.get(b["model"], 0.0) + (b.get("usd") or 0.0)
+    gaps = {m: round((per_cc.get(m) or 0.0) - per_tr.get(m, 0.0), 7) for m in set(per_cc) | set(per_tr)}
+    details = {"claude_code_usd": cc, "transcript_usd": c["total_usd"], "gap_by_model": gaps, "retries": len(retries)}
+    consistent = all(v is not None for v in per_cc.values()) and abs(sum(per_cc.values()) - cc) <= tol
+    if retries and consistent and cc > c["total_usd"] and all(g >= -tol for g in gaps.values()):
+        return "retry_unrecorded", details
+    return "mismatch", details
+
+
 def advisor_calls(transcript):
     """Every advisor call in the transcript, its result matched by tool_use_id: returned | failed | no_result."""
     calls, results = {}, {}
@@ -1159,7 +1194,13 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
                        "computed_total_usd": c["total_usd"], "estimated": c["estimated"], "notes": c["notes"],
                        "prices_as_of": c.get("prices_as_of"), "jev_usd_est": (rj.get("jev") or {}).get("cost_usd_est")}
         cc = rj["costs"]["claude_code_total_usd"]
-        if cc is not None and abs(cc - c["total_usd"]) > 0.01:
+        retries = transcript_retries(tp)
+        rj["observation"]["api_retries"] = retries
+        gap, details = classify_cost_gap(result, c, retries)
+        rj["costs"]["reconstruction"] = {"ok": "complete", "retry_unrecorded": "incomplete"}.get(gap, "mismatch")
+        if details:
+            rj["costs"]["reconstruction_gap"] = details
+        if gap == "mismatch":
             problems.append(f"cost mismatch: claude code {cc:.4f} vs costs.py {c['total_usd']:.4f}")
         rj["models_seen"], p = check_models(result, c, modes, mode)
         problems += p
@@ -1183,7 +1224,13 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False):
                          "voluntary": sum(1 for x in calls if x["voluntary"]),
                          "unattributed_no_ts": sum(1 for x in calls if x["attribution"] == "no_timestamp"),
                          "advisor_models_named": named, "blocks": per_block, "calls": calls}
-        if calls and not named:
+        # the model name is checked on what came back or was paid for; a request that never returned anything and
+        # cost nothing (no advisor usage anywhere) is telemetry (advisor.no_result), not a broken session (18.11)
+        paid = bool((result or {}).get("modelUsage", {}).get(adv)) if adv else False
+        paid = paid or c["advisor"].get("source") == "iterations"   # an "estimate" is our guess, not a bill
+        answered = any(x["status"] in ("returned", "failed") for x in calls)
+        rj["advisor"]["unanswered_unpaid"] = bool(calls) and not answered and not paid
+        if (answered or paid) and not named:
             problems.append("advisor called but no advisor_message.model in the transcript")
         if calls and not adv:
             problems.append(f"advisor called {len(calls)} time(s) in a mode without an advisor")
@@ -1300,21 +1347,77 @@ def calibration(run_jsons, mode="A", batch=None):
     return out
 
 
-def pair_report(run_jsons, modes=("A", "B"), batches=None):
-    """Paired comparison of two modes: within a paired batch, repeat r of mode A and of mode B form a pair. Only
-    pairs with both runs valid count; every valid run's cost counts, failed or not. Per task: the pairs, the mean
-    B - A cost, successes, regressions, session time, B's cost split (Sonnet / Opus), Jev's advice at the first Stop
-    and the extra Stops an intervention created."""
+def _setup_parts(rj):
+    """Everything experiment_key holds except the task itself: modes, policy, models, effort, Claude Code."""
+    cfg, ver = rj.get("config") or {}, rj.get("versions") or {}
+    return [ver.get("modes_file_sha256"), cfg.get("policy_sha256"), cfg.get("model"), cfg.get("advisor"),
+            cfg.get("effort_requested"), ver.get("claude_code")]
+
+
+def comparison_key(a, b):
+    """A pair's version: both runs' experiment keys. Rows of the pairs report are task@comparison_key, and the
+    overall total is per setup (the same key without the task), so different versions are never averaged."""
+    return hashlib.sha256(json.dumps([experiment_key(a), experiment_key(b)]).encode()).hexdigest()[:8]
+
+
+def setup_key(a, b):
+    return hashlib.sha256(json.dumps([_setup_parts(a), _setup_parts(b)]).encode()).hexdigest()[:8]
+
+
+def run_cost(rj):
+    """What a run cost, whatever became of it: Claude Code's total, else the transcript reconstruction."""
+    c = rj.get("costs") or {}
+    v = c.get("claude_code_total_usd")
+    if v is None:
+        v = ((rj.get("result") or {}).get("total_cost_usd"))
+    if v is None:
+        v = c.get("computed_total_usd")
+    return v or 0.0
+
+
+def with_revalidation(rj, overlay):
+    """A run as a corrected report sees it: run.json stays as it was, revalidated.json (written by `revalidate`)
+    replaces only integrity and valid, and the run is marked so the report can say which pairs rely on it."""
+    if not overlay:
+        return rj
+    out = dict(rj)
+    out["integrity"], out["valid"] = overlay["integrity"], overlay["valid"]
+    out["revalidated"] = {"by": overlay.get("runner_version"), "cleared": overlay.get("cleared")}
+    return out
+
+
+def pair_report(run_jsons, modes=("A", "B"), batches=None, manifests=None, replacements=None):
+    """Paired comparison of two modes. Within a paired batch, repeat r of mode A and of mode B form a pair; only pairs
+    with both runs valid count; every valid run's cost counts, failed or not.
+
+    Rows are task@comparison_key: pairs of different task, test, modes, policy, model or Claude Code versions are
+    never pooled. Per row: the pairs, the mean B - A cost, successes, regressions, time, B's Sonnet / Opus split,
+    Jev's advice at the first Stop and the extra Stops an intervention created.
+
+    With the batch manifests (`manifests`, {batch_id: manifest}) every planned pair is accounted for:
+    valid | invalid | incomplete (a half missing or unfinished) | replaced (superseded by a declared replacement);
+    `replacements` maps (batch_id, repeat) of a replacement pair to the (batch_id, repeat) it stands in for.
+    `spend` is what the batches really cost: every run they started, interrupted, invalid and unpaired included."""
     ma, mb = modes
-    runs = {}
+    replacements = replacements or {}
+    in_scope = lambda b: not batches or b in batches
+    runs, spend = {}, {}
     for rj in run_jsons:
         plan = rj.get("plan") or {}
-        if not plan.get("paired") or rj.get("mode") not in modes or (batches and plan.get("batch_id") not in batches):
+        if not plan.get("paired") or rj.get("mode") not in modes or not in_scope(plan.get("batch_id")):
             continue
+        sp = spend.setdefault(rj.get("task_id"), {"usd": 0.0, "runs": 0, "outside_pairs_usd": 0.0})
+        sp["usd"] += run_cost(rj)
+        sp["runs"] += 1
         if not (rj.get("finished_at") and rj.get("verdict")):
+            sp["outside_pairs_usd"] += run_cost(rj)
             continue
         key = (rj.get("task_id"), plan.get("batch_id"), plan.get("repeat"), rj.get("mode"))
-        if key not in runs or (rj.get("valid") and not runs[key].get("valid")):   # a retry replaces an invalid run
+        if key in runs:                                # a retried slot: the valid one is used, the other is spend
+            keep, drop = (rj, runs[key]) if rj.get("valid") and not runs[key].get("valid") else (runs[key], rj)
+            sp["outside_pairs_usd"] += run_cost(drop)
+            runs[key] = keep
+        else:
             runs[key] = rj
 
     def view(rj):
@@ -1328,61 +1431,216 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None):
                 "regressions": len(h.get("regressions") or []), "session_s": (rj.get("session") or {}).get("wall_s"),
                 "first_stop_would_consult": answers[0].get("would_consult") if answers else None,
                 "extra_stops": max(stops - 1, 0), "blocks": (rj.get("decisions") or {}).get("blocks"),
-                "advisor_called": (rj.get("advisor") or {}).get("called")}
-    out = {}
+                "advisor_called": (rj.get("advisor") or {}).get("called"),
+                "revalidated": bool(rj.get("revalidated"))}
+
+    superseded = set(replacements.values())
+    out, status = {}, {}                              # status[(task, batch, repeat)] = valid | invalid | ...
     for (task, batch, rep_, mode), rj in runs.items():
         if mode != ma or (task, batch, rep_, mb) not in runs:
             continue
-        a, b = view(rj), view(runs[(task, batch, rep_, mb)])
-        t = out.setdefault(task, {"pairs": [], "invalid_pairs": 0})
+        rb = runs[(task, batch, rep_, mb)]
+        if (batch, rep_) in superseded:
+            status[(task, batch, rep_)] = "replaced"
+            sp = spend[task]
+            sp["outside_pairs_usd"] += run_cost(rj) + run_cost(rb)
+            continue
+        a, b = view(rj), view(rb)
+        row = f"{task}@{comparison_key(rj, rb)}"
+        t = out.setdefault(row, {"task_id": task, "setup": setup_key(rj, rb), "pairs": [], "invalid_pairs": 0,
+                                 "invalid": []})
         if not (a["valid"] and b["valid"]) or a["usd"] is None or b["usd"] is None:
             t["invalid_pairs"] += 1
+            t["invalid"].append({"batch": batch, "repeat": rep_, ma: {"run_id": a["run_id"], "integrity": rj.get("integrity")},
+                                 mb: {"run_id": b["run_id"], "integrity": rb.get("integrity")}})
+            spend[task]["outside_pairs_usd"] += (a["usd"] or 0) + (b["usd"] or 0)
+            status[(task, batch, rep_)] = "invalid"
             continue
-        t["pairs"].append({"batch": batch, "repeat": rep_, ma: a, mb: b, "diff_usd": b["usd"] - a["usd"]})
+        status[(task, batch, rep_)] = "valid"
+        x = {"batch": batch, "repeat": rep_, ma: a, mb: b, "diff_usd": b["usd"] - a["usd"]}
+        if (batch, rep_) in replacements:
+            x["replaces"] = list(replacements[(batch, rep_)])
+        t["pairs"].append(x)
     for t in out.values():
         p = t["pairs"]
         t["mean_diff_usd"] = sum(x["diff_usd"] for x in p) / len(p) if p else None
+        t["revalidated_pairs"] = sum(1 for x in p if x[ma]["revalidated"] or x[mb]["revalidated"])
         for m in modes:
             t[f"{m}_success"] = sum(x[m]["success"] for x in p)
             t[f"{m}_usd_total"] = sum(x[m]["usd"] for x in p)
+    # a run that finished but whose partner never did is outside every pair
+    for (task, batch, rep_, mode), rj in runs.items():
+        other = mb if mode == ma else ma
+        if (task, batch, rep_, other) not in runs:
+            spend[task]["outside_pairs_usd"] += run_cost(rj)
+
+    accounting = {}
+    for bid, m in sorted((manifests or {}).items()):
+        if not m.get("paired") or not in_scope(bid):
+            continue
+        acc = accounting.setdefault(m["task"], {"planned": 0, "valid": 0, "invalid": 0, "incomplete": 0,
+                                                "replaced": 0, "replacements": {}, "slots": []})
+        for rep_ in sorted({r for mode, r in m.get("order") or [] if mode in modes}):
+            st = status.get((m["task"], bid, rep_), "incomplete")
+            if (bid, rep_) in superseded:
+                st = "replaced"
+            if (bid, rep_) in replacements:      # a replacement slot is not planned: it stands in for a replaced one
+                acc["replacements"][st] = acc["replacements"].get(st, 0) + 1
+            else:
+                acc["planned"] += 1
+                acc[st] += 1
+            acc["slots"].append({"batch": bid, "repeat": rep_, "status": st,
+                                 **({"replaces": list(replacements[(bid, rep_)])} if (bid, rep_) in replacements else {})})
+    return {"rows": out, "accounting": accounting, "spend": spend}
+
+
+def load_manifests():
+    out = {}
+    for p in sorted((lab_root() / "batches").glob("*.json")):
+        try:
+            m = json.loads(p.read_text())
+            out[m["batch_id"]] = m
+        except Exception as e:
+            print(f"{p.name}: unreadable manifest ({e})")
     return out
 
 
-def cmd_pairs(a):
+def replacements_from(manifests, pilot=None):
+    """(batch, repeat) of a replacement pair -> (batch, repeat) it stands in for: from a batch run with --replaces
+    and from a pilot declaration's "replacements" (for batches run before --replaces existed)."""
+    rep = {}
+    for bid, m in manifests.items():
+        for i, target in enumerate(m.get("replaces") or []):
+            rep[(bid, i + 1)] = (target["batch_id"], target["repeat"])
+    for r in (pilot or {}).get("replacements") or []:
+        rep[(r["batch_id"], r["repeat"])] = (r["replaces"]["batch_id"], r["replaces"]["repeat"])
+    return rep
+
+
+def load_runs(revalidated=False):
     runs = []
     for p in sorted((lab_root() / "runs").glob("*/run.json"), key=lambda p: p.stat().st_mtime):
         try:
-            runs.append(json.loads(p.read_text()))
+            rj = json.loads(p.read_text())
         except Exception as e:
             print(f"{p.parent.name}: unreadable ({e})")
+            continue
+        ov = p.parent / "revalidated.json"
+        if revalidated and ov.exists():
+            rj = with_revalidation(rj, json.loads(ov.read_text()))
+        runs.append(rj)
+    return runs
+
+
+def cmd_pairs(a):
+    pilot = json.loads(Path(a.pilot).read_text()) if a.pilot else None
+    batches = set(a.batch or []) | set((pilot or {}).get("batches") or [])
+    manifests = load_manifests()
     modes = tuple(m.strip() for m in a.modes.split(","))
-    table = pair_report(runs, modes, set(a.batch) if a.batch else None)
+    rep = replacements_from(manifests, pilot)
+    report = pair_report(load_runs(a.revalidated), modes, batches or None, manifests, rep)
     if a.json:
-        print(json.dumps(table, indent=2))
+        print(json.dumps({"rows": report["rows"], "accounting": report["accounting"], "spend": report["spend"],
+                          "replacements": [[list(k), list(v)] for k, v in rep.items()],
+                          "revalidated": bool(a.revalidated)}, indent=2))
         return 0
     ma, mb = modes
-    total = {ma: 0.0, mb: 0.0, "pairs": 0}
-    for task, t in sorted(table.items()):
+    totals = {}
+    if a.revalidated:
+        print("corrected report: revalidated.json applied where present (run.json records unchanged)")
+    for row, t in sorted(report["rows"].items()):
         n = len(t["pairs"])
+        tot = totals.setdefault(t["setup"], {ma: 0.0, mb: 0.0, "pairs": 0, "tasks": set()})
         if n:
-            total[ma] += t[f"{ma}_usd_total"]
-            total[mb] += t[f"{mb}_usd_total"]
-            total["pairs"] += n
+            tot[ma] += t[f"{ma}_usd_total"]
+            tot[mb] += t[f"{mb}_usd_total"]
+            tot["pairs"] += n
+            tot["tasks"].add(t["task_id"])
         md = f"{t['mean_diff_usd']:+.3f}" if t["mean_diff_usd"] is not None else "-"
-        print(f"{task:<14} pairs {n}  mean {mb}-{ma} ${md}  success {ma} {t[f'{ma}_success']}/{n} {mb} {t[f'{mb}_success']}/{n}"
-              + (f"  (+{t['invalid_pairs']} invalid)" if t["invalid_pairs"] else ""))
+        print(f"{row:<23} pairs {n}  mean {mb}-{ma} ${md}  success {ma} {t[f'{ma}_success']}/{n} {mb} {t[f'{mb}_success']}/{n}"
+              + (f"  (+{t['invalid_pairs']} invalid)" if t["invalid_pairs"] else "")
+              + (f"  ({t['revalidated_pairs']} revalidated)" if t["revalidated_pairs"] else ""))
         for x in t["pairs"]:
             A, B = x[ma], x[mb]
-            print(f"    #{x['repeat']} {ma} ${A['usd']:.3f} {A['session_s']:.0f}s regr {A['regressions']}  |  "
+            print(f"    {x['batch']}#{x['repeat']} {ma} ${A['usd']:.3f} {A['session_s']:.0f}s regr {A['regressions']}  |  "
                   f"{mb} ${B['usd']:.3f} (sonnet ${B['sonnet_usd'] or 0:.3f}, opus ${B['opus_usd'] or 0:.3f}) "
                   f"{B['session_s']:.0f}s regr {B['regressions']} blocks {B['blocks']} extra stops {B['extra_stops']}  |  "
-                  f"jev@1st stop {ma} {A['first_stop_would_consult']} {mb} {B['first_stop_would_consult']}")
-    if total["pairs"]:
-        print(f"total over {total['pairs']} pairs: {ma} ${total[ma]:.2f}  {mb} ${total[mb]:.2f}  "
-              f"mean {mb}-{ma} ${(total[mb] - total[ma]) / total['pairs']:+.3f}")
-    else:
+                  f"jev@1st stop {ma} {A['first_stop_would_consult']} {mb} {B['first_stop_would_consult']}"
+                  + (f"  replaces {x['replaces'][0]}#{x['replaces'][1]}" if x.get("replaces") else ""))
+    if len(totals) > 1:
+        print(f"note: {len(totals)} different setups; totals are given per setup and never pooled")
+    for sk, tot in sorted(totals.items()):
+        if tot["pairs"]:
+            print(f"total [setup {sk}] over {tot['pairs']} pairs, {len(tot['tasks'])} tasks: {ma} ${tot[ma]:.2f}  "
+                  f"{mb} ${tot[mb]:.2f}  mean {mb}-{ma} ${(tot[mb] - tot[ma]) / tot['pairs']:+.3f}")
+    if not any(t["pairs"] for t in report["rows"].values()):
         print("no valid pairs")
+    if report["accounting"]:
+        print("pairs by plan:")
+        for task, acc in sorted(report["accounting"].items()):
+            rp = ", ".join(f"{v} {k}" for k, v in sorted(acc["replacements"].items()))
+            print(f"  {task:<14} planned {acc['planned']}: valid {acc['valid']}, invalid {acc['invalid']}, "
+                  f"incomplete {acc['incomplete']}, replaced {acc['replaced']}" + (f"; replacements: {rp}" if rp else ""))
+    sp = report["spend"]
+    if sp:
+        allu = sum(v["usd"] for v in sp.values())
+        out_ = sum(v["outside_pairs_usd"] for v in sp.values())
+        print(f"spent: ${allu:.2f} over {sum(v['runs'] for v in sp.values())} runs, of it ${out_:.2f} outside the "
+              f"valid pairs (interrupted, invalid, unpaired, replaced)")
     return 0
+
+
+def revalidate(rj, result, transcript, modes):
+    """Re-apply today's cost and advisor checks to a stored run: only the two classifications changed on 18.11
+    (a request retried after the Mac slept; an advisor request that never returned and was never paid). Returns
+    the overlay {integrity, valid, cleared} or None when nothing changes. run.json itself is never rewritten."""
+    sys.path.insert(0, str(REPO))
+    import costs
+    mode = rj.get("mode")
+    c = costs.session_costs(transcript, advisor_model=advisor_for(modes, mode))
+    cleared, keep = [], []
+    for msg in rj.get("integrity") or []:
+        if msg.startswith("cost mismatch:"):
+            gap, details = classify_cost_gap(result, c, transcript_retries(transcript))
+            if gap == "retry_unrecorded":
+                cleared.append({"was": msg, "now": "cost reconstruction incomplete (retried request)", "details": details})
+                continue
+        if msg == "advisor called but no advisor_message.model in the transcript":
+            adv = advisor_for(modes, mode)
+            calls = advisor_calls(transcript)
+            paid = bool(((result or {}).get("modelUsage") or {}).get(adv)) or c["advisor"].get("source") == "iterations"
+            if calls and not paid and not any(x["status"] in ("returned", "failed") for x in calls):
+                cleared.append({"was": msg, "now": "advisor request without result, unpaid (telemetry)"})
+                continue
+        keep.append(msg)
+    if not cleared:
+        return None
+    valid = not keep and rj.get("session_status") not in (None, "not_started", "running")
+    return {"runner_version": RUNNER_VERSION, "run_id": rj.get("run_id"), "integrity": keep, "valid": valid,
+            "cleared": cleared, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+
+
+def cmd_revalidate(a):
+    modes, _ = load_modes()
+    rc = 0
+    for rid in a.runs:
+        d = lab_root() / "runs" / rid
+        rj = json.loads((d / "run.json").read_text())
+        recs, _ = jl(d / "stream.jsonl")
+        result = next((r for r in reversed(recs or []) if r.get("type") == "result"), None)
+        tp = (rj.get("observation") or {}).get("transcript")
+        if not tp or not Path(tp).exists():
+            print(f"{rid}: transcript not found ({tp})")
+            rc = 1
+            continue
+        ov = revalidate(rj, result, tp, modes)
+        if not ov:
+            print(f"{rid}: nothing to revalidate ({'; '.join(rj.get('integrity') or []) or 'no problems'})")
+            continue
+        (d / "revalidated.json").write_text(json.dumps(ov, indent=2, ensure_ascii=False))
+        print(f"{rid}: {'VALID' if ov['valid'] else 'still INVALID'} after revalidation; cleared: "
+              + "; ".join(x["now"] for x in ov["cleared"]) + (f"; remaining: {'; '.join(ov['integrity'])}" if ov["integrity"] else ""))
+    return rc
 
 
 def cmd_calib(a):
@@ -1709,7 +1967,18 @@ def cmd_batch(a):
         rng.shuffle(order)
     batch_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]   # unique when batches run side by side
     expect = batch_expect(task, modes_sha)
+    replaces = []
+    for spec in filter(None, (getattr(a, "replaces", None) or "").split(",")):
+        bid, _, rep_ = spec.strip().rpartition(":")
+        if not bid or not rep_.isdigit():
+            raise SystemExit(f"--replaces: expected BATCH_ID:REPEAT, got {spec!r}")
+        replaces.append({"batch_id": bid, "repeat": int(rep_)})
+    if len(replaces) > a.repeats:
+        raise SystemExit(f"--replaces names {len(replaces)} slots for {a.repeats} repeat(s)")
+    if replaces and not getattr(a, "paired", False):
+        raise SystemExit("--replaces needs --paired")
     manifest = {"batch_id": batch_id, "seed": a.seed, "paired": bool(getattr(a, "paired", False)), "task": task["task_id"], "order": order,
+                "replaces": replaces,
                 "expect": expect,
                 "runs": [], "valid": True}
     mpath = lab_root() / "batches" / f"{batch_id}.json"
@@ -1816,10 +2085,15 @@ def main(argv=None):
     b.add_argument("--repeats", type=int, default=1)
     b.add_argument("--seed", type=int, required=True)
     b.add_argument("--paired", action="store_true", help="each repeat runs every mode once, in a random order")
+    b.add_argument("--replaces", help="BATCH_ID:REPEAT[,...]: this batch's repeats 1, 2, ... stand in for these slots")
     pr = sub.add_parser("pairs")
     pr.add_argument("--modes", default="A,B")
     pr.add_argument("--batch", action="append", help="only these batch ids (repeatable)")
     pr.add_argument("--json", action="store_true")
+    pr.add_argument("--pilot", help="pilot declaration: its batches and declared replacements")
+    pr.add_argument("--revalidated", action="store_true", help="corrected report: apply revalidated.json overlays")
+    rv = sub.add_parser("revalidate")
+    rv.add_argument("runs", nargs="+", help="run ids")
     sc = sub.add_parser("screen")
     sc.add_argument("--tasks", required=True, help="comma-separated task ids or manifest paths")
     sc.add_argument("--modes", default="A")
@@ -1832,7 +2106,7 @@ def main(argv=None):
     c.add_argument("--json", action="store_true")
     c.add_argument("--batch", help="only this batch id")
     a = ap.parse_args(argv)
-    return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch,
+    return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch, "revalidate": cmd_revalidate,
             "calib": cmd_calib, "pairs": cmd_pairs, "screen": cmd_screen, "summary": cmd_summary}[a.cmd](a) or 0
 
 

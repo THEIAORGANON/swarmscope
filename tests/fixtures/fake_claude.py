@@ -3,6 +3,9 @@
 FAKE_SKILLS=<json>  report skills in init      FAKE_NO_STOP=1  never call the Stop hook
 FAKE_SLEEP=<s>      sleep before finishing      FAKE_MODEL=<id> report another lead model
 FAKE_WEB=main|sub   a WebFetch/WebSearch call   FAKE_VOLUNTARY_ADVISOR=1  call the advisor unasked   FAKE_PROFILE_ADVISOR=<id>  advisor without --advisor
+FAKE_SUSPEND=1|noretry  Claude Code bills $0.05 more than the transcript holds; 1: after a retried request
+                    (the Mac slept: StreamSuspended, as on 18.11), noretry: with no retry in the transcript
+FAKE_ADVISOR_NO_RESULT=1|paid  an advisor request that never returns; paid: Claude Code still bills the advisor
 FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never reached (as on 17.11),
                     mid: the API fails after work began, warn: the session still finishes normally"""
 import json
@@ -139,6 +142,7 @@ tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1", "model": mo
                                                          "usage": {"input_tokens": 1000, "output_tokens": 100}}})
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 cost = 0.002 + 0.001
+adv_cost = 0.0                                   # the advisor's share of cost
 if os.environ.get("FAKE_WEB"):                   # main: the session calls WebFetch; sub: a subagent calls WebSearch
     web = {"type": "assistant", "timestamp": iso(), "message": {"id": "mw", "model": model, "content": [
         {"type": "tool_use", "id": "tw", "name": "WebFetch" if os.environ["FAKE_WEB"] == "main" else "WebSearch",
@@ -158,6 +162,18 @@ if os.environ.get("FAKE_VOLUNTARY_ADVISOR") and advisor:    # the agent consults
             {"type": "message", "input_tokens": 1000, "output_tokens": 100},
             {"type": "advisor_message", "model": advisor, "input_tokens": 10000, "output_tokens": 500}]}}})
     cost += 0.003 + 0.04 + 0.01
+    adv_cost += 0.05
+if os.environ.get("FAKE_ADVISOR_NO_RESULT") and advisor:    # 18.11, run 3206e00905: request, no result, no usage
+    tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1n", "model": model, "content": [
+        {"type": "server_tool_use", "id": "srv8", "name": "advisor", "input": {}}],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "iterations": [
+            {"type": "message", "input_tokens": 10, "output_tokens": 5}]}}})
+SUSPEND = os.environ.get("FAKE_SUSPEND")
+if SUSPEND == "1":                               # 18.11, run 3ef45c38c8: the record Claude Code 2.1.326 writes
+    tr({"type": "system", "subtype": "api_error", "level": "error", "error": {"message": "Connection error.",
+        "formatted": "Connection lost while your computer was asleep", "connection": {"code": "StreamSuspended",
+        "message": "Stream watchdog detected system suspend; aborting to retry on a fresh connection"}},
+        "retryInMs": 605, "retryAttempt": 1, "maxRetries": 10, "source": "connection_retry", "timestamp": iso()})
 if not os.environ.get("FAKE_NO_STOP"):
     r = hook("Stop", stop_hook_active=False)
     if r and r.get("decision") == "block":
@@ -170,7 +186,15 @@ if not os.environ.get("FAKE_NO_STOP"):
                 {"type": "message", "input_tokens": 1000, "output_tokens": 100},
                 {"type": "advisor_message", "model": advisor, "input_tokens": 10000, "output_tokens": 500}]}}})
         cost += 0.003 + 0.04 + 0.01
+        adv_cost += 0.05
         hook("Stop", stop_hook_active=True)
+usage = {model: {}, **({advisor: {}} if cost > 0.01 and advisor else {})}
+if SUSPEND:                                      # the aborted attempt's usage is billed to the lead model only
+    cost += 0.05
+    usage = {model: {"costUSD": cost - adv_cost}, **({advisor: {"costUSD": adv_cost}} if adv_cost else {})}
+if os.environ.get("FAKE_ADVISOR_NO_RESULT") == "paid":
+    usage[advisor] = {"costUSD": 0.02}
+    cost += 0.02
 out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "total_cost_usd": cost,
      "duration_ms": 1234, "num_turns": 3,
-     "permission_denials": [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {}}] if os.environ.get("FAKE_DENY") else [], "modelUsage": {model: {}, **({advisor: {}} if cost > 0.01 and advisor else {})}})
+     "permission_denials": [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {}}] if os.environ.get("FAKE_DENY") else [], "modelUsage": usage})

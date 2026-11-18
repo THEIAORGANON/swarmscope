@@ -37,7 +37,7 @@ def jev_stub(monkeypatch):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             seen.append({"auth": self.headers.get("Authorization"), "body": body})
-            out = json.dumps({"model": body["model"], "answers": {"consult_advisor": {"type": "noul", "noul": 0.3}},
+            out = json.dumps({"model": body["model"], "answers": {"consult_advisor": {"type": "noul", "noul": float(os.environ.get("JEV_STUB_P", "0.3"))}},
                               "usage": {"input_tokens": 600, "output_tokens": 20}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -92,7 +92,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -980,6 +980,12 @@ def test_mode_can_set_its_own_effort(task):
 
 # --- pilot: cost of B against A, in pairs ----------------------------------------------------------------------
 
+def only_row(report, task_id):
+    rows = [t for t in report["rows"].values() if t["task_id"] == task_id]
+    assert len(rows) == 1, list(report["rows"])
+    return rows[0]
+
+
 def test_paired_batch_orders_each_pair_on_its_own(task):
     assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "3", "--seed", "7",
                      "--paired"]) == 0
@@ -989,7 +995,7 @@ def test_paired_batch_orders_each_pair_on_its_own(task):
     assert all(sorted(x[0] for x in p) == ["A", "B"] and p[0][1] == p[1][1] for p in pairs)
     assert [p[0][1] for p in pairs] == [1, 2, 3]
     report = lab.pair_report([json.loads(f.read_text()) for f in (lab.lab_root() / "runs").glob("*/run.json")])
-    t = report[task["task_id"]]
+    t = only_row(report, task["task_id"])
     assert len(t["pairs"]) == 3 and t["invalid_pairs"] == 0
     # the fake agent consults the advisor only when B blocks a Stop: B costs more in every pair
     assert all(x["diff_usd"] > 0 for x in t["pairs"]) and t["mean_diff_usd"] > 0
@@ -1006,7 +1012,7 @@ def test_pair_report_counts_only_valid_pairs_and_every_valid_run_cost():
                 "jev": {"answers": [{"would_consult": mode == "B"}]}}
     runs = [rj("A", 1, 0.10), rj("B", 1, 0.30), rj("A", 2, 0.20, success=False), rj("B", 2, 0.25),
             rj("A", 3, 0.10), rj("B", 3, 0.50, valid=False), rj("A", 4, 0.1, batch="other")]
-    t = lab.pair_report(runs)["pk-x"]
+    t = only_row(lab.pair_report(runs), "pk-x")
     assert len(t["pairs"]) == 2 and t["invalid_pairs"] == 1
     assert round(t["mean_diff_usd"], 3) == round(((0.30 - 0.10) + (0.25 - 0.20)) / 2, 3)
     assert (t["A_success"], t["B_success"]) == (1, 2)
@@ -1026,7 +1032,7 @@ def test_transient_api_failure_is_retried_once_and_the_batch_goes_on(task, monke
     runs = [json.loads(f.read_text()) for f in (lab.lab_root() / "runs").glob("*/run.json")]
     retry = [r for r in runs if (r.get("plan") or {}).get("retry_of")]
     assert len(retry) == 1 and retry[0]["valid"] is True
-    t = lab.pair_report(runs)[task["task_id"]]
+    t = only_row(lab.pair_report(runs), task["task_id"])
     assert len(t["pairs"]) == 1 and t["invalid_pairs"] == 0
 
 
@@ -1035,3 +1041,143 @@ def test_rate_limited_interruption_still_stops_the_batch(task, monkeypatch, caps
     assert lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "2", "--seed", "1"]) == 1
     out = capsys.readouterr().out
     assert "retrying" not in out and "stopping the batch: api_interrupted" in out
+
+
+# --- review of PR #6: versions in the pairs report, planned pairs, real spend; two misclassified runs ------------
+
+def _prj(mode, rep_, usd, batch="p1", task="pk-x", task_sha="t1", modes_sha="m1", valid=True, finished=True):
+    return {"run_id": f"{mode}{rep_}{batch}{task_sha}", "task_id": task, "mode": mode, "valid": valid, "success": True,
+            "plan": {"paired": True, "batch_id": batch, "repeat": rep_},
+            **({"finished_at": "x", "verdict": {"task_passed": True}} if finished else {}),
+            "task": {"sha256": task_sha, "hidden_tests_sha256": "h"},
+            "versions": {"modes_file_sha256": modes_sha, "claude_code": "2.1.326"},
+            "config": {"policy_sha256": mode, "model": "s", "advisor": "o", "effort_requested": "high"},
+            "costs": {"claude_code_total_usd": usd, "by_model": {"lead": {"usd": usd}}},
+            "session": {"wall_s": 60}, "tests": {"hidden": {"regressions": []}}, "decisions": {"stops": 1, "blocks": 0}}
+
+
+def test_pairs_of_different_experiment_versions_are_never_pooled(capsys):
+    """P1: pairs of one task with a different task sha or modes sha are separate rows, and totals are per setup."""
+    runs = [_prj("A", 1, 0.1), _prj("B", 1, 0.3),
+            _prj("A", 1, 0.1, batch="p2", task_sha="t2"), _prj("B", 1, 0.9, batch="p2", task_sha="t2"),
+            _prj("A", 1, 0.1, batch="p3", modes_sha="m2"), _prj("B", 1, 0.2, batch="p3", modes_sha="m2")]
+    rows = lab.pair_report(runs)["rows"]
+    assert len(rows) == 3 and all(len(t["pairs"]) == 1 for t in rows.values())
+    assert sorted(round(t["mean_diff_usd"], 2) for t in rows.values()) == [0.1, 0.2, 0.8]
+    assert len({t["setup"] for t in rows.values()}) == 2       # the task sha alone does not change the setup
+    # the same pair twice in one row: same versions pool
+    runs += [_prj("A", 2, 0.1), _prj("B", 2, 0.5)]
+    row = [t for t in lab.pair_report(runs)["rows"].values() if len(t["pairs"]) == 2]
+    assert len(row) == 1 and round(row[0]["mean_diff_usd"], 2) == 0.3
+
+
+def test_pairs_account_for_every_planned_pair_and_the_real_spend():
+    """P2: a pair with a half missing or unfinished is reported, a declared replacement is linked to its slot, and
+    spend counts interrupted, invalid, unpaired and replaced runs."""
+    manifests = {"p1": {"batch_id": "p1", "task": "pk-x", "paired": True,
+                        "order": [["A", 1], ["B", 1], ["B", 2], ["A", 2], ["A", 3], ["B", 3], ["B", 4], ["A", 4]]},
+                 "p9": {"batch_id": "p9", "task": "pk-x", "paired": True, "order": [["B", 1], ["A", 1]]}}
+    runs = [_prj("A", 1, 0.1), _prj("B", 1, 0.3),                       # valid
+            _prj("B", 2, 0.4, valid=False), _prj("A", 2, 0.2),          # invalid
+            _prj("A", 3, 0.25),                                          # B#3 never ran: incomplete
+            _prj("B", 3, 0.17, valid=False, finished=False),            # ... its interrupted attempt is spend
+            _prj("B", 4, 0.3), _prj("A", 4, 0.1),                       # superseded by p9#1
+            _prj("B", 1, 0.5, batch="p9"), _prj("A", 1, 0.2, batch="p9")]
+    rep = lab.replacements_from(manifests, {"replacements": [
+        {"batch_id": "p9", "repeat": 1, "replaces": {"batch_id": "p1", "repeat": 4}}]})
+    r = lab.pair_report(runs, manifests=manifests, replacements=rep)
+    acc = r["accounting"]["pk-x"]
+    assert (acc["planned"], acc["valid"], acc["invalid"], acc["incomplete"], acc["replaced"]) == (4, 1, 1, 1, 1)
+    assert acc["replacements"] == {"valid": 1}
+    row = only_row(r, "pk-x")
+    assert len(row["pairs"]) == 2 and row["invalid_pairs"] == 1
+    assert [x.get("replaces") for x in row["pairs"] if x["batch"] == "p9"] == [["p1", 4]]
+    sp = r["spend"]["pk-x"]
+    assert sp["runs"] == 10 and round(sp["usd"], 2) == 2.52
+    # outside the valid pairs: invalid pair 0.6, A#3 alone 0.25, interrupted B#3 0.17, replaced pair 0.4
+    assert round(sp["outside_pairs_usd"], 2) == 1.42
+
+
+def test_batch_replaces_declares_the_slot_it_stands_in_for(task):
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "3",
+                     "--paired", "--replaces", "20261118-023802-ee05:3"]) == 0
+    m = json.loads(next((lab.lab_root() / "batches").glob("*.json")).read_text())
+    assert m["replaces"] == [{"batch_id": "20261118-023802-ee05", "repeat": 3}]
+    assert lab.replacements_from({m["batch_id"]: m}) == {(m["batch_id"], 1): ("20261118-023802-ee05", 3)}
+    with pytest.raises(SystemExit):
+        lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "3",
+                  "--paired", "--replaces", "a:1,b:2"])
+
+
+def test_cost_gap_after_a_retried_request_is_an_incomplete_reconstruction(task):
+    """18.11, 3ef45c38c8: the Mac slept, Claude Code retried a request and billed more than the transcript holds.
+    Claude Code's sum is consistent and only exceeds the transcript: the run stays valid, marked incomplete."""
+    import os
+    os.environ["FAKE_SUSPEND"] = "1"
+    try:
+        r = lab.attempt(task, "A")
+    finally:
+        del os.environ["FAKE_SUSPEND"]
+    assert r["valid"] is True, r["integrity"]
+    assert r["costs"]["reconstruction"] == "incomplete"
+    assert r["observation"]["api_retries"][0]["code"] == "StreamSuspended"
+    assert r["costs"]["reconstruction_gap"]["gap_by_model"]["claude-sonnet-5-5"] > 0.04
+
+
+def test_cost_gap_without_a_retry_still_invalidates(task, monkeypatch):
+    monkeypatch.setenv("FAKE_SUSPEND", "noretry")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any(p.startswith("cost mismatch") for p in r["integrity"])
+    assert r["costs"]["reconstruction"] == "mismatch"
+
+
+def test_classify_cost_gap_rules():
+    c = {"total_usd": 0.776, "lead": {"model": "s", "usd": 0.472}, "advisor": {"model": "o", "usd": 0.304}, "subs": {}}
+    retry = [{"code": "StreamSuspended"}]
+    ok = {"total_cost_usd": 0.8266, "modelUsage": {"s": {"costUSD": 0.5226}, "o": {"costUSD": 0.304}}}
+    assert lab.classify_cost_gap(ok, c, retry)[0] == "retry_unrecorded"
+    assert lab.classify_cost_gap(ok, c, [])[0] == "mismatch"                       # no retry seen
+    less = {"total_cost_usd": 0.8266, "modelUsage": {"s": {"costUSD": 0.6026}, "o": {"costUSD": 0.224}}}
+    assert lab.classify_cost_gap(less, c, retry)[0] == "mismatch"                  # fewer advisor dollars
+    inconsistent = {"total_cost_usd": 0.9, "modelUsage": {"s": {"costUSD": 0.5226}, "o": {"costUSD": 0.304}}}
+    assert lab.classify_cost_gap(inconsistent, c, retry)[0] == "mismatch"
+    below = {"total_cost_usd": 0.70, "modelUsage": {"s": {"costUSD": 0.40}, "o": {"costUSD": 0.30}}}
+    assert lab.classify_cost_gap(below, c, retry)[0] == "mismatch"                 # less than the transcript
+    assert lab.classify_cost_gap({"total_cost_usd": 0.78}, c, [])[0] == "ok"
+
+
+def test_unanswered_unpaid_advisor_request_is_telemetry(task, monkeypatch):
+    """18.11, 3206e00905: a voluntary advisor request without a result and without any advisor usage."""
+    monkeypatch.setenv("FAKE_ADVISOR_NO_RESULT", "1")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is True, r["integrity"]
+    assert r["advisor"]["no_result"] == 1 and r["advisor"]["unanswered_unpaid"] is True
+
+
+def test_paid_advisor_without_a_model_name_still_invalidates(task, monkeypatch):
+    monkeypatch.setenv("FAKE_ADVISOR_NO_RESULT", "paid")
+    r = lab.attempt(task, "A")
+    assert "advisor called but no advisor_message.model in the transcript" in r["integrity"]
+
+
+def test_revalidate_writes_an_overlay_and_the_corrected_report_uses_it(task, monkeypatch, capsys):
+    """Old records stay as they were: revalidated.json beside run.json, and `pairs --revalidated` reads it."""
+    monkeypatch.setenv("FAKE_SUSPEND", "1")
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "5",
+                     "--paired"]) == 0
+    runs = {p.parent.name: p for p in (lab.lab_root() / "runs").glob("*/run.json")}
+    rid, path = next((k, p) for k, p in runs.items() if json.loads(p.read_text())["mode"] == "A")
+    rj = json.loads(path.read_text())                 # make it look like a record from before the fix
+    rj["valid"], rj["integrity"] = False, ["cost mismatch: claude code 0.0530 vs costs.py 0.0045"]
+    path.write_text(json.dumps(rj))
+    before = path.read_text()
+    capsys.readouterr()
+    assert lab.main(["pairs"]) == 0
+    assert "pairs 0" in capsys.readouterr().out
+    assert lab.main(["revalidate", rid]) == 0
+    assert "VALID after revalidation" in capsys.readouterr().out
+    assert path.read_text() == before and (path.parent / "revalidated.json").exists()
+    assert lab.main(["pairs", "--revalidated"]) == 0
+    out = capsys.readouterr().out
+    assert "corrected report" in out and "pairs 1" in out and "(1 revalidated)" in out
+

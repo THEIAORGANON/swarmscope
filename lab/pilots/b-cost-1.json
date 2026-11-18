@@ -3,16 +3,69 @@
   "declared": "2026-11-18, before any run of this series",
   "question": "What does policy B (Rules Engine b-5 enforcing R1/R2/R3 via the Stop hook) cost against A (observe only) on tasks A solves reliably, at the same effort?",
   "primary_metric": "mean paired difference B - A of claude_code_total_usd per task; every valid run counts, failed or not",
-  "secondary": ["success and regressions per mode", "session wall time", "B's cost split: Sonnet / Opus", "Jev advice (would_consult) at the first Stop of every run; Stops after a B block counted apart", "blocks and extra Stops in B"],
-  "modes": ["A", "B"],
+  "secondary": [
+    "success and regressions per mode",
+    "session wall time",
+    "B's cost split: Sonnet / Opus",
+    "Jev advice (would_consult) at the first Stop of every run; Stops after a B block counted apart",
+    "blocks and extra Stops in B"
+  ],
+  "modes": [
+    "A",
+    "B"
+  ],
   "effort": "high (both modes; modes.json m-6)",
-  "jev": {"question_version": "q-consult-2", "threshold": 0.5, "model": "jev-1.14.0 (as seen in run.json of the screening runs)"},
+  "jev": {
+    "question_version": "q-consult-2",
+    "threshold": 0.5,
+    "model": "jev-1.14.0 (as seen in run.json of the screening runs)"
+  },
   "design": "6 tasks x 3 pairs; inside each pair the order of A and B is random (batch --paired); one task after another, sequentially, on one machine; no parallel sessions",
   "tasks": {
-    "consult_seen_in_observe": {"pkf-prepared": "R3 triggered (A, 17-18.11)", "pkf-extras": "R1 + R3 triggered", "ckf-spec": "R1 + R3 triggered"},
-    "no_consult_seen": {"pk-range": "R1 triggered only", "ck-envvar": "R1 triggered only", "pk-specset": "no rule triggered"}
+    "consult_seen_in_observe": {
+      "pkf-prepared": "R3 triggered (A, 17-18.11)",
+      "pkf-extras": "R1 + R3 triggered",
+      "ckf-spec": "R1 + R3 triggered"
+    },
+    "no_consult_seen": {
+      "pk-range": "R1 triggered only",
+      "ck-envvar": "R1 triggered only",
+      "pk-specset": "no rule triggered"
+    }
   },
   "caveat": "the consult group is all features and the other group all bug fixes (in observe, R3 never triggered on a bug fix): group and task type are confounded",
-  "seeds": {"pkf-prepared": 101, "pkf-extras": 102, "ckf-spec": 103, "pk-range": 104, "ck-envvar": 105, "pk-specset": 106},
-  "report": "python lab/lab.py pairs --modes A,B (optionally --batch for each of the six batches)"
+  "seeds": {
+    "pkf-prepared": 101,
+    "pkf-extras": 102,
+    "ckf-spec": 103,
+    "pk-range": 104,
+    "ck-envvar": 105,
+    "pk-specset": 106
+  },
+  "report": "python lab/lab.py pairs --pilot lab/pilots/b-cost-1.json (original) / ... --revalidated (corrected, revision 2)",
+  "batches": [
+    "20261118-023802-ee05",
+    "20261118-072233-854a",
+    "20261118-073538-cbac",
+    "20261118-081908-c79c",
+    "20261118-083938-bd98",
+    "20261118-092653-b472",
+    "20261118-093353-625c"
+  ],
+  "replacements": [
+    {
+      "batch_id": "20261118-072233-854a",
+      "repeat": 1,
+      "replaces": {
+        "batch_id": "20261118-023802-ee05",
+        "repeat": 3
+      },
+      "why": "B#3 of pkf-prepared stopped with api_interrupted at night (before the retry existed); its pair was run again as a batch of its own, seed 107"
+    }
+  ],
+  "deviations": [
+    "pkf-prepared pair 3: replacement batch 20261118-072233-854a (seed 107), see replacements",
+    "pk-range pair 1 invalid in the original report: B 3ef45c38c8 cost reconstruction short by $0.0506 after a request retried when the Mac slept (StreamSuspended); A 3206e00905 a voluntary advisor request without result and without Opus usage. Both reclassified by `revalidate` (revalidated.json beside run.json; run.json unchanged); the corrected report is `pairs --pilot lab/pilots/b-cost-1.json --revalidated`"
+  ],
+  "status": "done 2026-11-18; now the development set for the Jev-gated policy (review 18.11)"
 }
