@@ -1300,11 +1300,9 @@ def line(rj):
 
 
 def experiment_key(rj):
-    """What must be equal for attempts to be pooled: task, hidden tests, modes, policy, models, Claude Code."""
-    cfg, task, ver = rj.get("config") or {}, rj.get("task") or {}, rj.get("versions") or {}
-    parts = [task.get("sha256"), task.get("hidden_tests_sha256"), ver.get("modes_file_sha256"),
-             cfg.get("policy_sha256"), cfg.get("model"), cfg.get("advisor"), cfg.get("effort_requested"),
-             ver.get("claude_code")]
+    """What must be equal for attempts to be pooled: task, hidden tests and everything in _setup_parts."""
+    task = rj.get("task") or {}
+    parts = [task.get("sha256"), task.get("hidden_tests_sha256")] + _setup_parts(rj)
     return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:8]
 
 
@@ -1348,10 +1346,12 @@ def calibration(run_jsons, mode="A", batch=None):
 
 
 def _setup_parts(rj):
-    """Everything experiment_key holds except the task itself: modes, policy, models, effort, Claude Code."""
+    """Everything experiment_key holds except the task itself: modes, policy, models, effort, Claude Code, the
+    swarmscope code bundle (hook, rules, Jev client, runner) and the lab profile's config fingerprint."""
     cfg, ver = rj.get("config") or {}, rj.get("versions") or {}
     return [ver.get("modes_file_sha256"), cfg.get("policy_sha256"), cfg.get("model"), cfg.get("advisor"),
-            cfg.get("effort_requested"), ver.get("claude_code")]
+            cfg.get("effort_requested"), ver.get("claude_code"),
+            (ver.get("swarmscope") or {}).get("bundle_sha256"), rj.get("config_fingerprint")]
 
 
 def comparison_key(a, b):
