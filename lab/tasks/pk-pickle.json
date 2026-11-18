@@ -26,7 +26,7 @@
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-pickle/hidden",
     "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
-    "expected_tests": 64198,
+    "expected_tests": 64197,
     "bug_tests": [
       "tests/test_direct_url.py::test_pickle_from_older_version_loads[26.3]",
       "tests/test_direct_url.py::test_pickle_old_dict_state_loads[direct_url0]",
@@ -38,7 +38,8 @@
       "tests/test_pylock.py::test_pickle_from_older_version_loads[26.1]",
       "tests/test_pylock.py::test_pickle_from_older_version_loads[26.3]",
       "tests/test_pylock.py::test_pickle_old_dict_state_loads"
-    ]
+    ],
+    "expected_tests_note": "Mac (python.org 3.14.7): Linux 3.13 collects 64198; one more platform skip on the Mac, as for every historical task"
   },
   "difficulty": "unknown (historical upstream bug)",
   "notes": "packaging PR #1548; hidden = the fix's whole tests/ directory; bug tests failing on base: 10",

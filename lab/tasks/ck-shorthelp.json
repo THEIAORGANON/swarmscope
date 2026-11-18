@@ -27,7 +27,7 @@
   "hidden_tests": {
     "dir": "~/Downloads/swarmscope-lab/tasks-src/ck-shorthelp/hidden",
     "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, click; p = os.path.realpath(click.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
-    "expected_tests": 2064,
+    "expected_tests": 2063,
     "bug_tests": [
       "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[-abbreviation inside sentence]",
       "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[-abbreviation inside truncated sentence]",
@@ -35,7 +35,8 @@
       "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[no-wrap mark-abbreviation inside sentence]",
       "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[no-wrap mark-abbreviation inside truncated sentence]",
       "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[no-wrap mark-lowercase after dot]"
-    ]
+    ],
+    "expected_tests_note": "Mac (python.org 3.14.7): Linux 3.13 collects 2064; one more platform skip on the Mac, as for every historical task"
   },
   "difficulty": "unknown (historical upstream bug)",
   "notes": "click PR #3865; hidden = the fix's whole tests/ directory; bug tests failing on base: 6",
