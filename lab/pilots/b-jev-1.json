@@ -83,5 +83,22 @@
     "B,BJ (BJ-B)",
     "B12,BJ (BJ-B12)",
     "A,BJ (BJ-A)"
-  ]
+  ],
+  "deviations": [
+    "Five-hour subscription limit hit twice (16:41 and ~21:00): semver repeat 2, rowquery and pk-pickle (both repeats) and pkf-relations repeat 2 were rerun as replacement batches with --replaces (seeds 401-405 instead of the planned seed); the first pkf-relations replacement (20261118-193442-7c84, seed 401) also hit the limit and was replaced again (20261118-222035-c4d9, seed 405).",
+    "pkf-relations BJ repeat 2 of the original batch (run d985a62293) was invalid: the agent tried to Read a tool-result file that Claude Code itself spilled into the lab config dir, which the deny rules cover. Not changed mid-pilot (it would change the config fingerprint); the slot was replaced.",
+    "Cells were assigned from b-cost-1 observe data; in this pilot R3 is trajectory-dependent: it also fired in B on semver and rowquery (labelled no-R3) and the BJ gate was asked on calendar and rowquery."
+  ],
+  "result": {
+    "valid_pairs": "14/14 planned (A, B, BJ, B12 in every pair), success 60/60 valid runs, regressions 0",
+    "spend_usd": 28.48,
+    "runs": 65,
+    "BJ_minus_B": "-0.094 mean, -0.031 median; BJ dearer in 5/14",
+    "BJ_minus_B12": "-0.050 mean, -0.030 median; BJ dearer in 4/14",
+    "BJ_minus_A": "+0.009 mean, +0.002 median; BJ dearer in 7/14",
+    "B_minus_A": "+0.103 mean, +0.059 median; B dearer in 10/14",
+    "B12_minus_A": "+0.059 mean, +0.032 median; B12 dearer in 9/14",
+    "jev_gate": "asked 6 times in valid BJ runs, yes 0, no 6, fallback 0; p 0.18-0.30; 333-391 ms",
+    "blocks_valid_runs": "B: R3 8, R1 5; BJ: R1 2; B12: R1 12; A: none"
+  }
 }
