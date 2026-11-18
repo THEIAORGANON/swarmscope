@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 from pathlib import Path
 import json
+import time
 import os
 import subprocess
 import sys
@@ -17,6 +18,16 @@ sys.path.insert(0, os.path.join(ROOT, "lab"))
 import lab  # noqa: E402
 
 FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_claude.py")
+
+
+def fake_launcher(tmp_path):
+    """The fake claude, started through the test's own interpreter: the fixture's executable bit is not relied on
+    (a copy of the repo written with mode 0644 made 45 tests fail with PermissionError on the lab Mac, 18.11)."""
+    launcher = tmp_path / "bin" / "claude"
+    launcher.parent.mkdir(exist_ok=True)
+    launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    launcher.chmod(0o755)
+    return str(launcher)
 KEY = "apikey_LABTEST_never_in_the_agent_env"
 
 
@@ -89,10 +100,10 @@ def task(tmp_path, monkeypatch, jev_stub):
     p.write_text(json.dumps(t))
     monkeypatch.setenv("SWARMSCOPE_LAB", str(tmp_path / "home" / "lab"))
     monkeypatch.setenv("SWARMSCOPE_WORK_ROOT", str(tmp_path / "w"))
-    monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
+    monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -398,6 +409,10 @@ def test_suites_get_a_minimal_environment(tmp_path, monkeypatch):
 
 def test_unsandboxed_tests_are_an_integrity_problem(task, monkeypatch):
     monkeypatch.delenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS")
+    # no sandbox on this machine: on Linux there is none anyway; on the lab Mac sandbox-exec exists and has to be
+    # hidden, or the tests simply run sandboxed (the test failed there, 18.11)
+    real_which = lab.shutil.which
+    monkeypatch.setattr(lab.shutil, "which", lambda n, *a, **k: None if n == "sandbox-exec" else real_which(n, *a, **k))
     r = lab.attempt(task, "A")
     assert r["valid"] is False and any("tests not run: no sandbox available" in p for p in r["integrity"])
     assert r["tests"]["hidden"]["sandbox"] == "unavailable" and r["success"] is False
@@ -1002,6 +1017,45 @@ def test_paired_batch_orders_each_pair_on_its_own(task):
     assert all(x["B"]["opus_usd"] and not x["A"]["opus_usd"] for x in t["pairs"])
 
 
+def test_quadruple_batch_gives_pairs_for_any_two_of_its_modes(task, monkeypatch, jev_stub):
+    # pilot b-jev-1: A, B, BJ and B12 in each repeat, compared two at a time
+    monkeypatch.setenv("JEV_STUB_P", "0.8")
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B,BJ,B12", "--repeats", "2", "--seed", "3",
+                     "--paired"]) == 0
+    m = json.loads(next((lab.lab_root() / "batches").glob("*.json")).read_text())
+    quads = [m["order"][i:i + 4] for i in range(0, 8, 4)]
+    assert all(sorted(x[0] for x in q) == ["A", "B", "B12", "BJ"] and {x[1] for x in q} == {i + 1}
+               for i, q in enumerate(quads))
+    runs = [json.loads(f.read_text()) for f in (lab.lab_root() / "runs").glob("*/run.json")]
+    for modes in (("B", "BJ"), ("BJ", "B12"), ("A", "BJ")):
+        t = only_row(lab.pair_report(runs, modes=modes), task["task_id"])
+        assert len(t["pairs"]) == 2 and t["invalid_pairs"] == 0, modes
+    # Jev says yes: BJ consults like B, B12 never does
+    t = only_row(lab.pair_report(runs, modes=("BJ", "B12")), task["task_id"])
+    assert all(x["BJ"]["opus_usd"] and not x["B12"]["opus_usd"] for x in t["pairs"])
+
+
+def test_pairs_pilot_reports_only_its_tagged_batches_and_refuses_an_empty_selection(task, tmp_path, capsys):
+    # review of f03edc5: with an empty "batches" list, pairs --pilot reported over every batch
+    decl = tmp_path / "p.json"
+    decl.write_text(json.dumps({"pilot": "b-jev-1", "batches": []}))
+    assert lab.main(["pairs", "--pilot", str(decl), "--modes", "A,B"]) == 2      # nothing tagged yet
+    assert "refusing" in capsys.readouterr().out
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "1",
+                     "--paired"]) == 0                                              # not the pilot's
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "2",
+                     "--paired", "--pilot", "b-jev-1"]) == 0
+    tagged = [m for m in lab.load_manifests().values() if m.get("pilot") == "b-jev-1"]
+    assert len(tagged) == 1 and tagged[0]["seed"] == 2
+    capsys.readouterr()
+    assert lab.main(["pairs", "--pilot", str(decl), "--modes", "A,B", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {x["batch"] for row in out["rows"].values() for x in row["pairs"]} == {tagged[0]["batch_id"]}
+    with pytest.raises(SystemExit):                                                # a typo in the name
+        lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "1", "--seed", "3",
+                  "--pilot", "b-jev-l"])
+
+
 def test_pair_report_counts_only_valid_pairs_and_every_valid_run_cost():
     def rj(mode, rep_, usd, valid=True, success=True, batch="p1"):
         return {"run_id": f"{mode}{rep_}{batch}", "task_id": "pk-x", "mode": mode, "valid": valid, "success": success,
@@ -1197,3 +1251,108 @@ def test_revalidate_writes_an_overlay_and_the_corrected_report_uses_it(task, mon
     out = capsys.readouterr().out
     assert "corrected report" in out and "pairs 1" in out and "(1 revalidated)" in out
 
+
+# --- next pilot: B with R3 gated by Jev, and B without R3 ------------------------------------------------------
+
+def _jev_recs(r):
+    import jevshadow
+    sw = lab.lab_root() / "runs" / r["run_id"] / "sw" / "jev"
+    return [x for f in sw.glob("*.jsonl") for x in jevshadow.load(f)[0]]
+
+
+def test_bj_declines_r3_when_jev_says_no_and_blocks_when_it_says_yes(task, monkeypatch, jev_stub):
+    monkeypatch.setenv("JEV_STUB_P", "0.3")
+    r = lab.attempt(task, "BJ")
+    assert r["valid"] is True, r["integrity"]
+    assert r["config"]["policy"]["r3_gate"] == "jev"
+    assert r["decisions"]["by_rule"]["R3_high_risk"] == {"declined": 1} and r["decisions"]["blocks"] == 0
+    assert r["advisor"]["called"] == 0
+    recs = _jev_recs(r)
+    ctx = [x for x in recs if x.get("kind") == "context"]
+    assert len(ctx) == r["decisions"]["stops"] == 1 and ctx[0]["gating"] == "R3"      # one Jev call per Stop
+    assert [x["gating"] for x in recs if x.get("kind") == "jev"] == [True]
+    assert r["jev"]["answers"][0]["would_consult"] is False
+    # regression (first live BJ run, 18.11): the gate's decision reached the raw journals but not run.json
+    assert r["jev"]["answers"][0]["gating"] == "R3"
+    r3 = [d for d in r["decisions"]["decisions"] if d["rule"] == "R3_high_risk"]
+    assert r3[0]["jev_gate"]["decided_by"] == "jev" and r3[0]["jev_gate"]["would_consult"] is False
+    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 0, "no": 1, "fallback": 0, "p_consult": [0.3]}
+
+    monkeypatch.setenv("JEV_STUB_P", "0.8")
+    r = lab.attempt(task, "BJ")
+    assert r["valid"] is True, r["integrity"]
+    assert r["decisions"]["blocks"] == 1 and r["advisor"]["requested_answered"] == 1
+    assert r["decisions"]["by_rule"]["R3_high_risk"].get("requested") == 1
+    ctx = [x for x in _jev_recs(r) if x.get("kind") == "context"]
+    assert len(ctx) == r["decisions"]["stops"] == 2                  # the second Stop is asked in shadow mode
+    assert [c.get("gating") for c in sorted(ctx, key=lambda c: c["ts"])] == ["R3", None]
+    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 1, "no": 0, "fallback": 0, "p_consult": [0.8]}
+    assert [a.get("gating") for a in sorted(r["jev"]["answers"], key=lambda a: a["stop_ts"])] == ["R3", None]
+
+
+def test_bj_falls_back_to_the_rule_when_jev_is_unreachable(task, monkeypatch):
+    monkeypatch.setenv("SWARMSCOPE_JEV_TEST_ENDPOINT", "http://127.0.0.1:9/v1/systemone")   # nothing listens
+    r = lab.attempt(task, "BJ")
+    assert r["decisions"]["blocks"] == 1                              # r3_gate_on_error "enforce": R3 stands
+    gate = [x for x in _jev_recs(r) if x.get("kind") == "jev" and x.get("gating")]
+    assert gate and gate[0]["status"] in ("error", "timeout")
+    assert any("jev answers not ok" in p for p in r["integrity"])     # a Jev failure is still reported
+    assert r["decisions"]["r3_gate"]["fallback"] == 1 and r["decisions"]["r3_gate"]["yes"] == 0
+
+
+@pytest.fixture
+def jev_trickle(monkeypatch):
+    """A Jev endpoint that accepts the request and then sends its answer one byte a second: no socket operation
+    ever waits 10 s, so urllib's per-operation timeout never fires; only a deadline for the whole request does."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            try:
+                for _ in range(120):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(1)
+            except OSError:
+                pass
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("SWARMSCOPE_JEV_TEST_ENDPOINT", f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone")
+    yield
+    srv.shutdown()
+
+
+def test_bj_hanging_jev_times_out_inside_the_stop_budget_and_r3_blocks(task, monkeypatch, jev_trickle, tmp_path):
+    # review of f03edc5: the Stop hook had 10 s, as much as Jev may take; a hanging Jev got the hook killed before
+    # the fallback was written, and the Stop went through unblocked
+    kills = tmp_path / "hook_kills"
+    monkeypatch.setenv("FAKE_HOOK_KILLS", str(kills))
+    jev_s = lab.build_policy(lab.load_modes()[0], "BJ")["jev"]["timeout_s"]
+    t0 = time.time()
+    r = lab.attempt(task, "BJ")
+    settings = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    assert settings["hooks"]["Stop"][0]["hooks"][0]["timeout"] >= jev_s + 20
+    assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == 10
+    assert not kills.exists()                                         # the hook finished every time
+    gate = [x for x in _jev_recs(r) if x.get("kind") == "jev" and x.get("gating")]
+    assert gate and gate[0]["status"] == "timeout" and gate[0]["latency_ms"] < (jev_s + 2) * 1000
+    assert r["decisions"]["blocks"] == 1                              # r3_gate_on_error "enforce": the block happened
+    assert r["decisions"]["by_rule"]["R3_high_risk"].get("requested") == 1
+    assert r["decisions"]["r3_gate"]["fallback"] == 1
+    assert any("jev answers not ok" in p for p in r["integrity"])     # and the run is not counted as valid
+    assert time.time() - t0 < 120
+
+
+def test_b12_never_blocks_on_r3(task):
+    r = lab.attempt(task, "B12")
+    assert r["valid"] is True, r["integrity"]
+    assert r["decisions"]["by_rule"]["R3_high_risk"] == {"triggered": 1} and r["decisions"]["blocks"] == 0
+    assert r["config"]["policy"]["enforce_rules"] == ["R1_tests", "R2_repeat_error"]
+    assert r["decisions"]["r3_gate"] is None

@@ -1,0 +1,44 @@
+{
+  "task_id": "ck-shorthelp",
+  "manifest_version": 2,
+  "set": "pilot-2-large-bugs",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/ck-shorthelp",
+    "commit": "c06920c",
+    "commit_full": "c06920c3e3020e71f8dd10567dc7ecbceb26477f",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pallets/click",
+    "base_sha": "6d5bac5c712195cbfa9666ba0ecbf0573cdea356",
+    "fix_sha": "f67c2bb6c2f055c1c7a57cd46c3697fc26a7742e",
+    "pr": 3865,
+    "pr_created": "2026-09-11",
+    "first_public_note": "branch commit 2026-09-11; merged as PR #3865"
+  },
+  "prompt": "The short help Click derives from a command's help text (shown in the command list of a group's --help) stops at an abbreviation inside the first sentence:\n\n```python\n>>> from click.utils import _make_default_short_help\n>>> _make_default_short_help(\"Weigh apples vs. pears.\", 30)\n'Weigh apples vs.'                    # expected 'Weigh apples vs. pears.'\n```\n\nExpected behaviour of click.utils._make_default_short_help(help, max_length):\n- only the first paragraph counts; newlines, tabs and runs of spaces collapse to one space; a leading \"\\b\" (no-rewrap marker) is ignored;\n- a word ending in \".\" ends the first sentence when it is the last word, or when the next word does not start with a lowercase letter (so \"Pick a fruit. 3 remain.\" stops after \"fruit.\"); a following lowercase word continues the sentence (\"vs. pears\", \"9. aaaa\");\n- the text up to that sentence end (or all of it) is returned as is when it fits in max_length;\n- otherwise it is shortened at a word boundary with \"...\" so that the result, \"...\" included, fits max_length: \"Weigh apples vs. pears and plums.\" at 20 gives \"Weigh apples vs....\";\n- a word is never split, hyphenated words included: \"well-behaved.\" at 8 gives \"...\", \"supercalifragilistic\" at 10 gives \"...\";\n- when max_length is too small even for \"...\" (3 or less, zero or negative) and the text does not fit, the result is \"...\" (\"ab cd\" at 2 or -1 gives \"...\"), while a text that fits is returned whole (\"ab\" at 2 gives \"ab\").\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, click; p = os.path.realpath(click.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
+  "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not stress'; tests/test_deprecations.py ignored: it needs installed package metadata"
+  },
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/ck-shorthelp/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, click; p = os.path.realpath(click.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests --ignore tests/test_deprecations.py",
+    "expected_tests": 2063,
+    "bug_tests": [
+      "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[-abbreviation inside sentence]",
+      "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[-abbreviation inside truncated sentence]",
+      "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[-lowercase after dot]",
+      "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[no-wrap mark-abbreviation inside sentence]",
+      "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[no-wrap mark-abbreviation inside truncated sentence]",
+      "tests/test_utils/test_make_default_short_help.py::test_make_default_short_help[no-wrap mark-lowercase after dot]"
+    ],
+    "expected_tests_note": "Mac (python.org 3.14.7): Linux 3.13 collects 2064; one more platform skip on the Mac, as for every historical task"
+  },
+  "difficulty": "unknown (historical upstream bug)",
+  "notes": "click PR #3865; hidden = the fix's whole tests/ directory; bug tests failing on base: 6",
+  "task_summary": "Fix the short help Click derives from a command's help so it does not stop at an abbreviation like vs.; done when the test suite passes."
+}

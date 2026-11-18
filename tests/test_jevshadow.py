@@ -459,3 +459,44 @@ def test_hook_detached_worker_writes_answer(repo, tmp_path_factory, fake_jev):
         time.sleep(0.05)
     jevs = [r for r in jevshadow._load(path) if r["kind"] == "jev"]
     assert len(jevs) == 3 and all(j["status"] == "ok" for j in jevs)
+
+
+def test_ask_with_deadline_bounds_the_whole_request():
+    # urllib's timeout is per socket operation; a slow DNS / connect / trickling answer could outlast it.
+    # The gated R3 call and the shadow worker both use one deadline for the whole request.
+    import time as _t
+    import jevshadow
+
+    def slow_opener(req, timeout):
+        _t.sleep(5)
+        raise AssertionError("never reached within the deadline")
+    t0 = _t.perf_counter()
+    cfg = dict(jevshadow.DEFAULTS)
+    res = jevshadow.ask_with_deadline({"model": "m", "state": {}, "questions": {}}, cfg, "secret-key-1", 0.5,
+                                      opener=slow_opener)
+    assert res["status"] == "timeout" and _t.perf_counter() - t0 < 2 and "secret-key-1" not in json.dumps(res)
+
+    class R:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"model": "m", "answers": {"consult_advisor": {"type": "noul", "noul": 0.7}},
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+    res = jevshadow.ask_with_deadline({"model": "m", "state": {}, "questions": {}}, cfg, "secret-key-1", 5,
+                                      opener=lambda req, timeout: R())
+    assert res["status"] == "ok" and res["would_consult"] is True
+    # an exception inside the request is a failure, not a timeout
+    def broken(*a, **k):
+        raise RuntimeError("bad state secret-key-1")
+    orig, jevshadow.ask_jev = jevshadow.ask_jev, broken
+    try:
+        res = jevshadow.ask_with_deadline({"model": "m", "state": {}, "questions": {}}, cfg, "secret-key-1", 5)
+    finally:
+        jevshadow.ask_jev = orig
+    assert res["status"] == "worker_failed" and "secret-key-1" not in json.dumps(res)

@@ -1,5 +1,5 @@
 {
-  "version": "m-6",
+  "version": "m-7",
   "common": {
     "model": "claude-sonnet-5-5",
     "advisor": "claude-opus-5-5",
@@ -25,7 +25,10 @@
     ],
     "jev": {
       "enabled": true,
-      "include_task": false
+      "include_task": false,
+      "model": "jev-1.14.0",
+      "threshold": 0.5,
+      "timeout_s": 10
     },
     "_why_permission_mode": "bypassPermissions auto-approved sandbox network requests (probe 17.11, Claude Code 2.1.326): example.com reachable. acceptEdits + autoAllowBashIfSandboxed: edits and sandboxed Bash run, anything that needs approval is refused in -p. acceptEdits alone refused interpreters (python3 -m unittest) in -p; settings add permissions.allow [\"Bash\"] (m-4)."
   },
@@ -47,6 +50,24 @@
       "policy_mode": "observe",
       "effort": "medium",
       "about": "A with effort medium (a separate, pre-declared condition: does the advisor matter at a smaller reasoning budget); rules and Jev only record"
+    },
+    "BJ": {
+      "policy_mode": "enforce",
+      "policy": {
+        "r3_gate": "jev",
+        "r3_gate_on_error": "enforce"
+      },
+      "about": "B with R3 gated by Jev (b-6): R1 and R2 block as in B; R3 blocks only when Jev, asked synchronously at that Stop (q-consult-2, jev-1.14.0, threshold 0.5, timeout 10 s), says would_consult; Jev error, timeout or no key: R3 stands (r3_gate_on_error enforce). Jev's time is in the session time, its estimated cost in jev_usd_est"
+    },
+    "B12": {
+      "policy_mode": "enforce",
+      "policy": {
+        "enforce_rules": [
+          "R1_tests",
+          "R2_repeat_error"
+        ]
+      },
+      "about": "Control for BJ: R1 and R2 block as in B, R3 never blocks (recorded as triggered, not_enforced); Jev records"
     }
   }
 }

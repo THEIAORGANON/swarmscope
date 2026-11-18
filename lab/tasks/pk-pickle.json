@@ -1,0 +1,47 @@
+{
+  "task_id": "pk-pickle",
+  "manifest_version": 2,
+  "set": "pilot-2-large-bugs",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/pk-pickle",
+    "commit": "2d30327",
+    "commit_full": "2d30327e62e693bf0479ebcb6e0b43eea5eb1884",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pypa/packaging",
+    "base_sha": "0efe21aa398df645c259ee31e54a8a4400b1fc6b",
+    "fix_sha": "f1c57155f97329b1723b3c088dd664f9294f3d25",
+    "pr": 1548,
+    "pr_created": "2026-11-16"
+  },
+  "prompt": "Objects of packaging.pylock and packaging.direct_url that were pickled by packaging 26.3 (and 26.0, 26.1) load as garbage with this version: no error, but every field holds its own name.\n\n```python\n# written with packaging 26.3:\nimport pickle\nfrom packaging.direct_url import DirectUrl, VcsInfo\ndata = pickle.dumps(DirectUrl(url=\"https://g.c/r.git\", vcs_info=VcsInfo(vcs=\"git\", commit_id=\"a\" * 40)))\n\n# loaded with this version:\npickle.loads(data)\n# DirectUrl(url='url', archive_info='archive_info', vcs_info='vcs_info', dir_info='dir_info', subdirectory='subdirectory')\n```\n\nThe same happens to Pylock and every dataclass it contains (packages, wheels, sdists, vcs/directory/archive entries...). The older releases stored the instance __dict__ as the pickle state.\n\nExpected:\n- pickles written by packaging 26.0, 26.1 and 26.3 of any dataclass in packaging.pylock and packaging.direct_url (nested ones included) load into objects equal to the originals, with nested objects of the right types;\n- pickling and copy.deepcopy with this version keep working as they do now;\n- an old-style dict state whose keys are not exactly the dataclass's fields (a field missing, or an unknown key) raises TypeError, and the message names the class (e.g. \"DirectUrl\").\n\nThe test venv's site-packages has packaging 26.3 installed, if you want to produce old pickles.\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)"
+  },
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-pickle/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 64197,
+    "bug_tests": [
+      "tests/test_direct_url.py::test_pickle_from_older_version_loads[26.3]",
+      "tests/test_direct_url.py::test_pickle_old_dict_state_loads[direct_url0]",
+      "tests/test_direct_url.py::test_pickle_old_dict_state_loads[direct_url1]",
+      "tests/test_direct_url.py::test_pickle_old_dict_state_loads[direct_url2]",
+      "tests/test_direct_url.py::test_pickle_old_dict_state_wrong_keys[state0]",
+      "tests/test_direct_url.py::test_pickle_old_dict_state_wrong_keys[state1]",
+      "tests/test_pylock.py::test_pickle_from_older_version_loads[26.0]",
+      "tests/test_pylock.py::test_pickle_from_older_version_loads[26.1]",
+      "tests/test_pylock.py::test_pickle_from_older_version_loads[26.3]",
+      "tests/test_pylock.py::test_pickle_old_dict_state_loads"
+    ],
+    "expected_tests_note": "Mac (python.org 3.14.7): Linux 3.13 collects 64198; one more platform skip on the Mac, as for every historical task"
+  },
+  "difficulty": "unknown (historical upstream bug)",
+  "notes": "packaging PR #1548; hidden = the fix's whole tests/ directory; bug tests failing on base: 10",
+  "task_summary": "Fix unpickling of Pylock and DirectUrl objects pickled by older packaging releases (26.0-26.3); done when the test suite passes."
+}

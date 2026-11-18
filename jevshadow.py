@@ -40,6 +40,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -368,6 +369,79 @@ def shadow(sid, base, events, pol, change, adv_times, now, has_tests, rule_recor
     return ctx_id
 
 
+def ask_with_deadline(request, cfg, key, deadline_s, opener=None):
+    """ask_jev with one deadline for the whole request. urllib's timeout covers each socket operation, not the
+    request: DNS, a slow connect or a response trickling in can outlast it. The request runs in a daemon thread;
+    past the deadline the result is status "timeout" and the thread is abandoned (it dies with the hook)."""
+    box = {}
+    t0 = time.perf_counter()
+
+    def run():
+        try:
+            box["res"] = ask_jev(request, cfg, key, opener)
+        except Exception as e:                       # reported as a failure, not mistaken for a timeout
+            box["res"] = {"requested_model": request["model"], "threshold": cfg["threshold"], "endpoint": endpoint(),
+                          "status": "worker_failed", "error": _clean(f"{type(e).__name__}: {e}", key)}
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(deadline_s)
+    if "res" in box:
+        return box["res"]
+    return {"requested_model": request["model"], "threshold": cfg["threshold"], "endpoint": endpoint(),
+            "latency_ms": round((time.perf_counter() - t0) * 1000), "status": "timeout",
+            "error": f"no answer within the {deadline_s} s deadline"}
+
+
+def gated(sid, base, events, pol, change, adv_times, now, has_tests, history_available=True):
+    """For the Rules Engine's r3_gate "jev": the same context and request as shadow(), asked synchronously (the
+    Stop waits up to timeout_s). Returns (ask, commit): ask() runs the request once and returns the result for
+    rules.gate; commit(rule_records) writes the context (linked to this Stop's decisions) and the answer to the
+    journal, so the runner sees exactly one Jev context per Stop, as in shadow mode. commit returns False when
+    ask() never ran (R3 was not requested): the caller then falls back to shadow()."""
+    cfg = config(pol)
+    state = {}
+    if not cfg:
+        return (lambda: {"status": "disabled"}), (lambda records: False)
+    ctx_id = f"{sid[:8]}-{uuid.uuid4().hex[:10]}"
+    features = build_context(events, pol, change, adv_times, now, has_tests, cfg, history_available)
+    request = {"model": cfg["model"], "state": features, "questions": QUESTIONS}
+
+    def ask():
+        if "result" in state:
+            return state["result"]
+        rec = {"kind": "jev", "ctx_id": ctx_id, "gating": True, "question_version": QUESTION_VERSION,
+               "request_hash": _hash(request), "same_request": True}
+        try:
+            key = load_key(base)
+            if not key:
+                rec.update(status="no_key", requested_model=request["model"], threshold=cfg["threshold"])
+            else:
+                rec.update(ask_with_deadline(request, cfg, key, cfg["timeout_s"]))
+        except Exception as e:
+            rec.update(status="worker_failed", error=_clean(f"{type(e).__name__}: {e}", None))
+        rec["ts"] = time.time()
+        state["result"] = rec
+        return dict(rec, ctx_id=ctx_id)
+
+    def commit(rule_records):
+        if "result" not in state:
+            return False
+        decisions = [r for r in rule_records if r.get("kind") == "decision"]
+        path = jev_file(base, sid)
+        _append(path, {"kind": "context", "ctx_id": ctx_id, "ts": now, "context_version": CONTEXT_VERSION,
+                       "checkpoint_type": "before_delivery", "gating": "R3",
+                       "turn": decisions[0].get("turn") if decisions else None,
+                       "policy_version": pol.get("policy_version"), "mode": pol.get("mode"),
+                       "rules": [{"id": r["id"], "rule": r["rule"], "state": r["state"], "action": r.get("action")}
+                                 for r in decisions],
+                       "jev": dict({k: v for k, v in cfg.items() if k != "enabled"}, question_version=QUESTION_VERSION,
+                                   questions_hash=_hash(QUESTIONS), config_hash=config_hash(cfg), endpoint=endpoint()),
+                       "request": request, "request_hash": _hash(request)})
+        _append(path, state["result"])
+        return True
+    return ask, commit
+
+
 def _context(path, ctx_id):
     return next((r for r in _load(path) if r.get("kind") == "context" and r.get("ctx_id") == ctx_id), None)
 
@@ -391,7 +465,7 @@ def run_worker(path, ctx_id, replay=False, current_question=False):
         if not key:
             rec.update(status="no_key", requested_model=request["model"], threshold=cfg["threshold"])
         else:
-            rec.update(ask_jev(request, cfg, key))
+            rec.update(ask_with_deadline(request, cfg, key, cfg["timeout_s"]))
     except Exception as e:
         rec.update(status="worker_failed", error=_clean(f"{type(e).__name__}: {e}", None))
     rec["ts"] = time.time()

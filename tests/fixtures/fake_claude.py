@@ -11,6 +11,7 @@ FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never rea
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -57,9 +58,18 @@ def hook(ev, **kw):
     if "hooks" not in settings:
         return None
     d = dict(session_id=sid, hook_event_name=ev, cwd=cwd, transcript_path=str(tp), **kw)
-    cmd = settings["hooks"][ev][0]["hooks"][0]["command"]
-    r = subprocess.run(cmd, shell=True, input=json.dumps(d), capture_output=True, text=True)
-    return json.loads(r.stdout) if r.stdout.strip() else None
+    h = settings["hooks"][ev][0]["hooks"][0]
+    p = subprocess.Popen(h["command"], shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:            # as Claude Code: a hook past its timeout is killed and its output ignored (a Stop goes through)
+        stdout, _ = p.communicate(json.dumps(d), timeout=h.get("timeout", 60))
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        with open(os.environ.get("FAKE_HOOK_KILLS", os.devnull), "a") as f:
+            f.write(ev + "\n")
+        return None
+    return json.loads(stdout) if stdout.strip() else None
 
 
 out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": ["Bash", "Edit"],

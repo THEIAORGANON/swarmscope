@@ -38,7 +38,7 @@ import os
 import re
 import time
 
-POLICY_VERSION = "b-5"
+POLICY_VERSION = "b-6"
 
 DEFAULTS = {
     "mode": "observe",                 # observe | advise | enforce
@@ -65,6 +65,14 @@ DEFAULTS = {
                       r"\bvitest\b", r"\brspec\b", r"\bmvn test\b", r"\bgradlew? test\b", r"\bdeno test\b"],
     "max_blocks_per_turn": 2,
     "defer_on_background_agents": True,
+    # enforce mode only. Rules that may block a Stop; a triggered rule not listed is recorded as "triggered"
+    # with not_enforced (b-6; None = all three, as in b-5)
+    "enforce_rules": None,
+    # "jev": R3 blocks only when Jev, asked synchronously at that Stop, says would_consult (p >= threshold);
+    # Jev "no" → state "declined". On a Jev error / timeout / no key: r3_gate_on_error "enforce" (the rule stands)
+    # or "pass" (declined). R1 and R2 are never gated. None = R3 as in b-5.
+    "r3_gate": None,
+    "r3_gate_on_error": "enforce",
 }
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -493,8 +501,10 @@ ACTION_TEXT = {
 }
 
 
-def gate(events, stop, pol, change, adv_times, log, has_tests, sid, now=None, transcript_ok=True):
-    """Evaluate the rules at a Stop. Returns (records_to_append, hook_output_dict_or_None)."""
+def gate(events, stop, pol, change, adv_times, log, has_tests, sid, now=None, transcript_ok=True, ask_jev=None):
+    """Evaluate the rules at a Stop. Returns (records_to_append, hook_output_dict_or_None).
+    ask_jev: with r3_gate "jev", called (no arguments) once, only when R3 would be requested; returns
+    {"status", "would_consult", "p_consult", ...}."""
     now = now or time.time()
     f = facts(events, pol)
     records = resolve_outcomes(log, f, adv_times, now, transcript_ok)
@@ -525,6 +535,28 @@ def gate(events, stop, pol, change, adv_times, log, has_tests, sid, now=None, tr
             new_state = "limited"
         for r in triggered:
             r["state"] = new_state
+        if mode == "enforce" and new_state == "requested":
+            allowed = pol.get("enforce_rules")
+            for r in triggered:
+                if allowed is not None and r["rule"] not in allowed:
+                    r["state"], r["not_enforced"] = "triggered", True
+            r3 = next((r for r in triggered if r["rule"] == "R3_high_risk" and r["state"] == "requested"), None)
+            if r3 is not None and pol.get("r3_gate") == "jev":
+                try:
+                    j = ask_jev() if ask_jev else {"status": "unavailable"}
+                except Exception as e:                    # never let the gate break: treat as a Jev error
+                    j = {"status": "error", "error": type(e).__name__}
+                j = j or {"status": "unavailable"}
+                g = {k: j.get(k) for k in ("status", "p_consult", "would_consult", "latency_ms", "ctx_id")}
+                if j.get("status") == "ok":
+                    g["decided_by"] = "jev"
+                    if not j.get("would_consult"):
+                        r3["state"] = "declined"
+                else:
+                    g["decided_by"] = "fallback_" + pol.get("r3_gate_on_error", "enforce")
+                    if pol.get("r3_gate_on_error") == "pass":
+                        r3["state"] = "declined"
+                r3["jev_gate"] = g
 
     n0 = sum(1 for r in log if r.get("kind") == "decision")
     for i, r in enumerate(results):
