@@ -836,3 +836,11 @@ def test_jev_is_not_asked_when_r3_would_not_block():
     p = pol(mode="enforce", r3_gate="jev", enforce_rules=["R1_tests"])
     _, _, calls = _gate(p, {"status": "ok", "would_consult": True})
     assert calls == []                                                              # R3 not enforced
+
+
+def test_git_in_tests_ignores_the_users_global_config():
+    # regression: on the lab Mac the global config signs commits with an SSH key and the suite asked for its
+    # passphrase; tests/conftest.py keeps the user's config out of every git call made by the tests
+    import subprocess as sp
+    out = sp.run(["git", "config", "--global", "--list"], capture_output=True, text=True)
+    assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull and out.stdout == ""
