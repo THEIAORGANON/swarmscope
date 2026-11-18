@@ -409,6 +409,10 @@ def test_suites_get_a_minimal_environment(tmp_path, monkeypatch):
 
 def test_unsandboxed_tests_are_an_integrity_problem(task, monkeypatch):
     monkeypatch.delenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS")
+    # no sandbox on this machine: on Linux there is none anyway; on the lab Mac sandbox-exec exists and has to be
+    # hidden, or the tests simply run sandboxed (the test failed there, 18.11)
+    real_which = lab.shutil.which
+    monkeypatch.setattr(lab.shutil, "which", lambda n, *a, **k: None if n == "sandbox-exec" else real_which(n, *a, **k))
     r = lab.attempt(task, "A")
     assert r["valid"] is False and any("tests not run: no sandbox available" in p for p in r["integrity"])
     assert r["tests"]["hidden"]["sandbox"] == "unavailable" and r["success"] is False
