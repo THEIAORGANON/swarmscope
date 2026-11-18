@@ -709,8 +709,26 @@ def summarize_decisions(recs, expected_mode, policy_sha):
     return {"present": True, "stops": len(stops), "stop_times": stops, "modes_seen": modes_seen,
             "policy_sha256_seen": shas, "policy_versions": sorted({r.get("policy_version") for r in dec}),
             "by_rule": by_rule, "blocks": sum(1 for r in recs if r.get("kind") == "block"),
-            "decisions": [{k: r.get(k) for k in ("id", "rule", "state", "action", "turn", "ts", "reason")} for r in dec],
-            "closing": closing}, problems
+            "decisions": [dict({k: r.get(k) for k in ("id", "rule", "state", "action", "turn", "ts", "reason")},
+                               **({"jev_gate": r["jev_gate"]} if r.get("jev_gate") else {})) for r in dec],
+            "r3_gate": r3_gate_summary(dec), "closing": closing}, problems
+
+
+def r3_gate_summary(dec):
+    """Policy b-6 with r3_gate "jev": how the Stops where R3 would block were decided (None when never asked)."""
+    gated = [r["jev_gate"] for r in dec if r.get("jev_gate")]
+    if not gated:
+        return None
+    out = {"asked": len(gated), "yes": 0, "no": 0, "fallback": 0, "p_consult": []}
+    for g in gated:
+        if g.get("decided_by") != "jev":
+            out["fallback"] += 1
+        elif g.get("would_consult"):
+            out["yes"] += 1
+        else:
+            out["no"] += 1
+        out["p_consult"].append(g.get("p_consult"))
+    return out
 
 
 def summarize_jev(recs, decision_recs, enabled):
@@ -733,7 +751,8 @@ def summarize_jev(recs, decision_recs, enabled):
         rows.append({"ctx_id": c["ctx_id"], "stop_ts": stop, "turn": c.get("turn"),
                      "rules": [(x["rule"], x["state"]) for x in c.get("rules", [])], "status": a.get("status", "pending"),
                      "p_consult": a.get("p_consult"), "would_consult": a.get("would_consult"),
-                     "latency_ms": a.get("latency_ms"), "cost_usd_est": a.get("cost_usd_est"), "model": a.get("model")})
+                     "latency_ms": a.get("latency_ms"), "cost_usd_est": a.get("cost_usd_est"), "model": a.get("model"),
+                     **({"gating": c["gating"]} if c.get("gating") else {})})
     statuses = {}
     for r in rows:
         statuses[r["status"]] = statuses.get(r["status"], 0) + 1

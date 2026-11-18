@@ -1002,6 +1002,24 @@ def test_paired_batch_orders_each_pair_on_its_own(task):
     assert all(x["B"]["opus_usd"] and not x["A"]["opus_usd"] for x in t["pairs"])
 
 
+def test_quadruple_batch_gives_pairs_for_any_two_of_its_modes(task, monkeypatch, jev_stub):
+    # pilot b-jev-1: A, B, BJ and B12 in each repeat, compared two at a time
+    monkeypatch.setenv("JEV_STUB_P", "0.8")
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B,BJ,B12", "--repeats", "2", "--seed", "3",
+                     "--paired"]) == 0
+    m = json.loads(next((lab.lab_root() / "batches").glob("*.json")).read_text())
+    quads = [m["order"][i:i + 4] for i in range(0, 8, 4)]
+    assert all(sorted(x[0] for x in q) == ["A", "B", "B12", "BJ"] and {x[1] for x in q} == {i + 1}
+               for i, q in enumerate(quads))
+    runs = [json.loads(f.read_text()) for f in (lab.lab_root() / "runs").glob("*/run.json")]
+    for modes in (("B", "BJ"), ("BJ", "B12"), ("A", "BJ")):
+        t = only_row(lab.pair_report(runs, modes=modes), task["task_id"])
+        assert len(t["pairs"]) == 2 and t["invalid_pairs"] == 0, modes
+    # Jev says yes: BJ consults like B, B12 never does
+    t = only_row(lab.pair_report(runs, modes=("BJ", "B12")), task["task_id"])
+    assert all(x["BJ"]["opus_usd"] and not x["B12"]["opus_usd"] for x in t["pairs"])
+
+
 def test_pair_report_counts_only_valid_pairs_and_every_valid_run_cost():
     def rj(mode, rep_, usd, valid=True, success=True, batch="p1"):
         return {"run_id": f"{mode}{rep_}{batch}", "task_id": "pk-x", "mode": mode, "valid": valid, "success": success,
@@ -1202,6 +1220,11 @@ def test_bj_declines_r3_when_jev_says_no_and_blocks_when_it_says_yes(task, monke
     assert len(ctx) == r["decisions"]["stops"] == 1 and ctx[0]["gating"] == "R3"      # one Jev call per Stop
     assert [x["gating"] for x in recs if x.get("kind") == "jev"] == [True]
     assert r["jev"]["answers"][0]["would_consult"] is False
+    # regression (first live BJ run, 18.11): the gate's decision reached the raw journals but not run.json
+    assert r["jev"]["answers"][0]["gating"] == "R3"
+    r3 = [d for d in r["decisions"]["decisions"] if d["rule"] == "R3_high_risk"]
+    assert r3[0]["jev_gate"]["decided_by"] == "jev" and r3[0]["jev_gate"]["would_consult"] is False
+    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 0, "no": 1, "fallback": 0, "p_consult": [0.3]}
 
     monkeypatch.setenv("JEV_STUB_P", "0.8")
     r = lab.attempt(task, "BJ")
@@ -1211,6 +1234,8 @@ def test_bj_declines_r3_when_jev_says_no_and_blocks_when_it_says_yes(task, monke
     ctx = [x for x in _jev_recs(r) if x.get("kind") == "context"]
     assert len(ctx) == r["decisions"]["stops"] == 2                  # the second Stop is asked in shadow mode
     assert [c.get("gating") for c in sorted(ctx, key=lambda c: c["ts"])] == ["R3", None]
+    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 1, "no": 0, "fallback": 0, "p_consult": [0.8]}
+    assert [a.get("gating") for a in sorted(r["jev"]["answers"], key=lambda a: a["stop_ts"])] == ["R3", None]
 
 
 def test_bj_falls_back_to_the_rule_when_jev_is_unreachable(task, monkeypatch):
@@ -1220,6 +1245,7 @@ def test_bj_falls_back_to_the_rule_when_jev_is_unreachable(task, monkeypatch):
     gate = [x for x in _jev_recs(r) if x.get("kind") == "jev" and x.get("gating")]
     assert gate and gate[0]["status"] in ("error", "timeout")
     assert any("jev answers not ok" in p for p in r["integrity"])     # a Jev failure is still reported
+    assert r["decisions"]["r3_gate"]["fallback"] == 1 and r["decisions"]["r3_gate"]["yes"] == 0
 
 
 def test_b12_never_blocks_on_r3(task):
@@ -1227,3 +1253,4 @@ def test_b12_never_blocks_on_r3(task):
     assert r["valid"] is True, r["integrity"]
     assert r["decisions"]["by_rule"]["R3_high_risk"] == {"triggered": 1} and r["decisions"]["blocks"] == 0
     assert r["config"]["policy"]["enforce_rules"] == ["R1_tests", "R2_repeat_error"]
+    assert r["decisions"]["r3_gate"] is None
