@@ -1099,12 +1099,15 @@ def test_rate_limited_interruption_still_stops_the_batch(task, monkeypatch, caps
 
 # --- review of PR #6: versions in the pairs report, planned pairs, real spend; two misclassified runs ------------
 
-def _prj(mode, rep_, usd, batch="p1", task="pk-x", task_sha="t1", modes_sha="m1", valid=True, finished=True):
+def _prj(mode, rep_, usd, batch="p1", task="pk-x", task_sha="t1", modes_sha="m1", valid=True, finished=True,
+         bundle="b1", fingerprint="f1"):
     return {"run_id": f"{mode}{rep_}{batch}{task_sha}", "task_id": task, "mode": mode, "valid": valid, "success": True,
             "plan": {"paired": True, "batch_id": batch, "repeat": rep_},
             **({"finished_at": "x", "verdict": {"task_passed": True}} if finished else {}),
             "task": {"sha256": task_sha, "hidden_tests_sha256": "h"},
-            "versions": {"modes_file_sha256": modes_sha, "claude_code": "2.1.326"},
+            "versions": {"modes_file_sha256": modes_sha, "claude_code": "2.1.326",
+                         "swarmscope": {"bundle_sha256": bundle}},
+            "config_fingerprint": fingerprint,
             "config": {"policy_sha256": mode, "model": "s", "advisor": "o", "effort_requested": "high"},
             "costs": {"claude_code_total_usd": usd, "by_model": {"lead": {"usd": usd}}},
             "session": {"wall_s": 60}, "tests": {"hidden": {"regressions": []}}, "decisions": {"stops": 1, "blocks": 0}}
@@ -1123,6 +1126,19 @@ def test_pairs_of_different_experiment_versions_are_never_pooled(capsys):
     runs += [_prj("A", 2, 0.1), _prj("B", 2, 0.5)]
     row = [t for t in lab.pair_report(runs)["rows"].values() if len(t["pairs"]) == 2]
     assert len(row) == 1 and round(row[0]["mean_diff_usd"], 2) == 0.3
+
+
+@pytest.mark.parametrize("field", ["bundle", "fingerprint"])
+def test_pairs_split_on_the_code_bundle_and_on_the_config_fingerprint(field):
+    """Review of PR #6 (P2): two batches whose runner/hook code or lab profile differ were one row and one total."""
+    runs = [_prj("A", 1, 0.1), _prj("B", 1, 0.3),
+            _prj("A", 1, 0.1, batch="p2", **{field: "x2"}), _prj("B", 1, 0.9, batch="p2", **{field: "x2"})]
+    r = lab.pair_report(runs)
+    assert len(r["rows"]) == 2 and sorted(round(t["mean_diff_usd"], 2) for t in r["rows"].values()) == [0.2, 0.8]
+    assert len({t["setup"] for t in r["rows"].values()}) == 2          # two setups: two overall totals
+    # the calibration groups the same way
+    cal = lab.calibration(runs, mode="A")
+    assert len(cal) == 2
 
 
 def test_pairs_account_for_every_planned_pair_and_the_real_spend():
