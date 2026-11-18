@@ -1181,3 +1181,49 @@ def test_revalidate_writes_an_overlay_and_the_corrected_report_uses_it(task, mon
     out = capsys.readouterr().out
     assert "corrected report" in out and "pairs 1" in out and "(1 revalidated)" in out
 
+
+# --- next pilot: B with R3 gated by Jev, and B without R3 ------------------------------------------------------
+
+def _jev_recs(r):
+    import jevshadow
+    sw = lab.lab_root() / "runs" / r["run_id"] / "sw" / "jev"
+    return [x for f in sw.glob("*.jsonl") for x in jevshadow.load(f)[0]]
+
+
+def test_bj_declines_r3_when_jev_says_no_and_blocks_when_it_says_yes(task, monkeypatch, jev_stub):
+    monkeypatch.setenv("JEV_STUB_P", "0.3")
+    r = lab.attempt(task, "BJ")
+    assert r["valid"] is True, r["integrity"]
+    assert r["config"]["policy"]["r3_gate"] == "jev"
+    assert r["decisions"]["by_rule"]["R3_high_risk"] == {"declined": 1} and r["decisions"]["blocks"] == 0
+    assert r["advisor"]["called"] == 0
+    recs = _jev_recs(r)
+    ctx = [x for x in recs if x.get("kind") == "context"]
+    assert len(ctx) == r["decisions"]["stops"] == 1 and ctx[0]["gating"] == "R3"      # one Jev call per Stop
+    assert [x["gating"] for x in recs if x.get("kind") == "jev"] == [True]
+    assert r["jev"]["answers"][0]["would_consult"] is False
+
+    monkeypatch.setenv("JEV_STUB_P", "0.8")
+    r = lab.attempt(task, "BJ")
+    assert r["valid"] is True, r["integrity"]
+    assert r["decisions"]["blocks"] == 1 and r["advisor"]["requested_answered"] == 1
+    assert r["decisions"]["by_rule"]["R3_high_risk"].get("requested") == 1
+    ctx = [x for x in _jev_recs(r) if x.get("kind") == "context"]
+    assert len(ctx) == r["decisions"]["stops"] == 2                  # the second Stop is asked in shadow mode
+    assert [c.get("gating") for c in sorted(ctx, key=lambda c: c["ts"])] == ["R3", None]
+
+
+def test_bj_falls_back_to_the_rule_when_jev_is_unreachable(task, monkeypatch):
+    monkeypatch.setenv("SWARMSCOPE_JEV_TEST_ENDPOINT", "http://127.0.0.1:9/v1/systemone")   # nothing listens
+    r = lab.attempt(task, "BJ")
+    assert r["decisions"]["blocks"] == 1                              # r3_gate_on_error "enforce": R3 stands
+    gate = [x for x in _jev_recs(r) if x.get("kind") == "jev" and x.get("gating")]
+    assert gate and gate[0]["status"] in ("error", "timeout")
+    assert any("jev answers not ok" in p for p in r["integrity"])     # a Jev failure is still reported
+
+
+def test_b12_never_blocks_on_r3(task):
+    r = lab.attempt(task, "B12")
+    assert r["valid"] is True, r["integrity"]
+    assert r["decisions"]["by_rule"]["R3_high_risk"] == {"triggered": 1} and r["decisions"]["blocks"] == 0
+    assert r["config"]["policy"]["enforce_rules"] == ["R1_tests", "R2_repeat_error"]

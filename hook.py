@@ -216,17 +216,35 @@ def run_gate(d, sid, ev, pol, change, BASE, advisor_activity, load_events, rules
     logf = str(BASE / "decisions" / f"{sid}.jsonl")
     events = load_events(sid)
     has_tests = rules.project_has_tests(base.get("root") or cwd, pol)
+    ask = commit = None
+    t_gate = time.time()
+    if pol.get("mode") == "enforce" and pol.get("r3_gate") == "jev":
+        try:
+            import jevshadow
+            ask, commit = jevshadow.gated(sid, str(BASE), events, pol, change, adv.get("times") or [], ev["ts"],
+                                          has_tests, bool(tp and os.path.exists(tp)))
+        except Exception:
+            ask = commit = None                  # gate gets no Jev: r3_gate_on_error applies
     records, out = rules.gate(events, d, pol, change, adv.get("times") or [], rules.load_log(logf),
-                              has_tests, sid, now=ev["ts"], transcript_ok=bool(tp and os.path.exists(tp)))
+                              has_tests, sid, now=ev["ts"], transcript_ok=bool(tp and os.path.exists(tp)),
+                              ask_jev=ask)
     src = pol.get("_source") or {}
     for r in records:                           # which policy file this Stop actually used (runner checks it)
         r["policy_source"] = src.get("kind")
         if src.get("sha256"):
             r["policy_sha256"] = src["sha256"]
     rules.append_log(logf, records)
+    gated = False
+    if commit:
+        try:
+            gated = commit(records)
+        except Exception:
+            gated = False
     if out:
         sys.stdout.write(json.dumps(out))
         sys.stdout.flush()
+    if gated:                                   # this Stop's Jev context is the synchronous one: no shadow call
+        return round((time.time() - t_gate) * 1000, 1)
     return jev_shadow(sid, BASE, events, pol, change, adv.get("times") or [], ev["ts"], has_tests, records,
                       bool(tp and os.path.exists(tp)))
 

@@ -1,0 +1,56 @@
+{
+  "pilot": "b-jev-1",
+  "status": "draft 2026-11-18: tasks and repeats are fixed after the screening below, before any run of the series",
+  "question": "Does gating R3 by Jev keep what B costs down without losing outcomes, and does Jev add anything over simply switching R3 off?",
+  "modes": {
+    "A": "observe only (baseline)",
+    "B": "Rules Engine b-6 as b-5: R1, R2, R3 block",
+    "BJ": "R1, R2 block; R3 blocks only when Jev says would_consult at that Stop",
+    "B12": "R1, R2 block; R3 recorded, never blocks (control: is Jev better than no R3 at all?)"
+  },
+  "jev": {
+    "question_version": "q-consult-2",
+    "model": "jev-1.14.0",
+    "threshold": 0.5,
+    "timeout_s": 10,
+    "on_error": "R3 stands (r3_gate_on_error enforce); every Jev failure is reported and makes the run invalid",
+    "asked": "synchronously, only at a Stop where R3 would block; at other Stops in shadow mode as before (one Jev context per Stop)",
+    "in_cost_and_time": "the session wall time includes the wait for Jev; Jev's own cost (jev_usd_est, about $0.0001 per run in b-cost-1) is reported beside the Claude Code cost, not added to it"
+  },
+  "primary_metric": "mean paired difference of claude_code_total_usd for BJ - B and BJ - B12, per task and per cell; every valid run counts, failed or not",
+  "secondary": [
+    "success and regressions per mode",
+    "session wall time",
+    "R3 Stops in BJ: how often Jev said yes, and the cost of those consultations",
+    "real spend incl. interrupted / invalid runs (pairs report)"
+  ],
+  "design": "paired batches with all four modes per repeat, order random inside each repeat (batch --paired --modes A,B,BJ,B12); one task after another on one machine; no parallel sessions",
+  "tasks": {
+    "_cells": "task type x R3 seen in observe runs (A, 16-18.11); b-cost-1's six tasks are the development set and are not reused",
+    "feature_r3": {
+      "pkf-relations": "R3 2/2",
+      "calendar": "R3 3/3"
+    },
+    "feature_no_r3": {
+      "semver": "R3 1/6",
+      "rowquery": "R3 1/3"
+    },
+    "bug_r3": {
+      "pk-pickle": "new (packaging PR #1548, 2026-11-16; upstream fix: 3 source files)",
+      "ck-shorthelp": "new (click PR #3865, 2026-09-11; upstream fix rewrites the function)"
+    },
+    "bug_no_r3": {
+      "orders": "R3 0/3",
+      "pk-meta": "R3 0/1"
+    }
+  },
+  "screening": {
+    "runs": "pk-pickle and ck-shorthelp: 2 x A each; one BJ run on pkf-prepared (R3 every time in A) as a live check of the synchronous Jev call",
+    "keep_a_new_bug_task_if": "valid, solved at least once, R3 triggered at least once in 2; otherwise the bug_r3 cell keeps whichever passes, and the gap is reported",
+    "screening_runs_are_not_pilot_data": true
+  },
+  "repeats": 2,
+  "size": "8 tasks x 4 modes x 2 = 64 runs; about 5 h and $25-35 at b-cost-1 rates",
+  "caveat": "R3 depends on Sonnet's own change, not on the task: a cell is what A showed, not a guarantee; the report gives R3 Stops per run",
+  "report": "python lab/lab.py pairs --pilot lab/pilots/b-jev-1.json --modes B,BJ (and BJ,B12; A,BJ)"
+}

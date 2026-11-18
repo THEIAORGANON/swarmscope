@@ -771,3 +771,68 @@ def test_snapshot_never_runs_repo_configured_programs(repo, tmp_path_factory):
     d = repostate.diff(cur["root"], store, base["tree"], cur["tree"])
     assert not marker.exists()
     assert {x["path"] for x in d} == {"a.py", "b.py"}
+
+
+# --- b-6: which rules may block, and R3 gated by Jev --------------------------------------------------------
+
+def _gate(p, jev=None, d=None, events=None):
+    d = d or files(("src/a.py", 40, 0), ("src/b.py", 40, 0), ("src/c.py", 40, 0))
+    events = events or [prompt(1), edit(5)]
+    times = [e["ts"] for e in events if e.get("tool_name") == "Edit"]
+    calls = []
+
+    def ask():
+        calls.append(1)
+        return jev
+    change = {"files": d, "src_times": times, "since_advisor": None, "before_advisor": None}
+    recs, out = rules.gate(events, {}, p, change, [], [], True, "sess1234", now=100.0,
+                           ask_jev=ask if jev is not None else None)
+    return recs, out, calls
+
+
+def test_b5_behaviour_is_unchanged_without_the_new_options():
+    recs, out, calls = _gate(pol(mode="enforce"))
+    assert by_rule(recs, "R3_high_risk")["state"] == "requested" and out["decision"] == "block" and not calls
+
+
+def test_rule_outside_enforce_rules_is_recorded_but_does_not_block():
+    p = pol(mode="enforce", enforce_rules=["R1_tests", "R2_repeat_error"])
+    recs, out, _ = _gate(p)
+    r3 = by_rule(recs, "R3_high_risk")
+    assert r3["state"] == "triggered" and r3["not_enforced"] is True
+    # R1 still blocks: the source changed and no tests ran
+    assert by_rule(recs, "R1_tests")["state"] == "requested" and out and "consult" not in out["reason"]
+    blk = [r for r in recs if r.get("kind") == "block"]
+    assert blk and by_rule(recs, "R3_high_risk")["id"] not in blk[0]["ids"]
+
+
+def test_r3_gated_by_jev_yes_blocks_and_no_declines():
+    p = pol(mode="enforce", r3_gate="jev", enforce_rules=["R3_high_risk"])        # R1 out of the way here
+    recs, out, calls = _gate(p, {"status": "ok", "would_consult": True, "p_consult": 0.7, "ctx_id": "c1"})
+    r3 = by_rule(recs, "R3_high_risk")
+    assert r3["state"] == "requested" and r3["jev_gate"]["decided_by"] == "jev" and calls == [1]
+    assert out and "consult the advisor" in out["reason"]
+    recs, out, calls = _gate(p, {"status": "ok", "would_consult": False, "p_consult": 0.2})
+    r3 = by_rule(recs, "R3_high_risk")
+    assert r3["state"] == "declined" and r3["jev_gate"]["p_consult"] == 0.2 and out is None and calls == [1]
+
+
+@pytest.mark.parametrize("on_error,state", [("enforce", "requested"), ("pass", "declined")])
+def test_r3_gate_on_jev_error_follows_the_declared_fallback(on_error, state):
+    p = pol(mode="enforce", r3_gate="jev", r3_gate_on_error=on_error, enforce_rules=["R3_high_risk"])
+    for j in ({"status": "timeout"}, {"status": "no_key"}):
+        r3 = by_rule(_gate(p, j)[0], "R3_high_risk")
+        assert r3["state"] == state and r3["jev_gate"]["decided_by"] == f"fallback_{on_error}"
+    r3 = by_rule(_gate(p)[0], "R3_high_risk")                                      # no ask_jev at all
+    assert r3["state"] == state and r3["jev_gate"]["status"] == "unavailable"
+
+
+def test_jev_is_not_asked_when_r3_would_not_block():
+    p = pol(mode="enforce", r3_gate="jev")
+    _, _, calls = _gate(p, {"status": "ok", "would_consult": True}, d=files(("src/a.py", 2, 0)))
+    assert calls == []                                                              # R3 passes: no question
+    _, _, calls = _gate(pol(mode="observe", r3_gate="jev"), {"status": "ok", "would_consult": True})
+    assert calls == []                                                              # observe never asks
+    p = pol(mode="enforce", r3_gate="jev", enforce_rules=["R1_tests"])
+    _, _, calls = _gate(p, {"status": "ok", "would_consult": True})
+    assert calls == []                                                              # R3 not enforced
