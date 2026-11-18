@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 from pathlib import Path
 import json
+import re
 import time
 import os
 import subprocess
@@ -103,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -152,9 +153,90 @@ def test_settings_sandbox_and_deny_rules(task):
     assert "~/" in sb["filesystem"]["denyRead"]
     for p in (str(lab.lab_root().resolve()), lab.expand(task["hidden_tests"]["dir"]), lab.expand(task["source"]["repo"])):
         assert p in sb["filesystem"]["denyRead"]
-        assert f"Read(/{p}/**)" in s["permissions"]["deny"] and f"Edit(/{p}/**)" in s["permissions"]["deny"]
-    assert "Read(~/**)" in s["permissions"]["deny"]
+        assert f"Edit(/{p}/**)" in s["permissions"]["deny"]
+    for p in (lab.expand(task["hidden_tests"]["dir"]), lab.expand(task["source"]["repo"])):
+        assert f"Read(/{p}/**)" in s["permissions"]["deny"]
+    assert "Edit(~/**)" in s["permissions"]["deny"]
     assert s["permissions"]["allow"] == ["Bash"]          # interpreters must run without an approval nobody can give
+
+
+def _rule_re(rule, tool):
+    """A Read/Edit path rule as a regex over absolute paths (gitignore-style: ** any depth, * one level, \\x)."""
+    m = re.fullmatch(tool + r"\((.*)\)", rule)
+    if not m:
+        return None
+    pat = m.group(1)
+    pat = str(Path.home()) + pat[1:] if pat.startswith("~/") else pat[1:] if pat.startswith("//") else pat
+    out, i = "", 0
+    while i < len(pat):
+        if pat[i] == "\\":
+            out += re.escape(pat[i + 1]); i += 2
+        elif pat.startswith("/**", i) and i + 3 == len(pat):
+            out += "(/.*)?"; i += 3
+        elif pat.startswith("**", i):
+            out += ".*"; i += 2
+        elif pat[i] == "*":
+            out += "[^/]*"; i += 1
+        elif pat[i] == "?":
+            out += "[^/]"; i += 1
+        else:
+            out += re.escape(pat[i]); i += 1
+    return re.compile(out + "$")
+
+
+def _denied(rules, path, tool):
+    return any(r and r.match(str(path)) for r in (_rule_re(x, tool) for x in rules))
+
+
+def test_read_denies_leave_open_only_the_sessions_own_spilled_tool_outputs(task):
+    # review 18.11: the agent may Read the tool output Claude Code spilled for it (run d985a62293 was invalid
+    # for it); other runs' outputs, transcripts, the config and everything else in home stay denied, writes too
+    home, cfg = Path.home().resolve(), (lab.lab_root() / "config").resolve()
+    (home / ".ssh").mkdir(exist_ok=True)
+    (home / ".ssh" / "id_x").write_text("k")
+    (home / "Downloads" / "x").mkdir(parents=True, exist_ok=True)
+    other = cfg / "projects" / "-private-tmp-swarmscope-w-old" / "s1" / "tool-results"
+    other.mkdir(parents=True, exist_ok=True)
+    r = lab.attempt(task, "A")
+    deny = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())["permissions"]["deny"]
+    own = cfg / "projects" / "-private-tmp-swarmscope-w-new" / "sess"
+    assert not _denied(deny, own / "tool-results" / "b3euojfv4.txt", "Read")
+    for p in (own / "tool-results" / "b3euojfv4.txt", own.parent / "sess.jsonl"):
+        assert _denied(deny, p, "Edit")
+    for p in (own.parent / "sess.jsonl", own / "subagents" / "agent-1.jsonl", own.parent / "memory" / "m.md",
+              other / "a.txt", cfg / "settings.json", cfg / ".claude.json", cfg / ".credentials.json",
+              cfg / "agents" / "docs.md", lab.lab_root().resolve() / "runs" / r["run_id"] / "run.json",
+              home / ".ssh" / "id_x", home / "Downloads" / "x" / "y", lab.expand(task["hidden_tests"]["dir"]) + "/t.py"):
+        assert _denied(deny, p, "Read"), p
+    # a name with glob characters is matched literally
+    odd = home / "we[i]rd*name"
+    odd.mkdir()
+    r = lab.attempt(task, "A")
+    deny = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())["permissions"]["deny"]
+    assert _denied(deny, odd / "f", "Read") and not _denied(deny, home / "weXrdyname" / "f", "Read")
+
+
+def test_reads_outside_the_working_copy_make_a_run_invalid(tmp_path):
+    proj = tmp_path / "projects" / "-w-1"
+    (proj / "sess" / "tool-results").mkdir(parents=True)
+    work = tmp_path / "w"
+    work.mkdir()
+    tp = proj / "sess.jsonl"
+
+    def use(i, name, inp):
+        return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": i, "name": name, "input": inp}]}}
+
+    def res(i, err=False):
+        return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": i, "is_error": err,
+                                                         "content": "x"}]}}
+    recs = [use("1", "Read", {"file_path": str(proj / "sess" / "tool-results" / "a.txt")}), res("1"),
+            use("2", "Read", {"file_path": "src/x.py"}), res("2"),
+            use("3", "Read", {"file_path": str(tmp_path / "secret")}), res("3", err=True),     # refused
+            use("4", "Grep", {"pattern": "k", "path": str(tmp_path / "projects")}), res("4"),
+            use("5", "Read", {"file_path": str(proj / "sess.jsonl")}), res("5")]
+    tp.write_text("\n".join(json.dumps(x) for x in recs) + "\n")
+    hits = lab.read_outside(str(tp), work)
+    assert sorted(h[2] for h in hits) == sorted([str(tmp_path / "projects"), str(proj / "sess.jsonl")])
 
 
 def test_working_copy_hides_the_experiment(task):
@@ -441,6 +523,21 @@ def test_all_skipped_hidden_suite_is_not_ok(tmp_path):
     r = lab.run_suite("hidden", f"{sys.executable} -c \"print('Ran 7 tests in 0.1s'); print(); print('OK (skipped=7)')\"",
                       snap, tmp_path, expected=7, work_base=tmp_path)
     assert r["ok"] is False and r["passed"] == 0 and r["tests"] == 7
+
+
+def test_probe_catches_a_readable_own_transcript(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_READ_TRANSCRIPT", "1")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_14_tool_read_own_transcript" in out and "boundary BROKEN" in out
+
+
+def test_a_read_outside_the_working_copy_makes_the_run_invalid(task, monkeypatch):
+    secret = lab.lab_root() / "runs" / "elsewhere.txt"
+    monkeypatch.setenv("FAKE_READ_OUTSIDE", str(secret))
+    r = lab.attempt(task, "A")
+    assert not r["valid"] and any("read outside" in p for p in r["integrity"])
+    assert r["observation"]["reads_outside"][0][2] == str(secret.resolve())
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):

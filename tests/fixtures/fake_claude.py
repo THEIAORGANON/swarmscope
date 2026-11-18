@@ -119,8 +119,22 @@ if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agen
             continue
         name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write"}[tool]
         inp = {"command": arg} if name == "Bash" else {"file_path": arg.split(" containing")[0].replace("create ", "")}
-        allowed = n == "10" or (n == "9" and os.environ.get("FAKE_NET"))
+        spill = Path(str(tp)[:-6]) / "tool-results" / "b3euojfv4.txt"     # Claude Code's spilled long output
+        if n == "12":
+            inp = {"file_path": str(spill), "limit": 5}
+        elif n == "14":
+            inp = {"file_path": str(tp), "limit": 5}
+        elif n == "15":
+            inp = {"file_path": str(spill.parent / "probe-write.txt"), "content": "probe"}
+        allowed = (n in ("10", "11", "12") or (n == "9" and os.environ.get("FAKE_NET"))
+                   or (n == "14" and os.environ.get("FAKE_READ_TRANSCRIPT")))
         text = "ok" if n == "10" else ("<h1>Example Domain</h1>" if allowed else "Operation not permitted")
+        if n == "11":
+            spill.parent.mkdir(parents=True, exist_ok=True)
+            spill.write_text(arg + "\n")
+            text = f"Output too large (198.0KB). Full output saved to: {spill}"
+        elif n == "12":
+            text = "swarmscope-spill-line swarmscope-spill-line"
         if n == "1" and os.environ.get("FAKE_LEAK"):
             leaked = Path(arg.split()[-1]).read_text()
             text, allowed = leaked, True
@@ -164,6 +178,12 @@ if os.environ.get("FAKE_WEB"):                   # main: the session calls WebFe
         sub.mkdir(parents=True, exist_ok=True)
         web["message"]["model"] = "claude-haiku-5-5"
         (sub / "agent-web1.jsonl").write_text(json.dumps(web) + "\n")
+if os.environ.get("FAKE_READ_OUTSIDE"):          # a Read that succeeds on a file outside the working copy
+    tr({"type": "assistant", "timestamp": iso(), "message": {"id": "mro", "model": model, "content": [
+        {"type": "tool_use", "id": "tro", "name": "Read", "input": {"file_path": os.environ["FAKE_READ_OUTSIDE"]}}],
+        "usage": {"input_tokens": 10, "output_tokens": 5}}})
+    tr({"type": "user", "timestamp": iso(), "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tro", "is_error": False, "content": "x"}]}})
 if os.environ.get("FAKE_VOLUNTARY_ADVISOR") and advisor:    # the agent consults the advisor on its own
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1a", "model": model, "content": [
         {"type": "server_tool_use", "id": "srv9", "name": "advisor", "input": {}},
