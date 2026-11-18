@@ -2,7 +2,7 @@
 """Fake Claude Code for runner tests: real hooks, scripted agent, init fields from lab/modes.json.
 FAKE_SKILLS=<json>  report skills in init      FAKE_NO_STOP=1  never call the Stop hook
 FAKE_SLEEP=<s>      sleep before finishing      FAKE_MODEL=<id> report another lead model
-FAKE_VOLUNTARY_ADVISOR=1  call the advisor unasked   FAKE_PROFILE_ADVISOR=<id>  advisor without --advisor
+FAKE_WEB=main|sub   a WebFetch/WebSearch call   FAKE_VOLUNTARY_ADVISOR=1  call the advisor unasked   FAKE_PROFILE_ADVISOR=<id>  advisor without --advisor
 FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never reached (as on 17.11),
                     mid: the API fails after work began, warn: the session still finishes normally"""
 import json
@@ -130,6 +130,17 @@ tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1", "model": mo
                                                          "usage": {"input_tokens": 1000, "output_tokens": 100}}})
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 cost = 0.002 + 0.001
+if os.environ.get("FAKE_WEB"):                   # main: the session calls WebFetch; sub: a subagent calls WebSearch
+    web = {"type": "assistant", "timestamp": iso(), "message": {"id": "mw", "model": model, "content": [
+        {"type": "tool_use", "id": "tw", "name": "WebFetch" if os.environ["FAKE_WEB"] == "main" else "WebSearch",
+         "input": {"url": "https://github.com/pypa/packaging/pull/1"}}], "usage": {"input_tokens": 10, "output_tokens": 5}}}
+    if os.environ["FAKE_WEB"] == "main":
+        tr(web)
+    else:
+        sub = Path(str(tp)[:-6]) / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        web["message"]["model"] = "claude-haiku-5-5"
+        (sub / "agent-web1.jsonl").write_text(json.dumps(web) + "\n")
 if os.environ.get("FAKE_VOLUNTARY_ADVISOR") and advisor:    # the agent consults the advisor on its own
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1a", "model": model, "content": [
         {"type": "server_tool_use", "id": "srv9", "name": "advisor", "input": {}},

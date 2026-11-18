@@ -1,0 +1,41 @@
+{
+  "task_id": "pk-meta",
+  "manifest_version": 2,
+  "set": "calib-2-historical",
+  "source": {
+    "repo": "~/Downloads/swarmscope-lab/tasks/pk-meta",
+    "commit": "25e94de",
+    "commit_full": "25e94def25a31a44a6848d9dd1967c0a92438533",
+    "exclude": []
+  },
+  "upstream": {
+    "repo": "https://github.com/pypa/packaging",
+    "base_sha": "984e438362464a05da2a4fa31f0497ad7654c4db",
+    "fix_sha": "b1c439b0f1fb1a8c541a5f0770946983c5d38b8c",
+    "pr": 1454,
+    "pr_created": "2026-10-16"
+  },
+  "prompt": "A subclass of packaging.metadata.Metadata does not behave like Metadata itself:\n\n```python\nfrom packaging import metadata\n\nclass CustomMetadata(metadata.Metadata):\n    pass\n\nraw = {\"metadata_version\": \"2.6\", \"name\": \"example\", \"version\": \"1.0\", \"summary\": \"An example package\",\n       \"requires_dist\": [\"dependency>=2\"], \"description\": \"Package description\\n\"}\nCustomMetadata.from_raw(raw)\n# ExceptionGroup: unrecognized field: 'name', 'version', 'requires_dist', ...\nCustomMetadata.from_raw(raw, validate=False).as_rfc822().as_string()\n# '\\nPackage description\\n'  -- every header is missing\n```\n\nfrom_email() has the same problem. A subclass that adds nothing must accept and write exactly what Metadata does: for from_raw() and from_email(), with validate=True and with validate=False, the result is an instance of the subclass and its as_rfc822() gives the same bytes as Metadata.from_raw(raw).as_rfc822().\n\nFix the bug in the library code under src/ and keep the public API. Add a regression test under tests/. Run the test suite with: PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests\n",
+  "public_tests": "PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+  "tests_timeout_s": 900,
+  "test_env": {
+    "python": "/Users/Shared/swarmscope-py (python.org 3.14.7 on the Mac)",
+    "packages": "pytest==9.2.0 hypothesis==6.170.15 pretend==1.0.9 tomli_w==1.2.0 (+ deps; site-packages packaging 26.3 predates every base here)",
+    "selection": "upstream addopts: -m 'not property' (property tests opt-in)",
+    "expected_tests_note": "counted on the Mac (screen 17.11): one test fewer than on Linux (packaging: glibc-only manylinux test skipped; Click: one more platform skip)"
+  },
+  "hidden_tests": {
+    "dir": "~/Downloads/swarmscope-lab/tasks-src/pk-meta/hidden",
+    "cmd": "rm -rf tests && cp -R {hidden}/tests tests && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -c \"import os, packaging; p = os.path.realpath(packaging.__file__); assert p.startswith(os.path.realpath('src') + os.sep), p\" && PYTHONPATH=src /Users/Shared/swarmscope-py/bin/python -m pytest -q tests",
+    "expected_tests": 63575,
+    "bug_tests": [
+      "tests/test_metadata.py::TestMetadata::test_subclass_round_trip[False-False]",
+      "tests/test_metadata.py::TestMetadata::test_subclass_round_trip[False-True]",
+      "tests/test_metadata.py::TestMetadata::test_subclass_round_trip[True-False]",
+      "tests/test_metadata.py::TestMetadata::test_subclass_round_trip[True-True]"
+    ]
+  },
+  "difficulty": "unknown (historical upstream bug)",
+  "notes": "packaging PR #1454; hidden = the fix's whole tests/ directory; bug tests failing on base: 4",
+  "task_summary": "Fix packaging.metadata so that a Metadata subclass validates and serializes inherited fields like Metadata; done when the test suite passes."
+}

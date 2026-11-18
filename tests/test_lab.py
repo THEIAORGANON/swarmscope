@@ -2,6 +2,8 @@
 (no network, no model). Each test pins one failure that would make a run look valid when it is not."""
 import argparse
 import http.server
+import importlib.util
+from pathlib import Path
 import json
 import os
 import subprocess
@@ -90,7 +92,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -759,3 +761,218 @@ def test_a0_and_a_are_different_experiments_for_calib():
     a, a0 = _rj("x"), _rj("y")
     a0["config"]["advisor"] = None
     assert lab.experiment_key(a) != lab.experiment_key(a0)
+# --- pytest suites (historical-bug tasks: packaging, Click) -------------------------------------------------
+
+@pytest.mark.parametrize("text,tests,failed,passed,ids", [
+    ("....F\nFAILED tests/test_a.py::test_x[1-2] - assert 1 == 2\n4 failed, 63746 passed, 444 deselected in 41.25s\n",
+     63750, 4, 63746, ["tests/test_a.py::test_x[1-2]"]),
+    ("=== short test summary info ===\nFAILED t.py::T::test_b - AssertionError\nERROR t.py::test_c - KeyError\n"
+     "==== 1 failed, 2 passed, 24 skipped, 1 xfailed, 1 error, 3 warnings in 0.50s ====\n",
+     4, 2, 2, ["t.py::T::test_b", "t.py::test_c"]),
+    ("ERROR tests/test_deprecations.py\n!!!!!! Interrupted: 1 error during collection !!!!!!\n"
+     "31000 deselected, 1 error in 2.09s\n", 1, 1, 0, ["tests/test_deprecations.py"]),
+    ("2083 passed, 24 skipped, 31000 deselected, 1 xfailed in 4.87s\n", 2083, 0, 2083, []),
+    # parametrized ids with spaces and brackets in the message
+    ("FAILED tests/t.py::test_l[(LICENSEREF-Foo OR licenseref-foo) AND MIT-x] - AssertionError: assert [1] == [2]\n"
+     "FAILED tests/t.py::test_o[envvar1-'--units' (env var: 'UNITS')] - assert 2 == 2\nFAILED tests/t.py::test_p[a b]\n"
+     "3 failed, 5 passed in 0.1s\n", 8, 3, 5,
+     ["tests/t.py::test_l[(LICENSEREF-Foo OR licenseref-foo) AND MIT-x]", "tests/t.py::test_o[envvar1-'--units' (env var: 'UNITS')]",
+      "tests/t.py::test_p[a b]"]),
+])
+def test_parse_pytest_summary_and_failing_ids(text, tests, failed, passed, ids):
+    p = lab.parse_pytest(text)
+    assert (p["tests"], p["failed"], p["passed"], p["not_passed"]) == (tests, failed, passed, ids)
+
+
+def test_parse_pytest_needs_a_summary():
+    assert lab.parse_pytest("no tests ran in 0.01s\n") is None
+    assert lab.parse_pytest("Traceback (most recent call last):\nKeyboardInterrupt\n") is None
+
+
+PYTEST_SUITE = '''import pytest
+def test_ok(): pass
+@pytest.mark.parametrize("x", [1, 2])
+def test_param(x): assert x == 1
+@pytest.mark.skip(reason="platform")
+def test_skipped(): pass
+'''
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")
+def test_hidden_pytest_suite_counts_and_ids(tmp_path):
+    snap = tmp_path / "snap"
+    (snap / "tests").mkdir(parents=True)
+    (snap / "tests" / "test_p.py").write_text(PYTEST_SUITE)
+    r = lab.run_suite("hidden", f"{sys.executable} -m pytest -q -p no:cacheprovider tests", snap, tmp_path,
+                      expected=3, work_base=tmp_path)
+    assert r["framework"] == "pytest" and r["report"] is True and r["ok"] is False
+    assert (r["tests"], r["passed"], r["not_passed"]) == (3, 2, ["tests/test_p.py::test_param[2]"])
+    assert r["pytest_counts"]["skipped"] == 1
+    (snap / "tests" / "test_p.py").write_text(PYTEST_SUITE.replace("assert x == 1", "assert x"))
+    r = lab.run_suite("hidden", f"{sys.executable} -m pytest -q -p no:cacheprovider tests", snap, tmp_path,
+                      expected=3, work_base=tmp_path)
+    assert r["ok"] is True and r["passed"] == 3 and r["not_passed"] == []
+
+
+def test_task_can_raise_the_test_suite_timeout(task, monkeypatch):
+    seen = []
+    real = lab.run_suite
+
+    def spy(name, cmd, *a, **kw):
+        seen.append((name, kw.get("timeout")))
+        return real(name, cmd, *a, **kw)
+    monkeypatch.setattr(lab, "run_suite", spy)
+    lab.attempt(dict(task, tests_timeout_s=900), "A")
+    lab.attempt(task, "A")
+    assert seen[:2] == [("public", 900), ("hidden", 900)] and seen[2:] == [("public", 300), ("hidden", 300)]
+
+
+# --- no web: WebFetch/WebSearch denied everywhere, and any use invalidates the run ------------------------------
+
+def test_settings_deny_web_tools(task):
+    r = lab.attempt(task, "A")
+    settings = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    assert {"WebFetch", "WebSearch"} <= set(settings["permissions"]["deny"])
+    assert r["valid"] is True and r["observation"]["web_tool_uses"] == 0
+
+
+@pytest.mark.parametrize("where,tool", [("main", "WebFetch"), ("sub", "WebSearch")])
+def test_web_tool_use_in_session_or_subagent_invalidates_the_run(task, monkeypatch, where, tool):
+    monkeypatch.setenv("FAKE_WEB", where)
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any(f"web tool used 1 time(s): ['{tool}']" in p for p in r["integrity"])
+
+
+def test_hidden_bug_tests_and_regressions_are_reported_apart(task, monkeypatch):
+    """Historical tasks: the base fails some known tests (the bug); the rest of the fix's suite checks regressions."""
+    spy_real = lab.run_suite
+
+    def fake_suite(name, cmd, *a, **kw):
+        r = spy_real(name, cmd, *a, **kw)
+        if name == "hidden":
+            r.update(report=True, ok=False, not_passed=["t.py::test_bug[2]", "t.py::test_other"])
+        return r
+    monkeypatch.setattr(lab, "run_suite", fake_suite)
+    t = json.loads(json.dumps(task))
+    t["hidden_tests"]["bug_tests"] = ["t.py::test_bug[1]", "t.py::test_bug[2]"]
+    r = lab.attempt(t, "A")
+    h = r["tests"]["hidden"]
+    assert h["bug_tests"] == {"total": 2, "not_passed": ["t.py::test_bug[2]"]}
+    assert h["regressions"] == ["t.py::test_other"]
+    c = next(iter(lab.calibration([r], "A").values()))
+    assert c["bug_fixed"] == [False] and c["regressions"] == [1]
+
+
+def test_screen_runs_batches_one_after_another(task, capsys):
+    second = Path(task["_file"]).with_name("task2.json")
+    second.write_text(json.dumps(dict(json.loads(Path(task["_file"]).read_text()), task_id="t2")))
+    assert lab.main(["screen", "--tasks", f"{task['_file']},{second}", "--seed", "3"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("started ") == 2 and out.count("VALID") == 2 and "2/2 batches all valid" in out
+    batches = list((lab.lab_root() / "batches").glob("*.json"))
+    assert len(batches) == 2 and len({b.name for b in batches}) == 2
+
+
+def test_screen_stops_starting_batches_after_an_api_failure(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "1")
+    assert lab.main(["screen", "--tasks", ",".join([task["_file"]] * 3), "--seed", "3", "--jobs", "1"]) == 1
+    out = capsys.readouterr().out
+    assert out.count("started ") == 1 and "not started:" in out
+
+
+# --- review of PR #5: isolation of runs side by side, strict validation of historical tasks -----------------------
+
+def test_check_copies_live_apart_and_are_denied_to_the_agent(task, monkeypatch):
+    roots = []
+    real = lab.run_suite
+
+    def spy(name, cmd, snapshot, run_dir, **kw):
+        roots.append(kw.get("work_base"))
+        return real(name, cmd, snapshot, run_dir, **kw)
+    monkeypatch.setattr(lab, "run_suite", spy)
+    r = lab.attempt(task, "A")
+    modes, _ = lab.load_modes()
+    check, work = lab.check_root(modes), lab.work_root(modes)
+    assert roots and all(Path(x) == check for x in roots) and check != work and not str(check).startswith(str(work) + "/")
+    st = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    assert f"Read(/{check}/**)" in st["permissions"]["deny"] and f"Edit(/{check}/**)" in st["permissions"]["deny"]
+    fs = st["sandbox"]["filesystem"]
+    assert str(check) in fs["denyRead"] and str(work) in fs["denyRead"]          # siblings closed to Bash ...
+    assert any(a.startswith(str(work) + "/") for a in fs["allowRead"])         # ... its own dir re-opened
+
+
+def test_screen_refuses_sessions_side_by_side(task, capsys):
+    """Review of PR #5: the Read tool is not kept out of sibling work dirs, so no parallel sessions for now."""
+    assert lab.main(["screen", "--tasks", task["_file"], "--seed", "3", "--jobs", "2"]) == 2
+    out = capsys.readouterr().out
+    assert "--jobs > 1 is disabled" in out and "started" not in out
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")
+def test_historical_validation_needs_a_full_report_failing_exactly_the_bug_tests(tmp_path):
+    """Review of PR #5: a base that fails before the hidden tests run (ImportError, no report) used to pass, since
+    an empty list of failures is a subset of the bug tests."""
+    sys.path.insert(0, os.path.join(ROOT, "lab", "tasks"))
+    import build_tasks
+    t = tmp_path / "hist"
+    (t / "base" / "src").mkdir(parents=True)
+    (t / "base" / "tests").mkdir()
+    (t / "base" / "src" / "m.py").write_text("def f(x):\n    return x\n")
+    (t / "base" / "tests" / "test_old.py").write_text("from m import f\ndef test_one():\n    assert f(1) == 1\n")
+    (t / "ref" / "src").mkdir(parents=True)
+    (t / "ref" / "src" / "m.py").write_text("def f(x):\n    return abs(x)\n")
+    (t / "hidden" / "tests").mkdir(parents=True)
+    (t / "hidden" / "tests" / "test_old.py").write_text((t / "base" / "tests" / "test_old.py").read_text())
+    (t / "hidden" / "tests" / "test_bug.py").write_text("from m import f\ndef test_neg():\n    assert f(-2) == 2\n")
+    (t / "task.json").write_text(json.dumps({"id": "hist", "kind": "historical",
+                                             "bug_tests": ["tests/test_bug.py::test_neg"]}))
+    py = f"PYTHONPATH=src {sys.executable} -m pytest -q -p no:cacheprovider tests"
+    good = {"public_tests": py, "hidden_tests": {"expected_tests": 2,
+                                                  "cmd": "rm -rf tests && cp -R {hidden}/tests tests && " + py}}
+    assert build_tasks.validate_historical(t, good) == []
+    broken = json.loads(json.dumps(good))                    # fails before pytest: no report at all
+    broken["hidden_tests"]["cmd"] = f"{sys.executable} -c 'import no_such_module' && " + good["hidden_tests"]["cmd"]
+    assert any("hist/base" in p for p in build_tasks.validate_historical(t, broken))
+    wrong = json.loads(json.dumps(good))                     # bug tests declared but another test fails instead
+    (t / "task.json").write_text(json.dumps({"id": "hist", "kind": "historical",
+                                             "bug_tests": ["tests/test_bug.py::test_neg", "tests/test_old.py::test_one"]}))
+    assert any("hist/base" in p for p in build_tasks.validate_historical(t, wrong))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")
+def test_feature_validation_allows_old_tests_the_feature_changes(tmp_path):
+    """A feature may change behaviour the base's own tests asserted: the reference only has to pass the feature's
+    suite. The base has to fail it (here at import, since the new function does not exist yet)."""
+    sys.path.insert(0, os.path.join(ROOT, "lab", "tasks"))
+    import build_tasks
+    t = tmp_path / "feat"
+    (t / "base" / "src").mkdir(parents=True)
+    (t / "base" / "tests").mkdir()
+    (t / "base" / "src" / "m.py").write_text("def f(x):\n    raise TypeError(x)\n")
+    (t / "base" / "tests" / "test_old.py").write_text(
+        "import pytest\nfrom m import f\ndef test_rejects():\n    with pytest.raises(TypeError):\n        f(1)\n")
+    (t / "ref" / "src").mkdir(parents=True)
+    (t / "ref" / "src" / "m.py").write_text("def f(x):\n    return x\ndef g():\n    return 2\n")
+    (t / "hidden" / "tests").mkdir(parents=True)
+    (t / "hidden" / "tests" / "test_new.py").write_text(
+        "from m import f, g\ndef test_f():\n    assert f(1) == 1\ndef test_g():\n    assert g() == 2\n")
+    (t / "task.json").write_text(json.dumps({"id": "feat", "kind": "historical", "feature": True,
+                                             "bug_tests": ["tests/test_new.py::test_f", "tests/test_new.py::test_g"]}))
+    py = f"PYTHONPATH=src {sys.executable} -m pytest -q -p no:cacheprovider tests"
+    m = {"public_tests": py, "hidden_tests": {"expected_tests": 2,
+                                               "cmd": "rm -rf tests && cp -R {hidden}/tests tests && " + py}}
+    assert build_tasks.validate_historical(t, m) == []
+    (t / "task.json").write_text(json.dumps({"id": "feat", "kind": "historical",
+                                             "bug_tests": ["tests/test_new.py::test_f", "tests/test_new.py::test_g"]}))
+    assert any("feat/" in p for p in build_tasks.validate_historical(t, m))   # as a bug fix it is not valid
+
+
+def test_mode_can_set_its_own_effort(task):
+    modes, _ = lab.load_modes()
+    assert lab.effort_for(modes, "A") == "high" and lab.effort_for(modes, "Am") == "medium"
+    cmd = lab.claude_cmd(modes, "s.json", "Am")
+    assert cmd[cmd.index("--effort") + 1] == "medium" and "--advisor" in cmd
+    r = lab.attempt(task, "Am")
+    assert r["config"]["effort_requested"] == "medium" and r["valid"] is True, r["integrity"]
+    a = lab.attempt(task, "A")
+    assert lab.experiment_key(a) != lab.experiment_key(r)
