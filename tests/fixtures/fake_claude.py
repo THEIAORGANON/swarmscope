@@ -64,6 +64,15 @@ out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model"
      "claude_code_version": MODES["claude_code"], "skills": json.loads(os.environ.get("FAKE_SKILLS", "[]")),
      "slash_commands": [], "plugins": [{"name": "cc-plugin-telemetry", "path": "builtin",
                                         "source": "cc-plugin-telemetry@builtin"}]})
+if os.environ.get("FAKE_FLAKY_FILE"):           # the first session fails mid-way with an API error, limits allowed
+    flag = Path(os.environ["FAKE_FLAKY_FILE"])
+    if not flag.exists():
+        flag.write_text("failed once")
+        out({"type": "rate_limit_event", "session_id": sid, "rate_limit_info": {"status": "allowed",
+             "rateLimitType": "five_hour"}})
+        out({"type": "result", "subtype": "success", "is_error": True, "session_id": sid, "total_cost_usd": 0.17,
+             "num_turns": 7, "modelUsage": {model: {}}, "permission_denials": [], "terminal_reason": "api_error"})
+        sys.exit(1)
 RL = os.environ.get("FAKE_RATE_LIMIT")
 if RL:                                           # a rejected rate-limit event, as Claude Code 2.1.326 writes it
     out({"type": "rate_limit_event", "session_id": sid, "rate_limit_info": {

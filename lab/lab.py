@@ -501,6 +501,13 @@ def parse_stream(path):
 API_FAILURES = ("api_error", "api_interrupted")
 
 
+def transient_api_failure(rj):
+    """An API failure after work had begun while no rate limit was rejected: worth one retry of the same slot."""
+    if rj.get("session_status") != "api_interrupted":
+        return False
+    return not any((e or {}).get("status") == "rejected" for e in rj.get("rate_limit_events") or [])
+
+
 def api_failure(result, rate_limits=()):
     """(status, reason) when the session ended on an API failure, else None. Decided by the terminal result only:
     a rejected rate-limit event in a session that still finished normally changes nothing.
@@ -1306,7 +1313,9 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None):
             continue
         if not (rj.get("finished_at") and rj.get("verdict")):
             continue
-        runs[(rj.get("task_id"), plan.get("batch_id"), plan.get("repeat"), rj.get("mode"))] = rj
+        key = (rj.get("task_id"), plan.get("batch_id"), plan.get("repeat"), rj.get("mode"))
+        if key not in runs or (rj.get("valid") and not runs[key].get("valid")):   # a retry replaces an invalid run
+            runs[key] = rj
 
     def view(rj):
         c, h = rj.get("costs") or {}, (rj.get("tests") or {}).get("hidden") or {}
@@ -1708,9 +1717,17 @@ def cmd_batch(a):
     mpath.write_text(json.dumps(manifest, indent=2))
     print(f"batch {batch_id} seed {a.seed}: " + ", ".join(f"{m}#{r}" for m, r in order))
     for i, (m, r) in enumerate(order):
-        rj = attempt(task, m, plan={"batch_id": batch_id, "seed": a.seed, "position": i, "repeat": r,
-                                    "paired": bool(getattr(a, "paired", False)),
-                                    "order": [f"{x}#{y}" for x, y in order]}, expect=expect)
+        plan = {"batch_id": batch_id, "seed": a.seed, "position": i, "repeat": r,
+                "paired": bool(getattr(a, "paired", False)), "order": [f"{x}#{y}" for x, y in order]}
+        rj = attempt(task, m, plan=plan, expect=expect)
+        if transient_api_failure(rj):
+            # 18.11: one API error mid-session (limits allowed) stopped a night's series; such a run is invalid,
+            # the same slot is run once more and the batch goes on. A second failure stops it as before.
+            manifest["runs"].append({"run_id": rj["run_id"], "mode": m, "repeat": r, "valid": False,
+                                     "success": False, "replaced_by_retry": True})
+            mpath.write_text(json.dumps(manifest, indent=2))
+            print(f"retrying {m}#{r}: {rj['session_status']} with rate limits allowed ({rj['run_id']})")
+            rj = attempt(task, m, plan=dict(plan, retry_of=rj["run_id"]), expect=expect)
         manifest["runs"].append({"run_id": rj["run_id"], "mode": m, "repeat": r, "valid": rj.get("valid"),
                                  "success": rj.get("success")})
         manifest["valid"] &= bool(rj.get("valid"))

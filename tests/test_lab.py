@@ -92,7 +92,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -1011,3 +1011,27 @@ def test_pair_report_counts_only_valid_pairs_and_every_valid_run_cost():
     assert round(t["mean_diff_usd"], 3) == round(((0.30 - 0.10) + (0.25 - 0.20)) / 2, 3)
     assert (t["A_success"], t["B_success"]) == (1, 2)
     assert t["pairs"][0]["B"]["extra_stops"] == 1 and t["pairs"][0]["B"]["first_stop_would_consult"] is True
+
+
+
+def test_transient_api_failure_is_retried_once_and_the_batch_goes_on(task, monkeypatch, tmp_path, capsys):
+    """18.11 night: one api_interrupted run (rate limits allowed) stopped the pilot after its first task."""
+    monkeypatch.setenv("FAKE_FLAKY_FILE", str(tmp_path / "flaky"))
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "1", "--seed", "1",
+                     "--paired"]) == 0
+    out = capsys.readouterr().out
+    assert "retrying" in out and "stopping the batch" not in out
+    m = json.loads(next((lab.lab_root() / "batches").glob("*.json")).read_text())
+    assert [x.get("replaced_by_retry", False) for x in m["runs"]] == [True, False, False] and m["valid"] is True
+    runs = [json.loads(f.read_text()) for f in (lab.lab_root() / "runs").glob("*/run.json")]
+    retry = [r for r in runs if (r.get("plan") or {}).get("retry_of")]
+    assert len(retry) == 1 and retry[0]["valid"] is True
+    t = lab.pair_report(runs)[task["task_id"]]
+    assert len(t["pairs"]) == 1 and t["invalid_pairs"] == 0
+
+
+def test_rate_limited_interruption_still_stops_the_batch(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_RATE_LIMIT", "mid")
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A", "--repeats", "2", "--seed", "1"]) == 1
+    out = capsys.readouterr().out
+    assert "retrying" not in out and "stopping the batch: api_interrupted" in out
