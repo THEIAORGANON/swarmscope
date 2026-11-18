@@ -18,6 +18,16 @@ sys.path.insert(0, os.path.join(ROOT, "lab"))
 import lab  # noqa: E402
 
 FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_claude.py")
+
+
+def fake_launcher(tmp_path):
+    """The fake claude, started through the test's own interpreter: the fixture's executable bit is not relied on
+    (a copy of the repo written with mode 0644 made 45 tests fail with PermissionError on the lab Mac, 18.11)."""
+    launcher = tmp_path / "bin" / "claude"
+    launcher.parent.mkdir(exist_ok=True)
+    launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+    launcher.chmod(0o755)
+    return str(launcher)
 KEY = "apikey_LABTEST_never_in_the_agent_env"
 
 
@@ -90,7 +100,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     p.write_text(json.dumps(t))
     monkeypatch.setenv("SWARMSCOPE_LAB", str(tmp_path / "home" / "lab"))
     monkeypatch.setenv("SWARMSCOPE_WORK_ROOT", str(tmp_path / "w"))
-    monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", FAKE)
+    monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
     monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS")
