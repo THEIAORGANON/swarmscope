@@ -863,11 +863,10 @@ def test_hidden_bug_tests_and_regressions_are_reported_apart(task, monkeypatch):
     assert c["bug_fixed"] == [False] and c["regressions"] == [1]
 
 
-def test_screen_runs_batches_side_by_side(task, monkeypatch, capsys):
-    monkeypatch.setenv("FAKE_SLEEP", "1")
+def test_screen_runs_batches_one_after_another(task, capsys):
     second = Path(task["_file"]).with_name("task2.json")
     second.write_text(json.dumps(dict(json.loads(Path(task["_file"]).read_text()), task_id="t2")))
-    assert lab.main(["screen", "--tasks", f"{task['_file']},{second}", "--seed", "3", "--jobs", "2"]) == 0
+    assert lab.main(["screen", "--tasks", f"{task['_file']},{second}", "--seed", "3"]) == 0
     out = capsys.readouterr().out
     assert out.count("started ") == 2 and out.count("VALID") == 2 and "2/2 batches all valid" in out
     batches = list((lab.lab_root() / "batches").glob("*.json"))
@@ -902,9 +901,11 @@ def test_check_copies_live_apart_and_are_denied_to_the_agent(task, monkeypatch):
     assert any(a.startswith(str(work) + "/") for a in fs["allowRead"])         # ... its own dir re-opened
 
 
-def test_screen_refuses_the_same_task_twice_side_by_side(task, capsys):
-    assert lab.main(["screen", "--tasks", f"{task['_file']},{task['_file']}", "--seed", "3", "--jobs", "2"]) == 2
-    assert "a task appears twice" in capsys.readouterr().out
+def test_screen_refuses_sessions_side_by_side(task, capsys):
+    """Review of PR #5: the Read tool is not kept out of sibling work dirs, so no parallel sessions for now."""
+    assert lab.main(["screen", "--tasks", task["_file"], "--seed", "3", "--jobs", "2"]) == 2
+    out = capsys.readouterr().out
+    assert "--jobs > 1 is disabled" in out and "started" not in out
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pytest") is None, reason="needs pytest")

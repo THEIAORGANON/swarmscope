@@ -1631,9 +1631,10 @@ def cmd_screen(a):
     own runs, work dirs and batch manifest). Faster wall time for picking tasks; final mode comparisons should
     still run as ordinary batches. Stops starting new batches after an API failure or a batch that did not start."""
     tasks = [t.strip() for t in a.tasks.split(",") if t.strip()]
-    if a.jobs > 1 and len({str(load_task(t)["task_id"]) for t in tasks}) != len(tasks):
-        # the Read tool cannot be kept out of sibling work dirs (deny beats allow); different tasks only
-        print("screen: a task appears twice; side by side only different tasks may run (use --jobs 1 or a batch)")
+    if a.jobs > 1:
+        # Bash is kept out of sibling work dirs, the Read tool is not (deny beats allow), and a later base of one
+        # packaging task can hold the fix of another: no sessions side by side until that is closed (review of #5)
+        print("screen: --jobs > 1 is disabled until the Read tool is isolated from sibling sessions; use --jobs 1")
         return 2
     for t in tasks:
         load_task(t)                              # unknown task: fail before anything starts
@@ -1706,7 +1707,7 @@ def main(argv=None):
     sc.add_argument("--modes", default="A")
     sc.add_argument("--repeats", type=int, default=1)
     sc.add_argument("--seed", type=int, required=True)
-    sc.add_argument("--jobs", type=int, default=3)
+    sc.add_argument("--jobs", type=int, default=1)
     sub.add_parser("summary")
     c = sub.add_parser("calib")
     c.add_argument("--mode", default="A")
