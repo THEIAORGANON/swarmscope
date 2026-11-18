@@ -12,6 +12,8 @@ of the final snapshot after the session, and one run.json.
   python lab/lab.py batch  --task T --modes A,B --repeats 1 --seed 1
   python lab/lab.py summary
   python lab/lab.py screen --tasks T1,T2,... --seed S [--jobs 3] [--modes A] [--repeats 1]   batches side by side
+  python lab/lab.py batch  --task T --modes A,B --repeats 3 --seed S --paired   pairs, random order inside each
+  python lab/lab.py pairs  [--modes A,B] [--batch ID ...] [--json]            paired B - A cost per task
   python lab/lab.py calib  [--mode A] [--json]   per task: successes, hidden tests passed, which ones failed
 
 Runner side (the agent can neither read nor write it): $SWARMSCOPE_LAB or ~/Downloads/swarmscope-lab
@@ -1291,6 +1293,89 @@ def calibration(run_jsons, mode="A", batch=None):
     return out
 
 
+def pair_report(run_jsons, modes=("A", "B"), batches=None):
+    """Paired comparison of two modes: within a paired batch, repeat r of mode A and of mode B form a pair. Only
+    pairs with both runs valid count; every valid run's cost counts, failed or not. Per task: the pairs, the mean
+    B - A cost, successes, regressions, session time, B's cost split (Sonnet / Opus), Jev's advice at the first Stop
+    and the extra Stops an intervention created."""
+    ma, mb = modes
+    runs = {}
+    for rj in run_jsons:
+        plan = rj.get("plan") or {}
+        if not plan.get("paired") or rj.get("mode") not in modes or (batches and plan.get("batch_id") not in batches):
+            continue
+        if not (rj.get("finished_at") and rj.get("verdict")):
+            continue
+        runs[(rj.get("task_id"), plan.get("batch_id"), plan.get("repeat"), rj.get("mode"))] = rj
+
+    def view(rj):
+        c, h = rj.get("costs") or {}, (rj.get("tests") or {}).get("hidden") or {}
+        bm = c.get("by_model") or {}
+        answers = (rj.get("jev") or {}).get("answers") or []
+        stops = (rj.get("decisions") or {}).get("stops") or 0
+        return {"run_id": rj.get("run_id"), "valid": bool(rj.get("valid")), "success": bool(rj.get("success")),
+                "usd": c.get("claude_code_total_usd"), "sonnet_usd": (bm.get("lead") or {}).get("usd"),
+                "opus_usd": (bm.get("advisor") or {}).get("usd"),
+                "regressions": len(h.get("regressions") or []), "session_s": (rj.get("session") or {}).get("wall_s"),
+                "first_stop_would_consult": answers[0].get("would_consult") if answers else None,
+                "extra_stops": max(stops - 1, 0), "blocks": (rj.get("decisions") or {}).get("blocks"),
+                "advisor_called": (rj.get("advisor") or {}).get("called")}
+    out = {}
+    for (task, batch, rep_, mode), rj in runs.items():
+        if mode != ma or (task, batch, rep_, mb) not in runs:
+            continue
+        a, b = view(rj), view(runs[(task, batch, rep_, mb)])
+        t = out.setdefault(task, {"pairs": [], "invalid_pairs": 0})
+        if not (a["valid"] and b["valid"]) or a["usd"] is None or b["usd"] is None:
+            t["invalid_pairs"] += 1
+            continue
+        t["pairs"].append({"batch": batch, "repeat": rep_, ma: a, mb: b, "diff_usd": b["usd"] - a["usd"]})
+    for t in out.values():
+        p = t["pairs"]
+        t["mean_diff_usd"] = sum(x["diff_usd"] for x in p) / len(p) if p else None
+        for m in modes:
+            t[f"{m}_success"] = sum(x[m]["success"] for x in p)
+            t[f"{m}_usd_total"] = sum(x[m]["usd"] for x in p)
+    return out
+
+
+def cmd_pairs(a):
+    runs = []
+    for p in sorted((lab_root() / "runs").glob("*/run.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            runs.append(json.loads(p.read_text()))
+        except Exception as e:
+            print(f"{p.parent.name}: unreadable ({e})")
+    modes = tuple(m.strip() for m in a.modes.split(","))
+    table = pair_report(runs, modes, set(a.batch) if a.batch else None)
+    if a.json:
+        print(json.dumps(table, indent=2))
+        return 0
+    ma, mb = modes
+    total = {ma: 0.0, mb: 0.0, "pairs": 0}
+    for task, t in sorted(table.items()):
+        n = len(t["pairs"])
+        if n:
+            total[ma] += t[f"{ma}_usd_total"]
+            total[mb] += t[f"{mb}_usd_total"]
+            total["pairs"] += n
+        md = f"{t['mean_diff_usd']:+.3f}" if t["mean_diff_usd"] is not None else "-"
+        print(f"{task:<14} pairs {n}  mean {mb}-{ma} ${md}  success {ma} {t[f'{ma}_success']}/{n} {mb} {t[f'{mb}_success']}/{n}"
+              + (f"  (+{t['invalid_pairs']} invalid)" if t["invalid_pairs"] else ""))
+        for x in t["pairs"]:
+            A, B = x[ma], x[mb]
+            print(f"    #{x['repeat']} {ma} ${A['usd']:.3f} {A['session_s']:.0f}s regr {A['regressions']}  |  "
+                  f"{mb} ${B['usd']:.3f} (sonnet ${B['sonnet_usd'] or 0:.3f}, opus ${B['opus_usd'] or 0:.3f}) "
+                  f"{B['session_s']:.0f}s regr {B['regressions']} blocks {B['blocks']} extra stops {B['extra_stops']}  |  "
+                  f"jev@1st stop {ma} {A['first_stop_would_consult']} {mb} {B['first_stop_would_consult']}")
+    if total["pairs"]:
+        print(f"total over {total['pairs']} pairs: {ma} ${total[ma]:.2f}  {mb} ${total[mb]:.2f}  "
+              f"mean {mb}-{ma} ${(total[mb] - total[ma]) / total['pairs']:+.3f}")
+    else:
+        print("no valid pairs")
+    return 0
+
+
 def cmd_calib(a):
     runs = []
     for p in sorted((lab_root() / "runs").glob("*/run.json"), key=lambda p: p.stat().st_mtime):
@@ -1602,11 +1687,21 @@ def cmd_batch(a):
     task = load_task(a.task)
     modes_cfg, modes_sha = load_modes()
     modes = [m.strip() for m in a.modes.split(",") if m.strip()]
-    order = [(m, r + 1) for m in modes for r in range(a.repeats)]
-    random.Random(a.seed).shuffle(order)
+    rng = random.Random(a.seed)
+    if getattr(a, "paired", False):
+        # pairs: repeat r runs every mode once, back to back, in a random order of its own
+        order = []
+        for r in range(a.repeats):
+            pair = [(m, r + 1) for m in modes]
+            rng.shuffle(pair)
+            order += pair
+    else:
+        order = [(m, r + 1) for m in modes for r in range(a.repeats)]
+        rng.shuffle(order)
     batch_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]   # unique when batches run side by side
     expect = batch_expect(task, modes_sha)
-    manifest = {"batch_id": batch_id, "seed": a.seed, "task": task["task_id"], "order": order, "expect": expect,
+    manifest = {"batch_id": batch_id, "seed": a.seed, "paired": bool(getattr(a, "paired", False)), "task": task["task_id"], "order": order,
+                "expect": expect,
                 "runs": [], "valid": True}
     mpath = lab_root() / "batches" / f"{batch_id}.json"
     mpath.parent.mkdir(parents=True, exist_ok=True)
@@ -1614,6 +1709,7 @@ def cmd_batch(a):
     print(f"batch {batch_id} seed {a.seed}: " + ", ".join(f"{m}#{r}" for m, r in order))
     for i, (m, r) in enumerate(order):
         rj = attempt(task, m, plan={"batch_id": batch_id, "seed": a.seed, "position": i, "repeat": r,
+                                    "paired": bool(getattr(a, "paired", False)),
                                     "order": [f"{x}#{y}" for x, y in order]}, expect=expect)
         manifest["runs"].append({"run_id": rj["run_id"], "mode": m, "repeat": r, "valid": rj.get("valid"),
                                  "success": rj.get("success")})
@@ -1702,6 +1798,11 @@ def main(argv=None):
     b.add_argument("--modes", default="A,B")
     b.add_argument("--repeats", type=int, default=1)
     b.add_argument("--seed", type=int, required=True)
+    b.add_argument("--paired", action="store_true", help="each repeat runs every mode once, in a random order")
+    pr = sub.add_parser("pairs")
+    pr.add_argument("--modes", default="A,B")
+    pr.add_argument("--batch", action="append", help="only these batch ids (repeatable)")
+    pr.add_argument("--json", action="store_true")
     sc = sub.add_parser("screen")
     sc.add_argument("--tasks", required=True, help="comma-separated task ids or manifest paths")
     sc.add_argument("--modes", default="A")
@@ -1715,7 +1816,7 @@ def main(argv=None):
     c.add_argument("--batch", help="only this batch id")
     a = ap.parse_args(argv)
     return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch,
-            "calib": cmd_calib, "screen": cmd_screen, "summary": cmd_summary}[a.cmd](a) or 0
+            "calib": cmd_calib, "pairs": cmd_pairs, "screen": cmd_screen, "summary": cmd_summary}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":

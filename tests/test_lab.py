@@ -976,3 +976,38 @@ def test_mode_can_set_its_own_effort(task):
     assert r["config"]["effort_requested"] == "medium" and r["valid"] is True, r["integrity"]
     a = lab.attempt(task, "A")
     assert lab.experiment_key(a) != lab.experiment_key(r)
+
+
+# --- pilot: cost of B against A, in pairs ----------------------------------------------------------------------
+
+def test_paired_batch_orders_each_pair_on_its_own(task):
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "A,B", "--repeats", "3", "--seed", "7",
+                     "--paired"]) == 0
+    m = json.loads(next((lab.lab_root() / "batches").glob("*.json")).read_text())
+    assert m["paired"] is True
+    pairs = [m["order"][i:i + 2] for i in range(0, 6, 2)]
+    assert all(sorted(x[0] for x in p) == ["A", "B"] and p[0][1] == p[1][1] for p in pairs)
+    assert [p[0][1] for p in pairs] == [1, 2, 3]
+    report = lab.pair_report([json.loads(f.read_text()) for f in (lab.lab_root() / "runs").glob("*/run.json")])
+    t = report[task["task_id"]]
+    assert len(t["pairs"]) == 3 and t["invalid_pairs"] == 0
+    # the fake agent consults the advisor only when B blocks a Stop: B costs more in every pair
+    assert all(x["diff_usd"] > 0 for x in t["pairs"]) and t["mean_diff_usd"] > 0
+    assert all(x["B"]["opus_usd"] and not x["A"]["opus_usd"] for x in t["pairs"])
+
+
+def test_pair_report_counts_only_valid_pairs_and_every_valid_run_cost():
+    def rj(mode, rep_, usd, valid=True, success=True, batch="p1"):
+        return {"run_id": f"{mode}{rep_}{batch}", "task_id": "pk-x", "mode": mode, "valid": valid, "success": success,
+                "plan": {"paired": True, "batch_id": batch, "repeat": rep_}, "finished_at": "x", "verdict": {"task_passed": success},
+                "costs": {"claude_code_total_usd": usd, "by_model": {"lead": {"usd": usd}}},
+                "session": {"wall_s": 60}, "tests": {"hidden": {"regressions": []}},
+                "decisions": {"stops": 2 if mode == "B" else 1, "blocks": 1 if mode == "B" else 0},
+                "jev": {"answers": [{"would_consult": mode == "B"}]}}
+    runs = [rj("A", 1, 0.10), rj("B", 1, 0.30), rj("A", 2, 0.20, success=False), rj("B", 2, 0.25),
+            rj("A", 3, 0.10), rj("B", 3, 0.50, valid=False), rj("A", 4, 0.1, batch="other")]
+    t = lab.pair_report(runs)["pk-x"]
+    assert len(t["pairs"]) == 2 and t["invalid_pairs"] == 1
+    assert round(t["mean_diff_usd"], 3) == round(((0.30 - 0.10) + (0.25 - 0.20)) / 2, 3)
+    assert (t["A_success"], t["B_success"]) == (1, 2)
+    assert t["pairs"][0]["B"]["extra_stops"] == 1 and t["pairs"][0]["B"]["first_stop_would_consult"] is True

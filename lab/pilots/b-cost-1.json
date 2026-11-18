@@ -1,0 +1,18 @@
+{
+  "pilot": "b-cost-1",
+  "declared": "2026-11-18, before any run of this series",
+  "question": "What does policy B (Rules Engine b-5 enforcing R1/R2/R3 via the Stop hook) cost against A (observe only) on tasks A solves reliably, at the same effort?",
+  "primary_metric": "mean paired difference B - A of claude_code_total_usd per task; every valid run counts, failed or not",
+  "secondary": ["success and regressions per mode", "session wall time", "B's cost split: Sonnet / Opus", "Jev advice (would_consult) at the first Stop of every run; Stops after a B block counted apart", "blocks and extra Stops in B"],
+  "modes": ["A", "B"],
+  "effort": "high (both modes; modes.json m-6)",
+  "jev": {"question_version": "q-consult-2", "threshold": 0.5, "model": "jev-1.14.0 (as seen in run.json of the screening runs)"},
+  "design": "6 tasks x 3 pairs; inside each pair the order of A and B is random (batch --paired); one task after another, sequentially, on one machine; no parallel sessions",
+  "tasks": {
+    "consult_seen_in_observe": {"pkf-prepared": "R3 triggered (A, 17-18.11)", "pkf-extras": "R1 + R3 triggered", "ckf-spec": "R1 + R3 triggered"},
+    "no_consult_seen": {"pk-range": "R1 triggered only", "ck-envvar": "R1 triggered only", "pk-specset": "no rule triggered"}
+  },
+  "caveat": "the consult group is all features and the other group all bug fixes (in observe, R3 never triggered on a bug fix): group and task type are confounded",
+  "seeds": {"pkf-prepared": 101, "pkf-extras": 102, "ckf-spec": 103, "pk-range": 104, "ck-envvar": 105, "pk-specset": 106},
+  "report": "python lab/lab.py pairs --modes A,B (optionally --batch for each of the six batches)"
+}
