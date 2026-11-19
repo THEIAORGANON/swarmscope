@@ -1,12 +1,16 @@
-"""Optional allow-list for the tools that read files (lab runs only).
+"""Allow-list for the tools that read files (lab runs only).
 
-When SWARMSCOPE_READ_GUARD is set (JSON: {"allow": [dirs]}), hook.py asks check() at every PreToolUse of a
-reading tool and denies the call unless every path it can reach lies in an allowed dir or in the session's own
+Run as its own PreToolUse command hook for the reading tools, with onFailure "block": SWARMSCOPE_READ_GUARD
+(JSON: {"allow": [dirs]}) names the allowed dirs, and a call is denied unless every path it can reach lies in an allowed dir or in the session's own
 spilled tool outputs (<project folder>/<session id>/tool-results, the project folder being the transcript's).
 The settings' Read denies cannot name what appears only after they were written; this guard decides on the
-path as it is when the tool runs. Paths are resolved through symlinks. Errors deny (fail closed)."""
+path as it is when the tool runs. Paths are resolved through symlinks.
+Failure: nothing is swallowed in main(): an error before the decision (import, bad spec, bad input) exits 1 and
+Claude Code blocks the call (onFailure "block"), as it does for a timeout or a failed start. Inside check() an
+error is a deny."""
 import json
 import os
+import sys
 
 READ_TOOLS = ("Read", "Glob", "Grep", "LS", "NotebookRead")
 GLOB_CHARS = set("*?[{")
@@ -41,6 +45,10 @@ def targets(tool, ti, cwd):
             break
         fixed.append(seg)
     head = "/".join(fixed)
+    if pat.startswith("/"):
+        head = head or "/"                     # "/[U]sers/..." or "/*/...": the fixed part is the root itself
+    elif pat.startswith("~"):
+        return [], f"glob pattern starts with ~: {pat}"
     root = _real(head, base) if head else base
     return [root], None
 
@@ -74,3 +82,16 @@ def spec_from_env():
 def deny_output(reason):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": f"swarmscope lab: {reason}"}}
+
+
+def main():
+    spec = json.loads(os.environ["SWARMSCOPE_READ_GUARD"])       # missing or broken: an error, so a block
+    d = json.load(sys.stdin)
+    reason = check(d, spec)
+    if reason:
+        sys.stdout.write(json.dumps(deny_output(reason)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

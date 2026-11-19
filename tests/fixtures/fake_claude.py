@@ -54,22 +54,54 @@ def iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
 
 
-def hook(ev, **kw):
-    if "hooks" not in settings:
-        return None
-    d = dict(session_id=sid, hook_event_name=ev, cwd=cwd, transcript_path=str(tp), **kw)
-    h = settings["hooks"][ev][0]["hooks"][0]
+def _matches(matcher, tool):
+    return not matcher or matcher == "*" or (tool is not None and re.fullmatch(matcher, tool) is not None)
+
+
+def _run_one(h, d, ev):
+    """(output, failure) for one command hook, as Claude Code runs it: a failed start, an exit other than 0 or 2,
+    a timeout or invalid JSON is a failure; a hook past its timeout is killed and its output ignored."""
     p = subprocess.Popen(h["command"], shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:            # as Claude Code: a hook past its timeout is killed and its output ignored (a Stop goes through)
-        stdout, _ = p.communicate(json.dumps(d), timeout=h.get("timeout", 60))
+    try:
+        stdout, stderr = p.communicate(json.dumps(d), timeout=h.get("timeout", 60))
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
         p.communicate()
         with open(os.environ.get("FAKE_HOOK_KILLS", os.devnull), "a") as f:
             f.write(ev + "\n")
+        return None, "timed out"
+    if p.returncode == 2:
+        return {"_exit2": stderr}, None
+    if p.returncode != 0:
+        return None, f"failed (exit {p.returncode}): {stderr.strip()[-200:]}"
+    try:
+        return (json.loads(stdout) if stdout.strip() else None), None
+    except ValueError:
+        return None, "invalid JSON output"
+
+
+def hook(ev, **kw):
+    """Every hook of the event whose matcher fits the tool; the first deny or block decides, else the last output.
+    onFailure "block": a failed hook blocks (returned as {"_blocked": why})."""
+    if "hooks" not in settings:
         return None
-    return json.loads(stdout) if stdout.strip() else None
+    d = dict(session_id=sid, hook_event_name=ev, cwd=cwd, transcript_path=str(tp), **kw)
+    last = None
+    for entry in settings["hooks"].get(ev, []):
+        if not _matches(entry.get("matcher"), kw.get("tool_name")):
+            continue
+        for h in entry["hooks"]:
+            res, failure = _run_one(h, d, ev)
+            if failure:
+                if h.get("onFailure") == "block":
+                    return {"_blocked": f"{ev} hook error: {failure}; blocking because onFailure is \"block\""}
+                continue
+            if res and (res.get("_exit2") is not None or
+                        (res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"):
+                return res
+            last = res if res is not None else last
+    return last
 
 
 out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": ["Bash", "Edit"],
@@ -183,6 +215,21 @@ if os.environ.get("FAKE_WEB"):                   # main: the session calls WebFe
         sub.mkdir(parents=True, exist_ok=True)
         web["message"]["model"] = "claude-haiku-5-5"
         (sub / "agent-web1.jsonl").write_text(json.dumps(web) + "\n")
+if os.environ.get("FAKE_GUARDED_READ"):          # a Read through the PreToolUse hooks, as Claude Code does it
+    inp = {"file_path": os.environ["FAKE_GUARDED_READ"]}
+    tr({"type": "assistant", "timestamp": iso(), "message": {"id": "mgr", "model": model, "content": [
+        {"type": "tool_use", "id": "tgr", "name": "Read", "input": inp}], "usage": {"input_tokens": 10, "output_tokens": 5}}})
+    res = hook("PreToolUse", tool_name="Read", tool_input=inp, tool_use_id="tgr")
+    refused = res and (res.get("_blocked") or res.get("_exit2") is not None or
+                       (res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny")
+    try:
+        text = json.dumps(res) if refused else Path(inp["file_path"]).read_text()
+    except OSError as e:
+        text = f"read failed: {e}"
+    tr({"type": "user", "timestamp": iso(), "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tgr", "is_error": bool(refused), "content": text}]}})
+    with open(os.environ.get("FAKE_GUARDED_LOG", os.devnull), "a") as f:
+        f.write(json.dumps({"refused": bool(refused), "res": res}) + "\n")
 if os.environ.get("FAKE_READ_OUTSIDE"):          # a Read that succeeds on a file outside the working copy
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "mro", "model": model, "content": [
         {"type": "tool_use", "id": "tro", "name": "Read", "input": {"file_path": os.environ["FAKE_READ_OUTSIDE"]}}],

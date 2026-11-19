@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -214,6 +214,66 @@ def test_read_denies_leave_open_only_the_sessions_own_spilled_tool_outputs(task)
     r = lab.attempt(task, "A")
     deny = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())["permissions"]["deny"]
     assert _denied(deny, odd / "f", "Read") and not _denied(deny, home / "weXrdyname" / "f", "Read")
+
+
+def _guarded(task, monkeypatch, tmp_path, target, wrap=None):
+    log = tmp_path / "guarded.jsonl"
+    monkeypatch.setenv("FAKE_GUARDED_READ", str(target))
+    monkeypatch.setenv("FAKE_GUARDED_LOG", str(log))
+    if wrap:
+        real = lab.read_guard_hook
+        monkeypatch.setattr(lab, "read_guard_hook", lambda work, task: wrap(real(work, task)))
+    r = lab.attempt(task, "A")
+    settings = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    return r, json.loads(log.read_text().splitlines()[-1]), settings
+
+
+def test_read_guard_is_its_own_fail_closed_hook_for_the_reading_tools(task, monkeypatch, tmp_path):
+    outside = Path.home() / "late-secret.txt"                       # appears after the settings, no deny names it
+    outside.write_text("s")
+    r, g, settings = _guarded(task, monkeypatch, tmp_path, outside)
+    pre = settings["hooks"]["PreToolUse"]
+    assert pre[0]["matcher"] == lab.READ_GUARD_MATCHER and pre[0]["hooks"][0]["onFailure"] == "block"
+    assert "readguard.py" in pre[0]["hooks"][0]["command"] and pre[1]["matcher"] == "*"
+    assert g["refused"] and "outside the working copy" in json.dumps(g["res"])
+    assert r["observation"]["reads_outside"] == []                   # refused, so nothing read
+
+
+def test_read_guard_error_before_the_decision_blocks_the_read(task, monkeypatch, tmp_path):
+    # review of PR #8 (P1): an import error before the check let the read through with exit 0
+    outside = Path.home() / "late-secret.txt"
+    outside.write_text("s")
+
+    def broken(h):
+        h["hooks"][0]["command"] = h["hooks"][0]["command"].replace("SWARMSCOPE_READ_GUARD=", "X_UNUSED=")
+        return h
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, outside, broken)
+    assert g["refused"] and "blocking because onFailure" in g["res"]["_blocked"]
+
+
+def test_read_guard_timeout_blocks_the_read(task, monkeypatch, tmp_path):
+    outside = Path.home() / "late-secret.txt"
+    outside.write_text("s")
+
+    def slow(h):
+        h["hooks"][0]["command"] = "sleep 5; " + h["hooks"][0]["command"]
+        h["hooks"][0]["timeout"] = 1
+        return h
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, outside, slow)
+    assert g["refused"] and "timed out" in g["res"]["_blocked"]
+
+
+def test_read_guard_lets_the_working_copy_through(task, monkeypatch, tmp_path):
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, "src/inside.py")     # relative: inside the own copy
+    assert not g["refused"] and g["res"] in (None, {})
+    # a sibling run's copy beside it is outside
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, Path(lab.work_root(lab.load_modes()[0])) / "other" / "x")
+    assert g["refused"]
+
+
+def test_old_claude_code_is_refused(task, monkeypatch):
+    assert any("older than 2.1.295" in p for p in lab.check_init(
+        {"model": "m", "claude_code_version": "2.1.200"}, lab.load_modes()[0], "/tmp"))
 
 
 def test_reads_outside_the_working_copy_make_a_run_invalid(tmp_path):

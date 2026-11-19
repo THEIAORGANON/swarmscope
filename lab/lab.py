@@ -342,6 +342,16 @@ def not_clean(init):
     return out
 
 
+MIN_CLAUDE_CODE = (2, 1, 295)
+
+
+def version_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split(".")[:3])
+    except ValueError:
+        return (0,)
+
+
 def check_init(init, modes, work):
     """Every init field the runner can compare with what it asked for."""
     c, problems = modes["common"], []
@@ -355,6 +365,10 @@ def check_init(init, modes, work):
         problems.append(f"init permissionMode {init.get('permissionMode')} != {c['permission_mode']}")
     if c.get("claude_code") and init.get("claude_code_version") != c["claude_code"]:
         problems.append(f"Claude Code {init.get('claude_code_version')} != pinned {c['claude_code']}")
+    if version_tuple(init.get("claude_code_version")) < MIN_CLAUDE_CODE:
+        # older versions ignore onFailure: the read guard would fail open
+        problems.append(f"Claude Code {init.get('claude_code_version')} is older than "
+                        f"{'.'.join(map(str, MIN_CLAUDE_CODE))} (hook onFailure)")
     if c.get("expected_agents") is not None and sorted(init.get("agents") or []) != sorted(c["expected_agents"]):
         problems.append(f"init agents {sorted(init.get('agents') or [])} != expected {sorted(c['expected_agents'])}")
     if init.get("cwd") and Path(init["cwd"]).resolve() != Path(work).resolve():
@@ -485,6 +499,22 @@ def hook_timeout(event, modes=None):
     return int(jev_s + STOP_HOOK_BUDGET_S)
 
 
+READ_GUARD_TIMEOUT_S = 10
+
+
+def read_guard_hook(work, task):
+    """The PreToolUse hook entry for the reading tools: only the working copy, allow_read and the session's own
+    spilled outputs (readguard.py)."""
+    spec = {"allow": [str(work)] + [expand(p) for p in (task or {}).get("allow_read", [])]}
+    cmd = " ".join([f"SWARMSCOPE_READ_GUARD={shlex.quote(json.dumps(spec))}", shlex.quote(sys.executable),
+                    shlex.quote(str(REPO / "readguard.py"))])
+    return {"matcher": READ_GUARD_MATCHER,
+            "hooks": [{"type": "command", "command": cmd, "timeout": READ_GUARD_TIMEOUT_S, "onFailure": "block"}]}
+
+
+READ_GUARD_MATCHER = "^(Read|Glob|Grep|LS|NotebookRead)$"
+
+
 def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=None):
     env = [f"SWARMSCOPE_DIR={shlex.quote(str(sw))}", f"SWARMSCOPE_POLICY_FILE={shlex.quote(str(policy_file))}"]
     if summary:
@@ -492,10 +522,6 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
     test_ep = os.environ.get("SWARMSCOPE_JEV_TEST_ENDPOINT")    # tests only; jevshadow accepts loopback only
     if test_ep:
         env.append(f"SWARMSCOPE_JEV_TEST_ENDPOINT={shlex.quote(test_ep)}")
-    # reading tools: only the working copy, allow_read and the session's own spilled outputs, decided on the path
-    # as it is when the tool runs (readguard.py); the settings' Read denies below cannot name later paths
-    guard = {"allow": [str(work)] + [expand(p) for p in (task or {}).get("allow_read", [])]}
-    env.append(f"SWARMSCOPE_READ_GUARD={shlex.quote(json.dumps(guard))}")
     cmd = " ".join(env + [shlex.quote(sys.executable), shlex.quote(str(REPO / "hook.py"))])
     hooks = {}
     for ev in HOOK_EVENTS:
@@ -503,6 +529,10 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
         if ev in WITH_MATCHER:
             h["matcher"] = "*"
         hooks[ev] = [h]
+    # reading tools: a hook of their own (readguard.py) decides on the path as it is when the tool runs - the
+    # settings' Read denies below cannot name later paths. It swallows no error and fails closed: a failed start,
+    # an error exit or a timeout blocks the call (onFailure "block", Claude Code >= 2.1.295)
+    hooks["PreToolUse"].insert(0, read_guard_hook(work, task))
     # check copies (hidden tests) of every run, including runs beside this one; the Read/Edit tools and Bash
     denied = deny_paths(task, lab, extra=[str(check_root(modes))])
     allow_read = [expand(p) for p in (task or {}).get("allow_read", [])]
