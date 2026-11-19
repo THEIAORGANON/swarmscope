@@ -111,14 +111,16 @@ if "hooks" not in settings:                     # doctor --ping
     sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
 if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agent (FAKE_SKIP/LEAK/NET break it)
-    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool|Glob tool): (.+)$", prompt, re.M)
+    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool|Glob tool|Grep tool): (.+)$", prompt, re.M)
     skip = os.environ.get("FAKE_SKIP", "")
     leaked = ""
     for n, tool, arg in steps:
         if n == skip:
             continue
-        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob"}[tool]
+        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob", "Grep tool": "Grep"}[tool]
+        m = re.match(r"pattern (\S+) in path (.+)", arg)
         inp = ({"command": arg} if name == "Bash" else {"pattern": arg.replace("pattern ", "", 1)} if name == "Glob"
+               else {"pattern": m.group(1), "path": m.group(2)} if name == "Grep"
                else {"file_path": arg.split(" containing")[0].replace("create ", "")})
         spill = Path(str(tp)[:-6]) / "tool-results" / "b3euojfv4.txt"     # Claude Code's spilled long output
         if n == "12":
@@ -130,6 +132,8 @@ if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agen
         allowed = (n in ("10", "11", "12") or (n == "9" and os.environ.get("FAKE_NET"))
                    or (n == "14" and os.environ.get("FAKE_READ_TRANSCRIPT")))
         text = "ok" if n == "10" else ("<h1>Example Domain</h1>" if allowed else "Operation not permitted")
+        if os.environ.get("FAKE_NO_TOOL") == n:
+            text = "<tool_use_error>Error: No such tool available: Grep.</tool_use_error>"
         if n == "11":
             spill.parent.mkdir(parents=True, exist_ok=True)
             spill.write_text(arg + "\n")

@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -569,12 +569,19 @@ def test_probe_creates_late_paths_after_the_settings_and_cleans_them(task, capsy
     assert lab.main(["probe", "--task", task["_file"]]) == 0
     out = capsys.readouterr().out
     for k in ("17_tool_read_late_home", "18_tool_read_late_config", "19_tool_read_late_project",
-              "20_tool_read_other_session", "21_glob_pattern_late_home", "22_glob_pattern_climbs_out"):
+              "20_tool_read_other_session", "21_grep_late_home", "22_grep_climbs_out"):
         assert f"ok    step_{k}" in out
     assert not any("_probe-late-" in r for r in seen["deny"])           # unknown to the settings: truly late
     assert not list(Path.home().glob("_probe-late-*"))
     assert not list((lab.lab_root() / "config").glob("_probe-late-*"))
     assert not list((lab.lab_root() / "config" / "projects").glob("*/probe-other-session-*"))
+
+
+def test_probe_a_missing_tool_is_not_a_refusal(task, monkeypatch, capsys):
+    # live probe c157de6666: Glob did not exist in the session and its "No such tool" counted as refused
+    monkeypatch.setenv("FAKE_NO_TOOL", "21")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    assert "FAIL  step_21_grep_late_home  (tool not available" in capsys.readouterr().out
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):
