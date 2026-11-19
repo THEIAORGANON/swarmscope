@@ -37,11 +37,30 @@ def log_cmd(c):
     return c if len(c) <= 1200 else c[:500] + "\n…\n" + c[-600:]
 
 
+def guard_reads(d, ev):
+    """Lab runs: a reading tool outside the allowed dirs is denied before it runs (readguard.py); fail closed."""
+    try:
+        import readguard
+        reason = readguard.check(d, readguard.spec_from_env())
+    except Exception as e:
+        reason = f"read guard unavailable: {type(e).__name__}"
+        if d.get("tool_name") not in ("Read", "Glob", "Grep", "LS", "NotebookRead"):
+            reason = None
+    if reason:
+        ev["read_guard"] = reason[:200]
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": f"swarmscope lab: {reason}"}}))
+        sys.stdout.flush()
+
+
 def main():
     from common import ensure_dirs, session_file
     d = json.load(sys.stdin)
     sid = d.get("session_id") or "unknown"
     ev = {"ts": time.time(), "event": d.get("hook_event_name")}
+    if os.environ.get("SWARMSCOPE_READ_GUARD") and d.get("hook_event_name") == "PreToolUse":
+        guard_reads(d, ev)
     if ev["event"] in ("UserPromptSubmit", "SessionStart") and d.get("cwd"):
         ev["cwd"] = d["cwd"]                    # which project this session works on (window title)
     for k in ("tool_name", "tool_use_id", "agent_id", "agent_type", "source",

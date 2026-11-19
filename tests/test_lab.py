@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -233,10 +233,19 @@ def test_reads_outside_the_working_copy_make_a_run_invalid(tmp_path):
             use("2", "Read", {"file_path": "src/x.py"}), res("2"),
             use("3", "Read", {"file_path": str(tmp_path / "secret")}), res("3", err=True),     # refused
             use("4", "Grep", {"pattern": "k", "path": str(tmp_path / "projects")}), res("4"),
-            use("5", "Read", {"file_path": str(proj / "sess.jsonl")}), res("5")]
+            use("5", "Read", {"file_path": str(proj / "sess.jsonl")}), res("5"),
+            # review of PR #8: another session's outputs in the same project, and a Glob pattern leaving its path
+            use("6", "Read", {"file_path": str(proj / "other" / "tool-results" / "b.txt")}), res("6"),
+            use("7", "Glob", {"pattern": str(tmp_path / "secret") + "/*"}), res("7"),
+            use("8", "Glob", {"pattern": "src/*/../../../x/*"}), res("8"),
+            use("9", "Glob", {"pattern": "src/**/*.py"}), res("9")]
     tp.write_text("\n".join(json.dumps(x) for x in recs) + "\n")
     hits = lab.read_outside(str(tp), work)
-    assert sorted(h[2] for h in hits) == sorted([str(tmp_path / "projects"), str(proj / "sess.jsonl")])
+    paths = sorted(h[2] for h in hits)
+    assert str(tmp_path / "projects") in paths and str(proj / "sess.jsonl") in paths
+    assert str(proj / "other" / "tool-results" / "b.txt") in paths
+    assert str(tmp_path / "secret") in paths and any("climbs out" in p for p in paths)
+    assert len(hits) == 5                                                  # 1, 2, 3 (refused) and 9 are fine
 
 
 def test_working_copy_hides_the_experiment(task):
@@ -538,6 +547,34 @@ def test_a_read_outside_the_working_copy_makes_the_run_invalid(task, monkeypatch
     r = lab.attempt(task, "A")
     assert not r["valid"] and any("read outside" in p for p in r["integrity"])
     assert r["observation"]["reads_outside"][0][2] == str(secret.resolve())
+
+
+def test_probe_step_12_must_read_the_file_step_11_named(task, monkeypatch, capsys, tmp_path):
+    # review of PR #8: a successful Read of some other file must not pass step 12
+    other = tmp_path / "x" / "tool-results" / "other.txt"
+    monkeypatch.setenv("FAKE_SPILL_READ", str(other))
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    assert "FAIL  step_12_reads_the_file_of_step_11" in capsys.readouterr().out
+
+
+def test_probe_creates_late_paths_after_the_settings_and_cleans_them(task, capsys, monkeypatch):
+    seen = {}
+    real = lab.write_settings
+
+    def spy(run_dir, *a, **k):
+        p = real(run_dir, *a, **k)
+        seen["deny"] = json.loads(p.read_text())["permissions"]["deny"]
+        return p
+    monkeypatch.setattr(lab, "write_settings", spy)
+    assert lab.main(["probe", "--task", task["_file"]]) == 0
+    out = capsys.readouterr().out
+    for k in ("17_tool_read_late_home", "18_tool_read_late_config", "19_tool_read_late_project",
+              "20_tool_read_other_session", "21_glob_pattern_late_home", "22_glob_pattern_climbs_out"):
+        assert f"ok    step_{k}" in out
+    assert not any("_probe-late-" in r for r in seen["deny"])           # unknown to the settings: truly late
+    assert not list(Path.home().glob("_probe-late-*"))
+    assert not list((lab.lab_root() / "config").glob("_probe-late-*"))
+    assert not list((lab.lab_root() / "config" / "projects").glob("*/probe-other-session-*"))
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):

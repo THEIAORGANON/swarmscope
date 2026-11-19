@@ -111,17 +111,18 @@ if "hooks" not in settings:                     # doctor --ping
     sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
 if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agent (FAKE_SKIP/LEAK/NET break it)
-    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool): (.+)$", prompt, re.M)
+    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool|Glob tool): (.+)$", prompt, re.M)
     skip = os.environ.get("FAKE_SKIP", "")
     leaked = ""
     for n, tool, arg in steps:
         if n == skip:
             continue
-        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write"}[tool]
-        inp = {"command": arg} if name == "Bash" else {"file_path": arg.split(" containing")[0].replace("create ", "")}
+        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob"}[tool]
+        inp = ({"command": arg} if name == "Bash" else {"pattern": arg.replace("pattern ", "", 1)} if name == "Glob"
+               else {"file_path": arg.split(" containing")[0].replace("create ", "")})
         spill = Path(str(tp)[:-6]) / "tool-results" / "b3euojfv4.txt"     # Claude Code's spilled long output
         if n == "12":
-            inp = {"file_path": str(spill), "limit": 5}
+            inp = {"file_path": os.environ.get("FAKE_SPILL_READ") or str(spill), "limit": 5}
         elif n == "14":
             inp = {"file_path": str(tp), "limit": 5}
         elif n == "15":
