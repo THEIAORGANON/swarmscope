@@ -371,6 +371,12 @@ def check_init(init, modes, work):
                         f"{'.'.join(map(str, MIN_CLAUDE_CODE))} (hook onFailure)")
     if c.get("expected_agents") is not None and sorted(init.get("agents") or []) != sorted(c["expected_agents"]):
         problems.append(f"init agents {sorted(init.get('agents') or [])} != expected {sorted(c['expected_agents'])}")
+    # a tool not on the list may read past the read guard (Workflow, PR #8 review): the session's tool set changed
+    # without a version change (Glob 19.11, Grep 20.11), so every new tool makes the run invalid until reviewed
+    if c.get("allowed_tools") is not None:
+        new = sorted(set(init.get("tools") or []) - set(c["allowed_tools"]))
+        if new:
+            problems.append(f"init tools not on the allow-list (review them, then add to modes.json allowed_tools): {new}")
     if init.get("cwd") and Path(init["cwd"]).resolve() != Path(work).resolve():
         problems.append(f"session cwd {init['cwd']} is not the working copy")
     return problems
@@ -545,6 +551,7 @@ def write_settings(run_dir, sw, policy_file, work, task, lab, modes, summary=Non
     # no web from the main session or any subagent (the docs agent declares both): Bash's network is the sandbox's
     # business, but WebFetch and WebSearch run outside it; for historical tasks the upstream fix is public
     rules += list(WEB_TOOLS)
+    rules += list(UNGUARDED_TOOLS)
     settings = {
         "hooks": hooks,
         # acceptEdits auto-allows only "safe" sandboxed commands: interpreters (python3 -m unittest) needed approval
@@ -670,6 +677,10 @@ def rate_limit_events(path):
 # --- advisor: calls, results and which block they answer -------------------------------------------------
 
 WEB_TOOLS = ("WebFetch", "WebSearch")
+# tools that read files without the PreToolUse hook for reading tools: Workflow parses a script file and returns the
+# failing line (PR #8 review, 2.1.326) and so reads what only the read guard closes - another session's spilled
+# output in the run's own project folder. A deny removes it from the session and its subagents.
+UNGUARDED_TOOLS = ("Workflow",)
 
 
 def web_tool_uses(transcript):
@@ -2028,13 +2039,17 @@ def probe_steps(canary, runs, write_bash, write_tool, hidden, other_result=None,
             ("9_bash_network", "Bash", "example.com", True), ("10_bash_write_inside", "Bash", "inside.txt", False)] + spill
 
 
+# the subagent tool: init lists "Task", the model calls it "Agent" (live probe c0a75b5374, Claude Code 2.1.326)
+TASK_TOOLS = ("Task", "Agent")
+
+
 def judge_steps(calls, steps):
     """Each step needs an observed attempt with the named tool, in the main session (parent None) or, for a "sub"
     step, inside the subagent that a successful step-21 Task call started, and the expected outcome: an explicit
     error for a denied step, success for the allowed one. A skipped step is a failure, never a pass; so is a tool
     that does not exist ("No such tool available" proves nothing about the boundary)."""
     out, used = {}, set()
-    task = next((k for k, c in enumerate(calls) if c[0] == "Task" and c[3] is None
+    task = next((k for k, c in enumerate(calls) if c[0] in TASK_TOOLS and c[3] is None
                  and '"subagent_type": "grep"' in json.dumps(c[1], ensure_ascii=False)), None)
     task_id = calls[task][4] if task is not None else None
     for step in steps:
@@ -2043,9 +2058,17 @@ def judge_steps(calls, steps):
 
         def place(c):
             return c[3] is None if where == "main" else (task_id is not None and c[3] == task_id)
-        hit = next((k for k, c in enumerate(calls)
-                    if k not in used and c[0] == tool and place(c) and needle in json.dumps(c[1], ensure_ascii=False)),
-                   None)
+        names = TASK_TOOLS if tool == "Task" else (tool,)
+        hits = [k for k, c in enumerate(calls)
+                if k not in used and c[0] in names and place(c) and needle in json.dumps(c[1], ensure_ascii=False)]
+        hit = hits[0] if hits else None
+        # a denied step fails if ANY of its calls got through, not only the first (a failed first try, then a
+        # successful second one with the same path: PR #8 review)
+        through = next((calls[k][2] for k in hits if must_fail and calls[k][2] and not calls[k][2]["is_error"]), None)
+        if through is not None and calls[hit][2] and calls[hit][2]["is_error"]:
+            used.update(hits)
+            out[label] = {"ok": False, "why": "allowed on a later call: " + through["text"][:110]}
+            continue
         if hit is None:
             out[label] = {"ok": False, "why": "not attempted" + (" in the grep subagent" if where == "sub" else "")}
             continue

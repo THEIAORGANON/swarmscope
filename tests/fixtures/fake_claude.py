@@ -106,6 +106,7 @@ def hook(ev, **kw):
 
 ABSENT = [t for t in os.environ.get("FAKE_ABSENT_TOOLS", "").split(",") if t]  # tools this session lacks
 TOOLS = [t for t in ("Task", "Bash", "Edit", "Read", "Write") if t not in ABSENT]   # main session, as 2.1.326
+TOOLS += [t for t in os.environ.get("FAKE_EXTRA_TOOLS", "").split(",") if t]          # a tool that appeared
 out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": TOOLS,
      "mcp_servers": [], "agents": MODES["expected_agents"], "permissionMode": a[a.index("--permission-mode") + 1],
      "claude_code_version": MODES["claude_code"], "skills": json.loads(os.environ.get("FAKE_SKILLS", "[]")),
@@ -157,7 +158,7 @@ if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agen
         if int(n) >= 21:                         # step 21 starts the grep subagent, 22-27 run inside it
             if name == "Task":
                 out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_use",
-                     "id": "t21", "name": "Task", "input": {"subagent_type": "grep", "description": "probe",
+                     "id": "t21", "name": "Agent", "input": {"subagent_type": "grep", "description": "probe",
                                                             "prompt": "steps 22-27"}}]}})
                 out({"type": "user", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_result",
                      "tool_use_id": "t21", "content": "Async agent launched successfully."}]}})

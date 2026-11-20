@@ -20,6 +20,8 @@
       "statusline-setup",
       "web-fetch"
     ],
+    "allowed_tools": ["Task", "Agent", "Bash", "CronCreate", "CronDelete", "CronList", "DesignSync", "Edit", "EnterWorktree", "ExitWorktree", "ListAgents", "Monitor", "NotebookEdit", "PushNotification", "Read", "RemoteTrigger", "ReportFindings", "ScheduleWakeup", "SendMessage", "TaskStop", "ToolSearch", "Write", "Glob", "Grep", "LS", "NotebookRead"],
+    "_why_allowed_tools": "init tools of the live probes b5da123f22 and c0a75b5374 (Claude Code 2.1.326, 20.11) plus Agent (Task's other name) and the reading tools the read guard covers (Glob, Grep, LS, NotebookRead). Any other tool makes a run invalid until reviewed: Workflow read files past the guard (PR #8 review).",
     "subagent_models": [
       "claude-haiku-5-5"
     ],

@@ -24,8 +24,9 @@ pytestmark = pytest.mark.skipif(not BIN, reason="SWARMSCOPE_REAL_CLAUDE not set"
 SECRET = "OTHERSESSION_SECRET"
 
 
-def session(tmp_path, sub_calls, main_calls=None):
-    """One real Claude Code session in the lab's read configuration; returns (subagent results, read_outside)."""
+def session(tmp_path, sub_calls, main_calls=None, deny_tools=True):
+    """One real Claude Code session in the lab's read configuration; returns (subagent results, read_outside).
+    The init tools land in tmp_path/init_tools.json."""
     home = tmp_path / "home"
     lab_dir = home / "Downloads" / "lab"
     cfg = lab_dir / "config"
@@ -41,7 +42,8 @@ def session(tmp_path, sub_calls, main_calls=None):
         import lab as L
         settings = {"hooks": {"PreToolUse": [L.read_guard_hook(work, {})]},
                     "permissions": {"allow": ["Bash"],
-                                    "deny": ["Edit(~/**)"] + L.read_deny_rules([str(home)], cfg)}}
+                                    "deny": ["Edit(~/**)"] + L.read_deny_rules([str(home)], cfg)
+                                    + (list(L.WEB_TOOLS) + list(L.UNGUARDED_TOOLS) if deny_tools else [])}}
         (tmp_path / "settings.json").write_text(json.dumps(settings))
         own = cfg / "projects" / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(work))
         other = own / "othersession" / "tool-results"               # a late path: no Read deny names it
@@ -69,11 +71,13 @@ def session(tmp_path, sub_calls, main_calls=None):
                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "EMBEDDED_SEARCH_TOOLS": "0",
                "DISABLE_AUTOUPDATER": "1"}
         try:
-            subprocess.run([BIN, "-p", "go", "--output-format", "stream-json", "--verbose", "--settings",
+            p = subprocess.run([BIN, "-p", "go", "--output-format", "stream-json", "--verbose", "--settings",
                             str(tmp_path / "settings.json"), "--permission-mode", "acceptEdits", "--model",
                             "claude-sonnet-5-5"], cwd=work, env=env, capture_output=True, text=True, timeout=180)
         finally:
             srv.terminate()
+        init = next((json.loads(x) for x in p.stdout.splitlines() if '"subtype":"init"' in x), {})
+        (tmp_path / "init_tools.json").write_text(json.dumps(init.get("tools")))
         recs = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         results = []
         for r in recs:
@@ -129,3 +133,14 @@ def test_audit_catches_what_a_broken_guard_lets_through(tmp_path, monkeypatch):
     results, outside = session(tmp_path, ESCAPES[:2])
     assert any(SECRET in r["text"] for r in results), results       # the bypass is real without the guard
     assert outside and all("path" in str(h[2]) for h in outside), outside
+
+
+def test_the_settings_deny_removes_workflow(tmp_path):
+    # PR #8 review: Workflow returned a line of another session's spilled output, past the read guard
+    session(tmp_path / "a", [], deny_tools=False)
+    before = json.loads((tmp_path / "a" / "init_tools.json").read_text())
+    session(tmp_path / "b", [])
+    after = json.loads((tmp_path / "b" / "init_tools.json").read_text())
+    if "Workflow" not in before:
+        pytest.skip(f"this binary offers no Workflow: {before}")
+    assert "Workflow" not in after and "Read" in after

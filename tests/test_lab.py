@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -445,6 +445,22 @@ def test_skills_loaded_in_the_session_are_an_integrity_problem(task, monkeypatch
     assert any("skills loaded" in p for p in r["integrity"]) and "--disable-slash-commands" in r["config"]["argv"]
 
 
+def test_a_tool_off_the_allow_list_makes_a_run_invalid(task, monkeypatch):
+    # PR #8 review: Workflow read a file past the read guard, and the tool set changes without a version change
+    monkeypatch.setenv("FAKE_EXTRA_TOOLS", "Workflow")
+    r = lab.attempt(task, "A")
+    assert not r["valid"] and any("not on the allow-list" in p and "Workflow" in p for p in r["integrity"])
+    monkeypatch.delenv("FAKE_EXTRA_TOOLS")
+    assert lab.attempt(task, "A")["valid"]
+
+
+def test_workflow_is_denied_in_the_settings(task, tmp_path):
+    modes = lab.load_modes()[0]
+    p = lab.write_settings(tmp_path, tmp_path / "sw", tmp_path / "pol.json", tmp_path / "w", task, lab.lab_root(), modes)
+    deny = json.loads(p.read_text())["permissions"]["deny"]
+    assert "Workflow" in deny and "WebFetch" in deny
+
+
 def test_batch_invariant_mismatch_stops_the_attempt(task):
     expect = lab.batch_expect(task, lab.load_modes()[1])
     r = lab.attempt(task, "A", expect=dict(expect, hidden_tests_sha256="other"))
@@ -677,6 +693,27 @@ def test_probe_catches_a_guard_that_misreads_a_tilde_path(task, monkeypatch, cap
     assert "FAIL  step_25_sub_grep_space_project  (allowed" in out
     assert "FAIL  step_27_sub_glob_tilde_project  (allowed" in out
     assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+
+
+def test_judge_steps_a_denied_step_fails_if_a_later_call_got_through():
+    # PR #8 review (P3): a failing first try, then the same path succeeds - the step was counted as refused
+    calls = [("Agent", {"subagent_type": "grep"}, {"is_error": False, "text": "launched"}, None, "t9"),
+             ("Grep", {"path": "~/x", "pattern": "("}, {"is_error": True, "text": "regex error"}, "t9", "s1"),
+             ("Grep", {"path": "~/x", "pattern": "a"}, {"is_error": False, "text": "/x/secret.txt"}, "t9", "s2")]
+    step = [("24_sub_grep_tilde_project", "Grep", '"path": "~/x"', True, "sub")]
+    r = lab.judge_steps(calls, step)["24_sub_grep_tilde_project"]
+    assert r["ok"] is False and r["why"].startswith("allowed on a later call")
+    assert lab.judge_steps(calls[:2], step)["24_sub_grep_tilde_project"]["ok"] is True
+
+
+def test_judge_steps_takes_the_subagent_call_by_either_name():
+    # live probe c0a75b5374: init lists "Task", the model called "Agent"; the step was "not attempted"
+    for name in ("Task", "Agent"):
+        calls = [(name, {"subagent_type": "grep"}, {"is_error": False, "text": "launched"}, None, "t9"),
+                 ("Grep", {"path": "/x"}, {"is_error": True, "text": "denied"}, "t9", "s1")]
+        steps = [("21_task_grep_agent", "Task", '"subagent_type": "grep"', False),
+                 ("22_sub_grep_late_home", "Grep", '"path": "/x"', True, "sub")]
+        assert all(v["ok"] for v in lab.judge_steps(calls, steps).values()), name
 
 
 def test_judge_steps_takes_sub_steps_only_from_the_grep_subagent():
