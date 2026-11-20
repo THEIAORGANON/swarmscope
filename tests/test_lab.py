@@ -1562,7 +1562,7 @@ def test_bj_declines_r3_when_jev_says_no_and_blocks_when_it_says_yes(task, monke
     assert r["jev"]["answers"][0]["gating"] == "R3"
     r3 = [d for d in r["decisions"]["decisions"] if d["rule"] == "R3_high_risk"]
     assert r3[0]["jev_gate"]["decided_by"] == "jev" and r3[0]["jev_gate"]["would_consult"] is False
-    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 0, "no": 1, "fallback": 0, "p_consult": [0.3]}
+    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 0, "no": 1, "fallback": 0, "forced": 0, "p_consult": [0.3]}
 
     monkeypatch.setenv("JEV_STUB_P", "0.8")
     r = lab.attempt(task, "BJ")
@@ -1572,7 +1572,7 @@ def test_bj_declines_r3_when_jev_says_no_and_blocks_when_it_says_yes(task, monke
     ctx = [x for x in _jev_recs(r) if x.get("kind") == "context"]
     assert len(ctx) == r["decisions"]["stops"] == 2                  # the second Stop is asked in shadow mode
     assert [c.get("gating") for c in sorted(ctx, key=lambda c: c["ts"])] == ["R3", None]
-    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 1, "no": 0, "fallback": 0, "p_consult": [0.8]}
+    assert r["decisions"]["r3_gate"] == {"asked": 1, "yes": 1, "no": 0, "fallback": 0, "forced": 0, "p_consult": [0.8]}
     assert [a.get("gating") for a in sorted(r["jev"]["answers"], key=lambda a: a["stop_ts"])] == ["R3", None]
 
 
@@ -1584,6 +1584,111 @@ def test_bj_falls_back_to_the_rule_when_jev_is_unreachable(task, monkeypatch):
     assert gate and gate[0]["status"] in ("error", "timeout")
     assert any("jev answers not ok" in p for p in r["integrity"])     # a Jev failure is still reported
     assert r["decisions"]["r3_gate"]["fallback"] == 1 and r["decisions"]["r3_gate"]["yes"] == 0
+
+
+# --- BJ-diag: the forced consultation's chain ---------------------------------------------------------------
+
+def test_r3_gate_summary_counts_forced_apart_from_fallback():
+    # condition 2: before, any decided_by other than "jev" counted as a fallback
+    dec = [{"jev_gate": {"decided_by": "forced", "forced": "consult",
+                         "real": {"status": "ok", "p_consult": 0.2, "would_consult": False}}},
+           {"jev_gate": {"decided_by": "forced", "forced": "consult", "real": {"status": "timeout"}}},
+           {"jev_gate": {"decided_by": "fallback_enforce", "status": "error"}},
+           {"jev_gate": {"decided_by": "jev", "would_consult": True, "p_consult": 0.7}}]
+    s = lab.r3_gate_summary(dec)
+    assert (s["asked"], s["yes"], s["no"], s["fallback"], s["forced"]) == (4, 1, 0, 1, 2)
+    assert s["forced_real"] == {"yes": 0, "no": 1, "failed": 1, "p_consult": [0.2, None]}
+    assert s["p_consult"] == [None, 0.7]                          # forced answers never mix with Jev's decisions
+
+
+def test_bjd_forces_the_block_and_the_chain_is_complete(task, monkeypatch, jev_stub, capsys):
+    monkeypatch.setenv("JEV_STUB_P", "0.3")                       # Jev says no: BJ would decline, BJd blocks anyway
+    r = lab.attempt(task, "BJd")
+    assert r["valid"] is True, r["integrity"]
+    assert r["plan"]["diagnostic"] is True and r["config"]["policy"]["r3_gate_force"] == "consult"
+    assert r["decisions"]["blocks"] == 1 and r["decisions"]["by_rule"]["R3_high_risk"].get("requested") == 1
+    g = r["decisions"]["r3_gate"]
+    assert g["forced"] == 1 and g["yes"] == g["no"] == g["fallback"] == 0
+    assert g["forced_real"]["no"] == 1 and g["forced_real"]["p_consult"] == [0.3]
+    d = r["diag"]
+    assert d["verdict"] == "complete", d
+    assert all(d["links"][k] for k in lab.DIAG_LINKS)
+    assert d["info"]["jev_real"][0]["would_consult"] is False and d["info"]["advisor_models_of_call"] == ["claude-opus-5-5"]
+    assert lab.main(["diag"]) == 0
+    out = capsys.readouterr().out
+    assert "chain: complete" in out and "jev real answer (not used): status ok, p=0.30" in out
+
+
+def test_diagnostic_runs_stay_out_of_pairs_and_calib(task, monkeypatch, jev_stub):
+    # condition 3: by the policy the run had (r3_gate_force), not only by the plan's label
+    monkeypatch.setenv("JEV_STUB_P", "0.3")
+    assert lab.main(["batch", "--task", task["_file"], "--modes", "B,BJd", "--repeats", "1", "--seed", "5",
+                     "--paired"]) == 0
+    runs = lab.load_runs()
+    assert sorted(r["mode"] for r in runs) == ["B", "BJd"]
+    def no_pairs(rs):
+        rows = [t for t in lab.pair_report(rs, modes=("B", "BJd"))["rows"].values() if t["task_id"] == task["task_id"]]
+        return all(not t["pairs"] for t in rows)
+    assert no_pairs(runs)
+    assert lab.calibration(runs, "BJd") == {}
+    for r in runs:                                             # the label lost: the policy alone still excludes it
+        r["plan"].pop("diagnostic", None)
+    assert lab.calibration(runs, "BJd") == {}
+    assert no_pairs(runs)
+
+
+def _diag_rj(**over):
+    rj = {"session_status": "success",
+          "decisions": {"decisions": [{"id": "s-3", "rule": "R3_high_risk", "state": "requested",
+                                       "jev_gate": {"decided_by": "forced", "real": {"status": "ok", "p_consult": 0.2}}}]},
+          "advisor": {"blocks": [{"ts": 100.0, "until": 200.0, "decision_ids": ["s-3"], "requests_consult": True,
+                                  "calls": ["srv1"]}],
+                      "calls": [{"id": "srv1", "ts": "2026-11-20T00:02:00.000Z", "message_id": "m1", "status": "returned",
+                                 "answers_block": 100.0}]},
+          "result": {"modelUsage": {"claude-opus-5-5": {"costUSD": 0.27}}},
+          "costs": {"reconstruction": "complete", "by_model": {"advisor": {"usd": 0.27, "source": "iterations"}}}}
+    rj.update(over)
+    return rj
+
+
+def _diag_tp(tmp_path, model="claude-opus-5-5", after=True):
+    recs = [{"type": "assistant", "timestamp": "2026-11-20T00:02:00.000Z", "message": {"id": "m1", "content": [
+        {"type": "server_tool_use", "id": "srv1", "name": "advisor"},
+        {"type": "advisor_tool_result", "tool_use_id": "srv1", "content": {"type": "advisor_redacted_result"}}],
+        "usage": {"iterations": [{"type": "advisor_message", "model": model}]}}}]
+    if after:
+        recs.append({"type": "assistant", "timestamp": "2026-11-20T00:02:30.000Z", "message": {"id": "m2",
+                     "content": [{"type": "text", "text": "applying the advice"}]}})
+    p = tmp_path / f"t-{model}-{after}.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    return str(p)
+
+
+def test_diag_chain_reports_the_first_missing_link(tmp_path):
+    tp = _diag_tp(tmp_path)
+    assert lab.diag_chain(_diag_rj(), tp, "claude-opus-5-5")["verdict"] == "complete"
+    nothing = _diag_rj(decisions={"decisions": [{"id": "s-1", "rule": "R3_high_risk", "state": "pass"}]})
+    d = lab.diag_chain(nothing, tp, "claude-opus-5-5")
+    assert d["verdict"] == "incomplete" and d["info"]["r3_states"] == ["pass"]
+    no_call = _diag_rj(advisor={"blocks": [dict(_diag_rj()["advisor"]["blocks"][0], calls=[])], "calls": []})
+    assert lab.diag_chain(no_call, tp, "claude-opus-5-5")["verdict"] == "broken at advisor_called_in_block"
+    failed = _diag_rj()
+    failed["advisor"]["calls"][0]["status"] = "failed"
+    assert lab.diag_chain(failed, tp, "claude-opus-5-5")["verdict"] == "broken at advisor_returned"
+    assert lab.diag_chain(_diag_rj(), _diag_tp(tmp_path, model="claude-sonnet-5-5"),
+                          "claude-opus-5-5")["verdict"] == "broken at pinned_model"
+    assert lab.diag_chain(_diag_rj(), _diag_tp(tmp_path, after=False),
+                          "claude-opus-5-5")["verdict"] == "broken at session_continued"
+    gap = _diag_rj(costs={"reconstruction": "incomplete", "by_model": {"advisor": {"usd": 0.27, "source": "iterations"}}})
+    assert lab.diag_chain(gap, tp, "claude-opus-5-5")["verdict"] == "broken at opus_cost_reconciled"
+    est = _diag_rj(costs={"reconstruction": "complete", "by_model": {"advisor": {"usd": 0.27, "source": "estimate"}}})
+    assert lab.diag_chain(est, tp, "claude-opus-5-5")["verdict"] == "broken at opus_cost_reconciled"
+    off = _diag_rj(result={"modelUsage": {"claude-opus-5-5": {"costUSD": 0.40}}})
+    assert lab.diag_chain(off, tp, "claude-opus-5-5")["verdict"] == "broken at opus_cost_reconciled"
+    # a call outside the R3 block's window is not this block's answer
+    stray = _diag_rj()
+    stray["advisor"]["calls"][0]["answers_block"] = None
+    assert lab.diag_chain(stray, tp, "claude-opus-5-5")["verdict"] == "broken at advisor_called_in_block"
 
 
 @pytest.fixture

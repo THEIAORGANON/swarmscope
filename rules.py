@@ -73,6 +73,11 @@ DEFAULTS = {
     # or "pass" (declined). R1 and R2 are never gated. None = R3 as in b-5.
     "r3_gate": None,
     "r3_gate_on_error": "enforce",
+    # diagnostics only (BJ-diag), never a policy to compare: "consult" forces the decision of an R3 that already
+    # reached the Jev gate (triggered, enforced, not deferred, within the block limit) to block. Jev is still asked;
+    # its real answer and status go to jev_gate.real, the decision is decided_by "forced". Runs with this key are
+    # left out of pairs and calib.
+    "r3_gate_force": None,
 }
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -556,6 +561,11 @@ def gate(events, stop, pol, change, adv_times, log, has_tests, sid, now=None, tr
                     g["decided_by"] = "fallback_" + pol.get("r3_gate_on_error", "enforce")
                     if pol.get("r3_gate_on_error") == "pass":
                         r3["state"] = "declined"
+                if pol.get("r3_gate_force") == "consult":
+                    # the real answer is kept apart and never read as Jev's decision; the block stands regardless
+                    g = {"decided_by": "forced", "forced": "consult",
+                         "real": dict(g, would_have_blocked=r3["state"] == "requested")}
+                    r3["state"] = "requested"
                 r3["jev_gate"] = g
 
     n0 = sum(1 for r in log if r.get("kind") == "decision")

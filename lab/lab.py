@@ -778,6 +778,90 @@ def advisor_models_in_transcript(transcript):
     return sorted(seen, key=str)
 
 
+def advisor_models_by_message(transcript):
+    """message.id -> models named by that message's advisor iterations (a message spans several transcript lines)."""
+    out = {}
+    recs, _ = jl(transcript)
+    for r in recs or []:
+        if r.get("type") != "assistant":
+            continue
+        msg = r.get("message") or {}
+        for it in (msg.get("usage") or {}).get("iterations") or []:
+            if isinstance(it, dict) and it.get("type") == "advisor_message":
+                out.setdefault(msg.get("id"), set()).add(it.get("model"))
+    return out
+
+
+def assistant_after(transcript, call_id):
+    """Did the lead model go on after the advisor's answer to `call_id`? Either content after the
+    advisor_tool_result in the same message, or any later assistant record. By order in the transcript, not by
+    timestamp (two records can share a millisecond)."""
+    recs, _ = jl(transcript)
+    seen = False
+    for r in recs or []:
+        if r.get("type") != "assistant":
+            continue
+        for b in (r.get("message") or {}).get("content") or []:
+            if not isinstance(b, dict):
+                continue
+            if seen:
+                return True
+            if b.get("type") == "advisor_tool_result" and b.get("tool_use_id") == call_id:
+                seen = True
+    return False
+
+
+DIAG_LINKS = ("r3_reached_gate", "r3_blocked", "advisor_called_in_block", "advisor_returned", "pinned_model",
+              "session_continued", "opus_cost_reconciled")
+
+
+def diag_chain(rj, transcript, advisor, tol=0.01):
+    """BJ-diag: did the forced consultation go through the whole chain? Each link is checked on recorded data:
+    the R3 decision forced at the gate -> its block record -> an advisor call inside that block's window (call and
+    result bound by tool_use_id) -> a returned result -> from the pinned advisor model (advisor_message.model of
+    that very message) -> the lead model went on after it and the session finished -> Opus cost: Claude Code's
+    modelUsage for the advisor equals the transcript reconstruction (from usage.iterations), and the whole
+    reconstruction is complete. verdict: complete | incomplete (R3 never reached the gate: nothing was forced) |
+    broken at <link>. Says nothing about whether Jev or the consultation helped."""
+    dec = (rj.get("decisions") or {}).get("decisions") or []
+    adv = rj.get("advisor") or {}
+    links, info = {}, {}
+    forced = [d for d in dec if d.get("rule") == "R3_high_risk" and (d.get("jev_gate") or {}).get("decided_by") == "forced"]
+    info["r3_states"] = [d.get("state") for d in dec if d.get("rule") == "R3_high_risk"]
+    info["forced_decisions"] = len(forced)
+    info["jev_real"] = [((d.get("jev_gate") or {}).get("real") or {}) for d in forced]
+    links["r3_reached_gate"] = bool(forced)
+    if not forced:
+        return {"verdict": "incomplete", "why": "R3 never reached the gate: nothing was forced", "links": links,
+                "info": info}
+    d = forced[0]
+    block = next((b for b in adv.get("blocks") or [] if d.get("id") in (b.get("decision_ids") or [])), None)
+    links["r3_blocked"] = bool(block and block.get("requests_consult") and d.get("state") == "requested")
+    calls = [c for c in adv.get("calls") or [] if block and c.get("answers_block") == block.get("ts")
+             and c.get("id") in (block.get("calls") or [])]
+    links["advisor_called_in_block"] = bool(calls)
+    returned = [c for c in calls if c.get("status") == "returned"]
+    links["advisor_returned"] = bool(returned)
+    by_msg = advisor_models_by_message(transcript) if transcript and Path(transcript).exists() else {}
+    c0 = returned[0] if returned else None
+    models = sorted(by_msg.get(c0.get("message_id"), set()), key=str) if c0 else []
+    info["advisor_models_of_call"] = models
+    links["pinned_model"] = bool(c0) and models == [advisor]
+    links["session_continued"] = (bool(c0) and assistant_after(transcript, c0.get("id"))
+                                  and block.get("until") is not None and rj.get("session_status") == "success")
+    costs_ = rj.get("costs") or {}
+    cc_adv = (((rj.get("result") or {}).get("modelUsage") or {}).get(advisor) or {}).get("costUSD")
+    tr = (costs_.get("by_model") or {}).get("advisor") or {}
+    info["opus_usd"] = {"claude_code": cc_adv, "transcript": tr.get("usd"), "source": tr.get("source"),
+                        "reconstruction": costs_.get("reconstruction")}
+    links["opus_cost_reconciled"] = (cc_adv is not None and tr.get("usd") is not None and tr.get("source") == "iterations"
+                                     and abs(cc_adv - tr["usd"]) <= tol and costs_.get("reconstruction") == "complete")
+    broken = next((k for k in DIAG_LINKS if not links.get(k)), None)
+    return {"verdict": "complete" if broken is None else f"broken at {broken}", "links": links, "info": info,
+            "decision_id": d.get("id"), "block_ts": block.get("ts") if block else None,
+            "calls": [{k: c.get(k) for k in ("id", "ts", "status", "message_id")} for c in calls]}
+
+
 def blocks_from_log(decision_recs, stop_times):
     """One unit per Stop that was actually blocked (the "block" record), not per decision: R2 and R3 on the
     same Stop are one instruction to the model. Window = from the block to the next Stop (or session end)."""
@@ -858,20 +942,40 @@ def summarize_decisions(recs, expected_mode, policy_sha):
 
 
 def r3_gate_summary(dec):
-    """Policy b-6 with r3_gate "jev": how the Stops where R3 would block were decided (None when never asked)."""
+    """Policy b-6 with r3_gate "jev": how the Stops where R3 would block were decided (None when never asked).
+    yes / no: Jev decided; fallback: Jev failed and r3_gate_on_error decided; forced: r3_gate_force decided (BJ-diag),
+    counted apart, with Jev's real answers in forced_real - never as yes / no."""
     gated = [r["jev_gate"] for r in dec if r.get("jev_gate")]
     if not gated:
         return None
-    out = {"asked": len(gated), "yes": 0, "no": 0, "fallback": 0, "p_consult": []}
+    out = {"asked": len(gated), "yes": 0, "no": 0, "fallback": 0, "forced": 0, "p_consult": []}
     for g in gated:
-        if g.get("decided_by") != "jev":
+        by = g.get("decided_by") or ""
+        if by == "forced":
+            out["forced"] += 1
+            real = g.get("real") or {}
+            fr = out.setdefault("forced_real", {"yes": 0, "no": 0, "failed": 0, "p_consult": []})
+            fr["failed" if real.get("status") != "ok" else "yes" if real.get("would_consult") else "no"] += 1
+            fr["p_consult"].append(real.get("p_consult"))
+            continue
+        if by.startswith("fallback"):
             out["fallback"] += 1
-        elif g.get("would_consult"):
+        elif by == "jev" and g.get("would_consult"):
             out["yes"] += 1
-        else:
+        elif by == "jev":
             out["no"] += 1
+        else:
+            out.setdefault("unknown", 0)
+            out["unknown"] += 1
         out["p_consult"].append(g.get("p_consult"))
     return out
+
+
+def is_diagnostic(rj):
+    """A diagnostic run (BJ-diag): never in pairs or calib. Decided by the policy the run actually had (r3_gate_force),
+    not only by the plan's label."""
+    return bool((rj.get("plan") or {}).get("diagnostic")
+                or ((rj.get("config") or {}).get("policy") or {}).get("r3_gate_force"))
 
 
 def summarize_jev(recs, decision_recs, enabled):
@@ -1184,6 +1288,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     if callable(prompt):                        # probe: the prompt names paths that depend on the work dir
         prompt = prompt(work)
     sw.mkdir(parents=True)
+    if build_policy(modes, mode).get("r3_gate_force"):     # BJ-diag: labelled in the plan too, never compared
+        plan = dict(plan or {}, diagnostic=True)
     rj = {"runner_version": RUNNER_VERSION, "run_id": run_id, "task_id": task["task_id"], "mode": mode,
           "plan": plan, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "integrity": []}
     problems = rj["integrity"]
@@ -1404,6 +1510,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
             problems.append("advisor called but no advisor_message.model in the transcript")
         if calls and not adv:
             problems.append(f"advisor called {len(calls)} time(s) in a mode without an advisor")
+        if (plan or {}).get("diagnostic"):
+            rj["diag"] = diag_chain(rj, tp, adv)
     save()
 
     # result: snapshot of the working copy, then each test suite on its own copy of the snapshot
@@ -1483,7 +1591,7 @@ def calibration(run_jsons, mode="A", batch=None):
     out = {}
     for rj in run_jsons:
         plan = rj.get("plan") or {}
-        if rj.get("mode") != mode or plan.get("probe") or (batch and plan.get("batch_id") != batch):
+        if rj.get("mode") != mode or plan.get("probe") or is_diagnostic(rj) or (batch and plan.get("batch_id") != batch):
             continue
         if not (rj.get("finished_at") and rj.get("verdict")):
             continue                                   # still running or the runner died: not an attempt yet
@@ -1574,7 +1682,8 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None, manifests=None, repla
     runs, spend = {}, {}
     for rj in run_jsons:
         plan = rj.get("plan") or {}
-        if not plan.get("paired") or rj.get("mode") not in modes or not in_scope(plan.get("batch_id")):
+        if (not plan.get("paired") or rj.get("mode") not in modes or not in_scope(plan.get("batch_id"))
+                or is_diagnostic(rj)):
             continue
         sp = spend.setdefault(rj.get("task_id"), {"usd": 0.0, "runs": 0, "outside_pairs_usd": 0.0})
         sp["usd"] += run_cost(rj)
@@ -1848,6 +1957,41 @@ def cmd_calib(a):
             print(f"    {n}x {name}")
     if not table:
         print(f"no runs in mode {a.mode}")
+    return 0
+
+
+def cmd_diag(a):
+    """Print each diagnostic run's chain (run.json "diag", computed when the run finished). No conclusion about
+    Jev or about the consultation's value is drawn here: the report only says which links were seen."""
+    runs = [rj for rj in load_runs() if is_diagnostic(rj) and (not a.runs or rj.get("run_id") in a.runs)]
+    if a.json:
+        print(json.dumps([{k: rj.get(k) for k in ("run_id", "task_id", "mode", "valid", "integrity", "diag")}
+                          for rj in runs], indent=2, default=str))
+        return 0
+    if not runs:
+        print("no diagnostic runs" + (f" among {', '.join(a.runs)}" if a.runs else ""))
+        return 1
+    for rj in runs:
+        d = rj.get("diag") or {}
+        print(f"{rj.get('run_id')}  {rj.get('task_id')}  {rj.get('mode')}  "
+              f"{'VALID' if rj.get('valid') else 'INVALID'}  chain: {d.get('verdict', 'not computed')}"
+              + (f"  ({d['why']})" if d.get("why") else ""))
+        for k in DIAG_LINKS:
+            if k in (d.get("links") or {}):
+                print(f"    {'ok  ' if d['links'][k] else 'FAIL'}  {k}")
+        info = d.get("info") or {}
+        for j in info.get("jev_real") or []:
+            p = j.get("p_consult")
+            print(f"    jev real answer (not used): status {j.get('status')}"
+                  + (f", p={p:.2f}, would_consult {j.get('would_consult')}" if isinstance(p, (int, float)) else ""))
+        if info.get("opus_usd"):
+            o = info["opus_usd"]
+            print(f"    opus: claude code {o.get('claude_code')} vs transcript {o.get('transcript')} "
+                  f"({o.get('source')}), reconstruction {o.get('reconstruction')}")
+        if info.get("r3_states") is not None and not info.get("forced_decisions"):
+            print(f"    R3 states seen: {info['r3_states'] or 'none (never triggered)'}")
+        for p in rj.get("integrity") or []:
+            print(f"    integrity: {p}")
     return 0
 
 
@@ -2429,8 +2573,11 @@ def main(argv=None):
     c.add_argument("--mode", default="A")
     c.add_argument("--json", action="store_true")
     c.add_argument("--batch", help="only this batch id")
+    dg = sub.add_parser("diag", help="BJ-diag: the forced consultation's chain, link by link (diagnostic runs only)")
+    dg.add_argument("runs", nargs="*", help="run ids (default: every diagnostic run)")
+    dg.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    return {"setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch, "revalidate": cmd_revalidate,
+    return {"diag": cmd_diag, "setup": cmd_setup, "doctor": cmd_doctor, "probe": cmd_probe, "run": cmd_run, "batch": cmd_batch, "revalidate": cmd_revalidate,
             "calib": cmd_calib, "pairs": cmd_pairs, "screen": cmd_screen, "summary": cmd_summary}[a.cmd](a) or 0
 
 
