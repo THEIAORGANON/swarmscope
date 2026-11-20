@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 from pathlib import Path
 import json
+import re
 import time
 import os
 import subprocess
@@ -103,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -152,9 +153,159 @@ def test_settings_sandbox_and_deny_rules(task):
     assert "~/" in sb["filesystem"]["denyRead"]
     for p in (str(lab.lab_root().resolve()), lab.expand(task["hidden_tests"]["dir"]), lab.expand(task["source"]["repo"])):
         assert p in sb["filesystem"]["denyRead"]
-        assert f"Read(/{p}/**)" in s["permissions"]["deny"] and f"Edit(/{p}/**)" in s["permissions"]["deny"]
-    assert "Read(~/**)" in s["permissions"]["deny"]
+        assert f"Edit(/{p}/**)" in s["permissions"]["deny"]
+    for p in (lab.expand(task["hidden_tests"]["dir"]), lab.expand(task["source"]["repo"])):
+        assert f"Read(/{p}/**)" in s["permissions"]["deny"]
+    assert "Edit(~/**)" in s["permissions"]["deny"]
     assert s["permissions"]["allow"] == ["Bash"]          # interpreters must run without an approval nobody can give
+
+
+def _rule_re(rule, tool):
+    """A Read/Edit path rule as a regex over absolute paths (gitignore-style: ** any depth, * one level, \\x)."""
+    m = re.fullmatch(tool + r"\((.*)\)", rule)
+    if not m:
+        return None
+    pat = m.group(1)
+    pat = str(Path.home()) + pat[1:] if pat.startswith("~/") else pat[1:] if pat.startswith("//") else pat
+    out, i = "", 0
+    while i < len(pat):
+        if pat[i] == "\\":
+            out += re.escape(pat[i + 1]); i += 2
+        elif pat.startswith("/**", i) and i + 3 == len(pat):
+            out += "(/.*)?"; i += 3
+        elif pat.startswith("**", i):
+            out += ".*"; i += 2
+        elif pat[i] == "*":
+            out += "[^/]*"; i += 1
+        elif pat[i] == "?":
+            out += "[^/]"; i += 1
+        else:
+            out += re.escape(pat[i]); i += 1
+    return re.compile(out + "$")
+
+
+def _denied(rules, path, tool):
+    return any(r and r.match(str(path)) for r in (_rule_re(x, tool) for x in rules))
+
+
+def test_read_denies_leave_open_only_the_sessions_own_spilled_tool_outputs(task):
+    # review 18.11: the agent may Read the tool output Claude Code spilled for it (run d985a62293 was invalid
+    # for it); other runs' outputs, transcripts, the config and everything else in home stay denied, writes too
+    home, cfg = Path.home().resolve(), (lab.lab_root() / "config").resolve()
+    (home / ".ssh").mkdir(exist_ok=True)
+    (home / ".ssh" / "id_x").write_text("k")
+    (home / "Downloads" / "x").mkdir(parents=True, exist_ok=True)
+    other = cfg / "projects" / "-private-tmp-swarmscope-w-old" / "s1" / "tool-results"
+    other.mkdir(parents=True, exist_ok=True)
+    r = lab.attempt(task, "A")
+    deny = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())["permissions"]["deny"]
+    own = cfg / "projects" / "-private-tmp-swarmscope-w-new" / "sess"
+    assert not _denied(deny, own / "tool-results" / "b3euojfv4.txt", "Read")
+    for p in (own / "tool-results" / "b3euojfv4.txt", own.parent / "sess.jsonl"):
+        assert _denied(deny, p, "Edit")
+    for p in (own.parent / "sess.jsonl", own / "subagents" / "agent-1.jsonl", own.parent / "memory" / "m.md",
+              other / "a.txt", cfg / "settings.json", cfg / ".claude.json", cfg / ".credentials.json",
+              cfg / "agents" / "docs.md", lab.lab_root().resolve() / "runs" / r["run_id"] / "run.json",
+              home / ".ssh" / "id_x", home / "Downloads" / "x" / "y", lab.expand(task["hidden_tests"]["dir"]) + "/t.py"):
+        assert _denied(deny, p, "Read"), p
+    # a name with glob characters is matched literally
+    odd = home / "we[i]rd*name"
+    odd.mkdir()
+    r = lab.attempt(task, "A")
+    deny = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())["permissions"]["deny"]
+    assert _denied(deny, odd / "f", "Read") and not _denied(deny, home / "weXrdyname" / "f", "Read")
+
+
+def _guarded(task, monkeypatch, tmp_path, target, wrap=None):
+    log = tmp_path / "guarded.jsonl"
+    monkeypatch.setenv("FAKE_GUARDED_READ", str(target))
+    monkeypatch.setenv("FAKE_GUARDED_LOG", str(log))
+    if wrap:
+        real = lab.read_guard_hook
+        monkeypatch.setattr(lab, "read_guard_hook", lambda work, task: wrap(real(work, task)))
+    r = lab.attempt(task, "A")
+    settings = json.loads((lab.lab_root() / "runs" / r["run_id"] / "settings.json").read_text())
+    return r, json.loads(log.read_text().splitlines()[-1]), settings
+
+
+def test_read_guard_is_its_own_fail_closed_hook_for_the_reading_tools(task, monkeypatch, tmp_path):
+    outside = Path.home() / "late-secret.txt"                       # appears after the settings, no deny names it
+    outside.write_text("s")
+    r, g, settings = _guarded(task, monkeypatch, tmp_path, outside)
+    pre = settings["hooks"]["PreToolUse"]
+    assert pre[0]["matcher"] == lab.READ_GUARD_MATCHER and pre[0]["hooks"][0]["onFailure"] == "block"
+    assert "readguard.py" in pre[0]["hooks"][0]["command"] and pre[1]["matcher"] == "*"
+    assert g["refused"] and "outside the working copy" in json.dumps(g["res"])
+    assert r["observation"]["reads_outside"] == []                   # refused, so nothing read
+
+
+def test_read_guard_error_before_the_decision_blocks_the_read(task, monkeypatch, tmp_path):
+    # review of PR #8 (P1): an import error before the check let the read through with exit 0
+    outside = Path.home() / "late-secret.txt"
+    outside.write_text("s")
+
+    def broken(h):
+        h["hooks"][0]["command"] = h["hooks"][0]["command"].replace("SWARMSCOPE_READ_GUARD=", "X_UNUSED=")
+        return h
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, outside, broken)
+    assert g["refused"] and "blocking because onFailure" in g["res"]["_blocked"]
+
+
+def test_read_guard_timeout_blocks_the_read(task, monkeypatch, tmp_path):
+    outside = Path.home() / "late-secret.txt"
+    outside.write_text("s")
+
+    def slow(h):
+        h["hooks"][0]["command"] = "sleep 5; " + h["hooks"][0]["command"]
+        h["hooks"][0]["timeout"] = 1
+        return h
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, outside, slow)
+    assert g["refused"] and "timed out" in g["res"]["_blocked"]
+
+
+def test_read_guard_lets_the_working_copy_through(task, monkeypatch, tmp_path):
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, "src/inside.py")     # relative: inside the own copy
+    assert not g["refused"] and g["res"] in (None, {})
+    # a sibling run's copy beside it is outside
+    r, g, _ = _guarded(task, monkeypatch, tmp_path, Path(lab.work_root(lab.load_modes()[0])) / "other" / "x")
+    assert g["refused"]
+
+
+def test_old_claude_code_is_refused(task, monkeypatch):
+    assert any("older than 2.1.295" in p for p in lab.check_init(
+        {"model": "m", "claude_code_version": "2.1.200"}, lab.load_modes()[0], "/tmp"))
+
+
+def test_reads_outside_the_working_copy_make_a_run_invalid(tmp_path):
+    proj = tmp_path / "projects" / "-w-1"
+    (proj / "sess" / "tool-results").mkdir(parents=True)
+    work = tmp_path / "w"
+    work.mkdir()
+    tp = proj / "sess.jsonl"
+
+    def use(i, name, inp):
+        return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": i, "name": name, "input": inp}]}}
+
+    def res(i, err=False):
+        return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": i, "is_error": err,
+                                                         "content": "x"}]}}
+    recs = [use("1", "Read", {"file_path": str(proj / "sess" / "tool-results" / "a.txt")}), res("1"),
+            use("2", "Read", {"file_path": "src/x.py"}), res("2"),
+            use("3", "Read", {"file_path": str(tmp_path / "secret")}), res("3", err=True),     # refused
+            use("4", "Grep", {"pattern": "k", "path": str(tmp_path / "projects")}), res("4"),
+            use("5", "Read", {"file_path": str(proj / "sess.jsonl")}), res("5"),
+            # review of PR #8: another session's outputs in the same project, and a Glob pattern leaving its path
+            use("6", "Read", {"file_path": str(proj / "other" / "tool-results" / "b.txt")}), res("6"),
+            use("7", "Glob", {"pattern": str(tmp_path / "secret") + "/*"}), res("7"),
+            use("8", "Glob", {"pattern": "src/*/../../../x/*"}), res("8"),
+            use("9", "Glob", {"pattern": "src/**/*.py"}), res("9")]
+    tp.write_text("\n".join(json.dumps(x) for x in recs) + "\n")
+    hits = lab.read_outside(str(tp), work)
+    paths = sorted(h[2] for h in hits)
+    assert str(tmp_path / "projects") in paths and str(proj / "sess.jsonl") in paths
+    assert str(proj / "other" / "tool-results" / "b.txt") in paths
+    assert str(tmp_path / "secret") in paths and any("climbs out" in p for p in paths)
+    assert len(hits) == 5                                                  # 1, 2, 3 (refused) and 9 are fine
 
 
 def test_working_copy_hides_the_experiment(task):
@@ -292,6 +443,22 @@ def test_skills_loaded_in_the_session_are_an_integrity_problem(task, monkeypatch
     monkeypatch.setenv("FAKE_SKILLS", '["built-in-browser"]')
     r = lab.attempt(task, "A")
     assert any("skills loaded" in p for p in r["integrity"]) and "--disable-slash-commands" in r["config"]["argv"]
+
+
+def test_a_tool_off_the_allow_list_makes_a_run_invalid(task, monkeypatch):
+    # PR #8 review: Workflow read a file past the read guard, and the tool set changes without a version change
+    monkeypatch.setenv("FAKE_EXTRA_TOOLS", "Workflow")
+    r = lab.attempt(task, "A")
+    assert not r["valid"] and any("not on the allow-list" in p and "Workflow" in p for p in r["integrity"])
+    monkeypatch.delenv("FAKE_EXTRA_TOOLS")
+    assert lab.attempt(task, "A")["valid"]
+
+
+def test_workflow_is_denied_in_the_settings(task, tmp_path):
+    modes = lab.load_modes()[0]
+    p = lab.write_settings(tmp_path, tmp_path / "sw", tmp_path / "pol.json", tmp_path / "w", task, lab.lab_root(), modes)
+    deny = json.loads(p.read_text())["permissions"]["deny"]
+    assert "Workflow" in deny and "WebFetch" in deny
 
 
 def test_batch_invariant_mismatch_stops_the_attempt(task):
@@ -441,6 +608,125 @@ def test_all_skipped_hidden_suite_is_not_ok(tmp_path):
     r = lab.run_suite("hidden", f"{sys.executable} -c \"print('Ran 7 tests in 0.1s'); print(); print('OK (skipped=7)')\"",
                       snap, tmp_path, expected=7, work_base=tmp_path)
     assert r["ok"] is False and r["passed"] == 0 and r["tests"] == 7
+
+
+def test_probe_catches_a_readable_own_transcript(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_READ_TRANSCRIPT", "1")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_14_tool_read_own_transcript" in out and "boundary BROKEN" in out
+
+
+def test_a_read_outside_the_working_copy_makes_the_run_invalid(task, monkeypatch):
+    secret = lab.lab_root() / "runs" / "elsewhere.txt"
+    monkeypatch.setenv("FAKE_READ_OUTSIDE", str(secret))
+    r = lab.attempt(task, "A")
+    assert not r["valid"] and any("read outside" in p for p in r["integrity"])
+    assert r["observation"]["reads_outside"][0][2] == str(secret.resolve())
+
+
+def test_probe_step_12_must_read_the_file_step_11_named(task, monkeypatch, capsys, tmp_path):
+    # review of PR #8: a successful Read of some other file must not pass step 12
+    other = tmp_path / "x" / "tool-results" / "other.txt"
+    monkeypatch.setenv("FAKE_SPILL_READ", str(other))
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    assert "FAIL  step_12_reads_the_file_of_step_11" in capsys.readouterr().out
+
+
+def test_probe_creates_late_paths_after_the_settings_and_cleans_them(task, capsys, monkeypatch):
+    seen = {}
+    real = lab.write_settings
+
+    def spy(run_dir, *a, **k):
+        p = real(run_dir, *a, **k)
+        seen["deny"] = json.loads(p.read_text())["permissions"]["deny"]
+        return p
+    monkeypatch.setattr(lab, "write_settings", spy)
+    assert lab.main(["probe", "--task", task["_file"]]) == 0
+    out = capsys.readouterr().out
+    for k in ("17_tool_read_late_home", "18_tool_read_late_config", "19_tool_read_late_project",
+              "20_tool_read_other_session", "22_sub_grep_late_home", "23_sub_grep_climbs_out",
+              "24_sub_grep_tilde_project", "25_sub_grep_space_project"):
+        assert f"ok    step_{k}" in out
+    assert not any("_probe-late-" in r for r in seen["deny"])           # unknown to the settings: truly late
+    assert not list(Path.home().glob("_probe-late-*"))
+    assert not list((lab.lab_root() / "config").glob("_probe-late-*"))
+    assert not list((lab.lab_root() / "config" / "projects").glob("*/probe-other-session-*"))
+
+
+def test_probe_a_missing_tool_is_not_a_refusal(task, monkeypatch, capsys):
+    # live probes c157de6666 (Glob, 19.11) and b5da123f22 (Grep, 20.11): "No such tool" is no refusal
+    monkeypatch.setenv("FAKE_ABSENT_TOOLS", "Grep")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_22_sub_grep_late_home  (tool not available" in out and "boundary BROKEN" in out
+
+
+def test_probe_runs_grep_and_glob_in_the_grep_subagent(task, capsys):
+    # PR #8 review: the main session of 2.1.326 has no Grep/Glob, the lab's grep subagent has both
+    assert lab.main(["probe", "--task", task["_file"]]) == 0
+    out = capsys.readouterr().out
+    for label in ("21_task_grep_agent", "22_sub_grep_late_home", "23_sub_grep_climbs_out", "24_sub_grep_tilde_project",
+                  "25_sub_grep_space_project", "26_sub_glob_project", "27_sub_glob_tilde_project"):
+        assert f"ok    step_{label}" in out, label
+
+
+def test_probe_catches_a_guard_that_misreads_a_tilde_path(task, monkeypatch, capsys, tmp_path):
+    # the bypass of the PR #8 review: the old guard joined '~/...' and ' /abs' to the working copy; Claude Code
+    # expands and trims them (the fake does too) - the probe must see the read go through
+    src = (Path(lab.REPO) / "readguard.py").read_text()
+    old = (src.replace('    if path.startswith("~"):\n        return f"path starts with ~: {path!r}"\n', "")
+              .replace("    if path and (path[0].isspace()", "    if False and (path[0].isspace()"))
+    assert old != src
+    (tmp_path / "readguard.py").write_text(old)
+    real = lab.read_guard_hook
+
+    def broken(work, task_):
+        h = real(work, task_)
+        h["hooks"][0]["command"] = h["hooks"][0]["command"].replace(str(Path(lab.REPO) / "readguard.py"),
+                                                                    str(tmp_path / "readguard.py"))
+        return h
+    monkeypatch.setattr(lab, "read_guard_hook", broken)
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_24_sub_grep_tilde_project  (allowed" in out
+    assert "FAIL  step_25_sub_grep_space_project  (allowed" in out
+    assert "FAIL  step_27_sub_glob_tilde_project  (allowed" in out
+    assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+
+
+def test_judge_steps_a_denied_step_fails_if_a_later_call_got_through():
+    # PR #8 review (P3): a failing first try, then the same path succeeds - the step was counted as refused
+    calls = [("Agent", {"subagent_type": "grep"}, {"is_error": False, "text": "launched"}, None, "t9"),
+             ("Grep", {"path": "~/x", "pattern": "("}, {"is_error": True, "text": "regex error"}, "t9", "s1"),
+             ("Grep", {"path": "~/x", "pattern": "a"}, {"is_error": False, "text": "/x/secret.txt"}, "t9", "s2")]
+    step = [("24_sub_grep_tilde_project", "Grep", '"path": "~/x"', True, "sub")]
+    r = lab.judge_steps(calls, step)["24_sub_grep_tilde_project"]
+    assert r["ok"] is False and r["why"].startswith("allowed on a later call")
+    assert lab.judge_steps(calls[:2], step)["24_sub_grep_tilde_project"]["ok"] is True
+
+
+def test_judge_steps_takes_the_subagent_call_by_either_name():
+    # live probe c0a75b5374: init lists "Task", the model called "Agent"; the step was "not attempted"
+    for name in ("Task", "Agent"):
+        calls = [(name, {"subagent_type": "grep"}, {"is_error": False, "text": "launched"}, None, "t9"),
+                 ("Grep", {"path": "/x"}, {"is_error": True, "text": "denied"}, "t9", "s1")]
+        steps = [("21_task_grep_agent", "Task", '"subagent_type": "grep"', False),
+                 ("22_sub_grep_late_home", "Grep", '"path": "/x"', True, "sub")]
+        assert all(v["ok"] for v in lab.judge_steps(calls, steps).values()), name
+
+
+def test_judge_steps_takes_sub_steps_only_from_the_grep_subagent():
+    calls = [("Grep", {"path": "/x"}, {"is_error": True, "text": "denied"}, None, "m1"),
+             ("Task", {"subagent_type": "grep"}, {"is_error": False, "text": "launched"}, None, "t9"),
+             ("Grep", {"path": "/x"}, {"is_error": True, "text": "denied"}, "other", "s0"),
+             ("Grep", {"path": "/x"}, {"is_error": True, "text": "No such tool available: Grep"}, "t9", "s1")]
+    step = [("22_sub_grep_late_home", "Grep", '"path": "/x"', True, "sub")]
+    # the main session's call and another agent's do not count; the grep subagent's "No such tool" fails
+    assert lab.judge_steps(calls, step)["22_sub_grep_late_home"]["ok"] is False
+    assert lab.judge_steps(calls[:3], step)["22_sub_grep_late_home"]["why"] == "not attempted in the grep subagent"
+    assert lab.judge_steps(calls[:3] + [calls[2][:3] + ("t9", "s2")], step)["22_sub_grep_late_home"]["ok"] is True
+    assert lab.judge_steps([c for c in calls if c[0] != "Task"], step)["22_sub_grep_late_home"]["ok"] is False
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):

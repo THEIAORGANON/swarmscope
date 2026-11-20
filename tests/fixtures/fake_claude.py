@@ -54,25 +54,60 @@ def iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
 
 
-def hook(ev, **kw):
-    if "hooks" not in settings:
-        return None
-    d = dict(session_id=sid, hook_event_name=ev, cwd=cwd, transcript_path=str(tp), **kw)
-    h = settings["hooks"][ev][0]["hooks"][0]
+def _matches(matcher, tool):
+    return not matcher or matcher == "*" or (tool is not None and re.fullmatch(matcher, tool) is not None)
+
+
+def _run_one(h, d, ev):
+    """(output, failure) for one command hook, as Claude Code runs it: a failed start, an exit other than 0 or 2,
+    a timeout or invalid JSON is a failure; a hook past its timeout is killed and its output ignored."""
     p = subprocess.Popen(h["command"], shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:            # as Claude Code: a hook past its timeout is killed and its output ignored (a Stop goes through)
-        stdout, _ = p.communicate(json.dumps(d), timeout=h.get("timeout", 60))
+    try:
+        stdout, stderr = p.communicate(json.dumps(d), timeout=h.get("timeout", 60))
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
         p.communicate()
         with open(os.environ.get("FAKE_HOOK_KILLS", os.devnull), "a") as f:
             f.write(ev + "\n")
+        return None, "timed out"
+    if p.returncode == 2:
+        return {"_exit2": stderr}, None
+    if p.returncode != 0:
+        return None, f"failed (exit {p.returncode}): {stderr.strip()[-200:]}"
+    try:
+        return (json.loads(stdout) if stdout.strip() else None), None
+    except ValueError:
+        return None, "invalid JSON output"
+
+
+def hook(ev, **kw):
+    """Every hook of the event whose matcher fits the tool; the first deny or block decides, else the last output.
+    onFailure "block": a failed hook blocks (returned as {"_blocked": why})."""
+    if "hooks" not in settings:
         return None
-    return json.loads(stdout) if stdout.strip() else None
+    d = dict(session_id=sid, hook_event_name=ev, cwd=cwd, transcript_path=str(tp), **kw)
+    last = None
+    for entry in settings["hooks"].get(ev, []):
+        if not _matches(entry.get("matcher"), kw.get("tool_name")):
+            continue
+        for h in entry["hooks"]:
+            res, failure = _run_one(h, d, ev)
+            if failure:
+                if h.get("onFailure") == "block":
+                    return {"_blocked": f"{ev} hook error: {failure}; blocking because onFailure is \"block\""}
+                continue
+            if res and (res.get("_exit2") is not None or
+                        (res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"):
+                return res
+            last = res if res is not None else last
+    return last
 
 
-out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": ["Bash", "Edit"],
+ABSENT = [t for t in os.environ.get("FAKE_ABSENT_TOOLS", "").split(",") if t]  # tools this session lacks
+TOOLS = [t for t in ("Task", "Bash", "Edit", "Read", "Write") if t not in ABSENT]   # main session, as 2.1.326
+TOOLS += [t for t in os.environ.get("FAKE_EXTRA_TOOLS", "").split(",") if t]          # a tool that appeared
+out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": TOOLS,
      "mcp_servers": [], "agents": MODES["expected_agents"], "permissionMode": a[a.index("--permission-mode") + 1],
      "claude_code_version": MODES["claude_code"], "skills": json.loads(os.environ.get("FAKE_SKILLS", "[]")),
      "slash_commands": [], "plugins": [{"name": "cc-plugin-telemetry", "path": "builtin",
@@ -111,24 +146,85 @@ if "hooks" not in settings:                     # doctor --ping
     sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
 if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agent (FAKE_SKIP/LEAK/NET break it)
-    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool): (.+)$", prompt, re.M)
+    steps = re.findall(r"^(\d+)\. (?:\(grep subagent\) )?(Bash|Read tool|Write tool|Glob tool|Grep tool|Task tool): (.+)$",
+                       prompt, re.M)
     skip = os.environ.get("FAKE_SKIP", "")
     leaked = ""
     for n, tool, arg in steps:
         if n == skip:
             continue
-        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write"}[tool]
-        inp = {"command": arg} if name == "Bash" else {"file_path": arg.split(" containing")[0].replace("create ", "")}
-        allowed = n == "10" or (n == "9" and os.environ.get("FAKE_NET"))
+        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob", "Grep tool": "Grep",
+                "Task tool": "Task"}[tool]
+        if int(n) >= 21:                         # step 21 starts the grep subagent, 22-27 run inside it
+            if name == "Task":
+                out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_use",
+                     "id": "t21", "name": "Agent", "input": {"subagent_type": "grep", "description": "probe",
+                                                            "prompt": "steps 22-27"}}]}})
+                out({"type": "user", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_result",
+                     "tool_use_id": "t21", "content": "Async agent launched successfully."}]}})
+                continue
+            m = re.match(r'pattern "?(.*?)"?, path "(.*)"$', arg)
+            inp = {"pattern": m.group(1), "path": m.group(2)}
+            if name in ABSENT:                    # the subagent lacks the tool (FAKE_ABSENT_TOOLS)
+                allowed, text = False, f"<tool_use_error>Error: No such tool available: {name}</tool_use_error>"
+            else:
+                # the real guard decides; what it lets through is read the way Claude Code reads it: '~' expanded,
+                # edge whitespace trimmed (2.1.326) - so a guard that misjudges such a path leaks here
+                res = hook("PreToolUse", tool_name=name, tool_input=inp, agent_type="grep", agent_id="a1")
+                denied = res and ((res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+                                  or "_blocked" in res or res.get("_exit2") is not None)
+                if denied:
+                    allowed = False
+                    text = f"PreToolUse:{name} hook error: " + str((res.get("hookSpecificOutput") or {}).get(
+                        "permissionDecisionReason") or res.get("_blocked") or res.get("_exit2"))
+                else:
+                    target = Path(os.path.expanduser(inp["path"].strip()))
+                    target = target if target.is_absolute() else Path(cwd) / target
+                    found = [p for p in target.rglob("*") if p.is_file()] if target.is_dir() else []
+                    allowed = True
+                    text = "\n".join(f"{p}:{p.read_text(errors='replace').strip()}" for p in found[:20]) or "No files found"
+            use = {"type": "assistant", "parent_tool_use_id": "t21", "message": {"content": [
+                {"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}}
+            result = {"type": "user", "parent_tool_use_id": "t21", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}}
+            out(use)
+            out(result)
+            sub_tp = Path(str(tp)[:-6]) / "subagents" / "agent-a1.jsonl"      # the subagent's own transcript
+            sub_tp.parent.mkdir(parents=True, exist_ok=True)
+            with open(sub_tp, "a") as fh:
+                fh.write(json.dumps(use) + "\n" + json.dumps(result) + "\n")
+            continue
+        m = re.match(r"pattern (\S+) in path (.+)", arg)
+        inp = ({"command": arg} if name == "Bash" else {"pattern": arg.replace("pattern ", "", 1)} if name == "Glob"
+               else {"pattern": m.group(1), "path": m.group(2)} if name == "Grep"
+               else {"file_path": arg.split(" containing")[0].replace("create ", "")})
+        spill = Path(str(tp)[:-6]) / "tool-results" / "b3euojfv4.txt"     # Claude Code's spilled long output
+        if n == "12":
+            inp = {"file_path": os.environ.get("FAKE_SPILL_READ") or str(spill), "limit": 5}
+        elif n == "14":
+            inp = {"file_path": str(tp), "limit": 5}
+        elif n == "15":
+            inp = {"file_path": str(spill.parent / "probe-write.txt"), "content": "probe"}
+        allowed = (n in ("10", "11", "12") or (n == "9" and os.environ.get("FAKE_NET"))
+                   or (n == "14" and os.environ.get("FAKE_READ_TRANSCRIPT")))
         text = "ok" if n == "10" else ("<h1>Example Domain</h1>" if allowed else "Operation not permitted")
+        if os.environ.get("FAKE_NO_TOOL") == n or name in ABSENT:
+            text = f"<tool_use_error>Error: No such tool available: {name}.</tool_use_error>"
+        if n == "11":
+            spill.parent.mkdir(parents=True, exist_ok=True)
+            spill.write_text(arg + "\n")
+            text = f"Output too large (198.0KB). Full output saved to: {spill}"
+        elif n == "12":
+            text = "swarmscope-spill-line swarmscope-spill-line"
         if n == "1" and os.environ.get("FAKE_LEAK"):
             leaked = Path(arg.split()[-1]).read_text()
             text, allowed = leaked, True
         if n == "10":
             Path("inside.txt").write_text("ok\n")
-        out({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}})
-        out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{n}",
-                                                       "is_error": not allowed, "content": text}]}})
+        out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}})
+        out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}})
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "p1", "model": model, "content": [
         {"type": "text", "text": "1 BLOCKED " + leaked}], "usage": {"input_tokens": 10, "output_tokens": 5}}})
     hook("Stop", stop_hook_active=False)
@@ -164,6 +260,27 @@ if os.environ.get("FAKE_WEB"):                   # main: the session calls WebFe
         sub.mkdir(parents=True, exist_ok=True)
         web["message"]["model"] = "claude-haiku-5-5"
         (sub / "agent-web1.jsonl").write_text(json.dumps(web) + "\n")
+if os.environ.get("FAKE_GUARDED_READ"):          # a Read through the PreToolUse hooks, as Claude Code does it
+    inp = {"file_path": os.environ["FAKE_GUARDED_READ"]}
+    tr({"type": "assistant", "timestamp": iso(), "message": {"id": "mgr", "model": model, "content": [
+        {"type": "tool_use", "id": "tgr", "name": "Read", "input": inp}], "usage": {"input_tokens": 10, "output_tokens": 5}}})
+    res = hook("PreToolUse", tool_name="Read", tool_input=inp, tool_use_id="tgr")
+    refused = res and (res.get("_blocked") or res.get("_exit2") is not None or
+                       (res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny")
+    try:
+        text = json.dumps(res) if refused else Path(inp["file_path"]).read_text()
+    except OSError as e:
+        text = f"read failed: {e}"
+    tr({"type": "user", "timestamp": iso(), "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tgr", "is_error": bool(refused), "content": text}]}})
+    with open(os.environ.get("FAKE_GUARDED_LOG", os.devnull), "a") as f:
+        f.write(json.dumps({"refused": bool(refused), "res": res}) + "\n")
+if os.environ.get("FAKE_READ_OUTSIDE"):          # a Read that succeeds on a file outside the working copy
+    tr({"type": "assistant", "timestamp": iso(), "message": {"id": "mro", "model": model, "content": [
+        {"type": "tool_use", "id": "tro", "name": "Read", "input": {"file_path": os.environ["FAKE_READ_OUTSIDE"]}}],
+        "usage": {"input_tokens": 10, "output_tokens": 5}}})
+    tr({"type": "user", "timestamp": iso(), "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tro", "is_error": False, "content": "x"}]}})
 if os.environ.get("FAKE_VOLUNTARY_ADVISOR") and advisor:    # the agent consults the advisor on its own
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m1a", "model": model, "content": [
         {"type": "server_tool_use", "id": "srv9", "name": "advisor", "input": {}},
