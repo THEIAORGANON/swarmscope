@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -642,6 +642,35 @@ def test_probe_a_missing_tool_is_not_a_refusal(task, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_NO_TOOL", "21")
     assert lab.main(["probe", "--task", task["_file"]]) == 1
     assert "FAIL  step_21_grep_late_home  (tool not available" in capsys.readouterr().out
+
+
+def test_probe_a_tool_missing_from_the_session_is_not_applicable(task, monkeypatch, capsys):
+    # live probe b5da123f22 (20.11): Grep was not in the session's init tools; steps 21-22 are n/a, not failures
+    monkeypatch.setenv("FAKE_ABSENT_TOOLS", "Grep")
+    assert lab.main(["probe", "--task", task["_file"]]) == 0
+    out = capsys.readouterr().out
+    assert "n/a   step_21_grep_late_home  (n/a: Grep is not in this session's tools)" in out
+    assert "n/a   step_22_grep_climbs_out" in out
+    assert "boundary HOLDS" in out and "not applicable: 21_grep_late_home, 22_grep_climbs_out" in out
+    rj = json.loads(next(p for p in (lab.lab_root() / "runs").glob("*/run.json")
+                         if (json.loads(p.read_text()).get("probe") or {}).get("not_applicable")).read_text())
+    assert rj["probe"]["not_applicable"] == ["21_grep_late_home", "22_grep_climbs_out"]
+
+
+def test_probe_a_required_tool_missing_from_the_session_fails(task, monkeypatch, capsys):
+    # Read, Write and Bash cannot be n/a: without Read the boundary checks prove nothing
+    monkeypatch.setenv("FAKE_ABSENT_TOOLS", "Read")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_2_tool_read_canary  (tool not available" in out and "boundary BROKEN" in out
+
+
+def test_judge_steps_n_a_needs_the_session_tool_list():
+    calls = [("Grep", {"path": "/x"}, {"is_error": True, "text": "No such tool available: Grep"})]
+    step = [("21_grep_late_home", "Grep", "/x", True)]
+    assert lab.judge_steps(calls, step, ["Read", "Bash"])["21_grep_late_home"]["na"] is True
+    assert lab.judge_steps(calls, step, ["Read", "Grep"])["21_grep_late_home"]["ok"] is False   # listed tool
+    assert lab.judge_steps(calls, step, None)["21_grep_late_home"]["ok"] is False             # unknown list
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):

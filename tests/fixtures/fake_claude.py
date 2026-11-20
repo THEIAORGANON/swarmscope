@@ -104,7 +104,9 @@ def hook(ev, **kw):
     return last
 
 
-out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": ["Bash", "Edit"],
+ABSENT = [t for t in os.environ.get("FAKE_ABSENT_TOOLS", "").split(",") if t]  # tools this session lacks
+TOOLS = [t for t in ("Bash", "Edit", "Read", "Write", "Grep") if t not in ABSENT]
+out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": TOOLS,
      "mcp_servers": [], "agents": MODES["expected_agents"], "permissionMode": a[a.index("--permission-mode") + 1],
      "claude_code_version": MODES["claude_code"], "skills": json.loads(os.environ.get("FAKE_SKILLS", "[]")),
      "slash_commands": [], "plugins": [{"name": "cc-plugin-telemetry", "path": "builtin",
@@ -164,8 +166,8 @@ if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agen
         allowed = (n in ("10", "11", "12") or (n == "9" and os.environ.get("FAKE_NET"))
                    or (n == "14" and os.environ.get("FAKE_READ_TRANSCRIPT")))
         text = "ok" if n == "10" else ("<h1>Example Domain</h1>" if allowed else "Operation not permitted")
-        if os.environ.get("FAKE_NO_TOOL") == n:
-            text = "<tool_use_error>Error: No such tool available: Grep.</tool_use_error>"
+        if os.environ.get("FAKE_NO_TOOL") == n or name in ABSENT:
+            text = f"<tool_use_error>Error: No such tool available: {name}.</tool_use_error>"
         if n == "11":
             spill.parent.mkdir(parents=True, exist_ok=True)
             spill.write_text(arg + "\n")

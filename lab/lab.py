@@ -2012,9 +2012,16 @@ def probe_steps(canary, runs, write_bash, write_tool, hidden, other_result=None,
             ("9_bash_network", "Bash", "example.com", True), ("10_bash_write_inside", "Bash", "inside.txt", False)] + spill
 
 
-def judge_steps(calls, steps):
+# probe steps whose tool may be missing from a session: Claude Code 2.1.326 offered neither Glob (19.11) nor
+# Grep (20.11); Read, Write and Bash are required
+OPTIONAL_PROBE_TOOLS = ("Glob", "Grep", "LS", "NotebookRead")
+
+
+def judge_steps(calls, steps, session_tools=None):
     """Each step needs an observed attempt with the named tool and the expected outcome: an explicit error
-    for a denied step, success for the allowed one. A skipped step is a failure, never a pass."""
+    for a denied step, success for the allowed one. A skipped step is a failure, never a pass. A step of an
+    optional tool is not applicable (ok, na) only when the session's init did not list that tool and the call
+    met "No such tool available"; a listed tool that answers so, or a required tool, still fails."""
     out, used = {}, set()
     for label, tool, needle, must_fail in steps:
         hit = next((k for k, (name, inp, res) in enumerate(calls)
@@ -2028,7 +2035,10 @@ def judge_steps(calls, steps):
             out[label] = {"ok": False, "why": "no tool result"}
         elif "No such tool available" in res["text"]:
             # a refusal only counts when the tool exists: a missing tool proves nothing (Glob, 19.11)
-            out[label] = {"ok": False, "why": "tool not available in this session: " + res["text"][:80]}
+            if tool in OPTIONAL_PROBE_TOOLS and session_tools is not None and tool not in session_tools:
+                out[label] = {"ok": True, "na": True, "why": f"n/a: {tool} is not in this session's tools"}
+            else:
+                out[label] = {"ok": False, "why": "tool not available in this session: " + res["text"][:80]}
         elif res["is_error"] != must_fail:
             out[label] = {"ok": False, "why": ("allowed" if must_fail else "refused") + ": " + res["text"][:120]}
         else:
@@ -2113,8 +2123,9 @@ def cmd_probe(a):
                  if p and Path(p).exists()]
         blob = "\n".join(texts)
         calls = tool_calls(stream)
+        session_tools = (rj.get("loaded") or {}).get("tools")
         steps = judge_steps(calls, probe_steps(canary, runs, write_bash, write_tool, hidden_file,
-                                               other_result, config_canary, late))
+                                               other_result, config_canary, late), session_tools)
         for label, v in steps.items():
             checks[f"step_{label}"] = v["ok"]
         # step 12 must have read the very file step 11's result named, in this session's own tool-results
@@ -2151,15 +2162,18 @@ def cmd_probe(a):
     recs, _ = jl(lab / "runs" / rj["run_id"] / "stream.jsonl")
     res = next((r for r in reversed(recs or []) if r.get("type") == "result"), {})
     answer = str(res.get("result", ""))
+    na = [label for label, v in steps.items() if v.get("na")]
     rj["probe"] = {"checks": checks, "steps": steps, "passed": bool(checks) and all(checks.values()),
-                   "agent_report": answer[:2000]}
+                   "not_applicable": na, "agent_report": answer[:2000]}
     (lab / "runs" / rj["run_id"] / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False, default=str))
     print("\nprobe checks:")
     for k, v in checks.items():
         why = steps.get(k[5:], {}).get("why", "") if k.startswith("step_") else ""
-        print(f"  {'ok  ' if v else 'FAIL'}  {k}" + (f"  ({why[:70]})" if why and not v else ""))
+        isna = k.startswith("step_") and steps.get(k[5:], {}).get("na")
+        print(f"  {'n/a ' if isna else 'ok  ' if v else 'FAIL'}  {k}" + (f"  ({why[:70]})" if why and (isna or not v) else ""))
     print("\nagent's report:\n" + answer.strip()[:2000])
-    print("\nboundary " + ("HOLDS" if rj["probe"]["passed"] else "BROKEN") + f"  (run {rj['run_id']})")
+    print("\nboundary " + ("HOLDS" if rj["probe"]["passed"] else "BROKEN") + f"  (run {rj['run_id']})"
+          + (f"  not applicable: {', '.join(na)}" if na else ""))
     return 0 if rj["probe"]["passed"] else 1
 
 
