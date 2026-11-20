@@ -11,9 +11,27 @@ error is a deny."""
 import json
 import os
 import sys
+import unicodedata
 
 READ_TOOLS = ("Read", "Glob", "Grep", "LS", "NotebookRead")
 GLOB_CHARS = set("*?[{")
+
+
+def _odd(path):
+    """Why a path string cannot be resolved the way Claude Code will resolve it, or None. Claude Code expands a
+    leading '~' and trims surrounding whitespace before it reads (Grep/Glob path, 2.1.326: PR #8 review), so such
+    a string named one place to this guard and another to the tool. Refused rather than imitated: any edge
+    whitespace or invisible character, a control or format character anywhere, a leading '~' and a non-string."""
+    if not isinstance(path, str):
+        return f"path is not a string: {type(path).__name__}"
+    if path.startswith("~"):
+        return f"path starts with ~: {path!r}"
+    if path and (path[0].isspace() or path[-1].isspace() or not path[0].isprintable() or not path[-1].isprintable()
+                 or unicodedata.category(path[0]) in ("Cf", "Zs") or unicodedata.category(path[-1]) in ("Cf", "Zs")):
+        return f"path has whitespace or an invisible character at an edge: {path!r}"
+    if any(unicodedata.category(c) in ("Cc", "Cf") for c in path):
+        return f"path has a control or format character: {path!r}"
+    return None
 
 
 def _real(path, cwd):
@@ -28,14 +46,22 @@ def targets(tool, ti, cwd):
     """Every path the call can read: (paths, problem). A Glob pattern can leave its path: its fixed leading part
     joins the path, and a '..' after a wildcard is refused (its reach cannot be bounded)."""
     ti = ti if isinstance(ti, dict) else {}
-    if tool == "Read":
-        return [_real(ti.get("file_path") or "", cwd)], None
-    if tool == "NotebookRead":
-        return [_real(ti.get("notebook_path") or "", cwd)], None
-    base = _real(ti.get("path") or cwd or "/", cwd)
+    key = {"Read": "file_path", "NotebookRead": "notebook_path"}.get(tool, "path")
+    raw = ti.get(key)
+    if raw is not None:
+        problem = _odd(raw)
+        if problem:
+            return [], problem
+    if tool in ("Read", "NotebookRead"):
+        return [_real(raw or "", cwd)], None
+    base = _real(raw or cwd or "/", cwd)
     if tool != "Glob":
         return [base], None
-    pat = str(ti.get("pattern") or "")
+    pat = ti.get("pattern")
+    problem = _odd(pat) if pat is not None else None
+    if problem:
+        return [], "glob " + problem
+    pat = pat or ""
     parts = pat.split("/")
     fixed = []
     for k, seg in enumerate(parts):
@@ -47,8 +73,6 @@ def targets(tool, ti, cwd):
     head = "/".join(fixed)
     if pat.startswith("/"):
         head = head or "/"                     # "/[U]sers/..." or "/*/...": the fixed part is the root itself
-    elif pat.startswith("~"):
-        return [], f"glob pattern starts with ~: {pat}"
     root = _real(head, base) if head else base
     return [root], None
 

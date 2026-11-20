@@ -105,7 +105,7 @@ def hook(ev, **kw):
 
 
 ABSENT = [t for t in os.environ.get("FAKE_ABSENT_TOOLS", "").split(",") if t]  # tools this session lacks
-TOOLS = [t for t in ("Bash", "Edit", "Read", "Write", "Grep") if t not in ABSENT]
+TOOLS = [t for t in ("Task", "Bash", "Edit", "Read", "Write") if t not in ABSENT]   # main session, as 2.1.326
 out({"type": "system", "subtype": "init", "session_id": sid, "cwd": cwd, "model": model, "tools": TOOLS,
      "mcp_servers": [], "agents": MODES["expected_agents"], "permissionMode": a[a.index("--permission-mode") + 1],
      "claude_code_version": MODES["claude_code"], "skills": json.loads(os.environ.get("FAKE_SKILLS", "[]")),
@@ -145,13 +145,54 @@ if "hooks" not in settings:                     # doctor --ping
     sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
 if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agent (FAKE_SKIP/LEAK/NET break it)
-    steps = re.findall(r"^(\d+)\. (Bash|Read tool|Write tool|Glob tool|Grep tool): (.+)$", prompt, re.M)
+    steps = re.findall(r"^(\d+)\. (?:\(grep subagent\) )?(Bash|Read tool|Write tool|Glob tool|Grep tool|Task tool): (.+)$",
+                       prompt, re.M)
     skip = os.environ.get("FAKE_SKIP", "")
     leaked = ""
     for n, tool, arg in steps:
         if n == skip:
             continue
-        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob", "Grep tool": "Grep"}[tool]
+        name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob", "Grep tool": "Grep",
+                "Task tool": "Task"}[tool]
+        if int(n) >= 21:                         # step 21 starts the grep subagent, 22-27 run inside it
+            if name == "Task":
+                out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_use",
+                     "id": "t21", "name": "Task", "input": {"subagent_type": "grep", "description": "probe",
+                                                            "prompt": "steps 22-27"}}]}})
+                out({"type": "user", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_result",
+                     "tool_use_id": "t21", "content": "Async agent launched successfully."}]}})
+                continue
+            m = re.match(r'pattern "?(.*?)"?, path "(.*)"$', arg)
+            inp = {"pattern": m.group(1), "path": m.group(2)}
+            if name in ABSENT:                    # the subagent lacks the tool (FAKE_ABSENT_TOOLS)
+                allowed, text = False, f"<tool_use_error>Error: No such tool available: {name}</tool_use_error>"
+            else:
+                # the real guard decides; what it lets through is read the way Claude Code reads it: '~' expanded,
+                # edge whitespace trimmed (2.1.326) - so a guard that misjudges such a path leaks here
+                res = hook("PreToolUse", tool_name=name, tool_input=inp, agent_type="grep", agent_id="a1")
+                denied = res and ((res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+                                  or "_blocked" in res or res.get("_exit2") is not None)
+                if denied:
+                    allowed = False
+                    text = f"PreToolUse:{name} hook error: " + str((res.get("hookSpecificOutput") or {}).get(
+                        "permissionDecisionReason") or res.get("_blocked") or res.get("_exit2"))
+                else:
+                    target = Path(os.path.expanduser(inp["path"].strip()))
+                    target = target if target.is_absolute() else Path(cwd) / target
+                    found = [p for p in target.rglob("*") if p.is_file()] if target.is_dir() else []
+                    allowed = True
+                    text = "\n".join(f"{p}:{p.read_text(errors='replace').strip()}" for p in found[:20]) or "No files found"
+            use = {"type": "assistant", "parent_tool_use_id": "t21", "message": {"content": [
+                {"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}}
+            result = {"type": "user", "parent_tool_use_id": "t21", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}}
+            out(use)
+            out(result)
+            sub_tp = Path(str(tp)[:-6]) / "subagents" / "agent-a1.jsonl"      # the subagent's own transcript
+            sub_tp.parent.mkdir(parents=True, exist_ok=True)
+            with open(sub_tp, "a") as fh:
+                fh.write(json.dumps(use) + "\n" + json.dumps(result) + "\n")
+            continue
         m = re.match(r"pattern (\S+) in path (.+)", arg)
         inp = ({"command": arg} if name == "Bash" else {"pattern": arg.replace("pattern ", "", 1)} if name == "Glob"
                else {"pattern": m.group(1), "path": m.group(2)} if name == "Grep"
@@ -179,9 +220,10 @@ if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agen
             text, allowed = leaked, True
         if n == "10":
             Path("inside.txt").write_text("ok\n")
-        out({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}})
-        out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{n}",
-                                                       "is_error": not allowed, "content": text}]}})
+        out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_use", "id": f"t{n}", "name": name, "input": inp}]}})
+        out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}})
     tr({"type": "assistant", "timestamp": iso(), "message": {"id": "p1", "model": model, "content": [
         {"type": "text", "text": "1 BLOCKED " + leaked}], "usage": {"input_tokens": 10, "output_tokens": 5}}})
     hook("Stop", stop_hook_active=False)

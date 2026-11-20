@@ -629,7 +629,8 @@ def test_probe_creates_late_paths_after_the_settings_and_cleans_them(task, capsy
     assert lab.main(["probe", "--task", task["_file"]]) == 0
     out = capsys.readouterr().out
     for k in ("17_tool_read_late_home", "18_tool_read_late_config", "19_tool_read_late_project",
-              "20_tool_read_other_session", "21_grep_late_home", "22_grep_climbs_out"):
+              "20_tool_read_other_session", "22_sub_grep_late_home", "23_sub_grep_climbs_out",
+              "24_sub_grep_tilde_project", "25_sub_grep_space_project"):
         assert f"ok    step_{k}" in out
     assert not any("_probe-late-" in r for r in seen["deny"])           # unknown to the settings: truly late
     assert not list(Path.home().glob("_probe-late-*"))
@@ -638,39 +639,57 @@ def test_probe_creates_late_paths_after_the_settings_and_cleans_them(task, capsy
 
 
 def test_probe_a_missing_tool_is_not_a_refusal(task, monkeypatch, capsys):
-    # live probe c157de6666: Glob did not exist in the session and its "No such tool" counted as refused
-    monkeypatch.setenv("FAKE_NO_TOOL", "21")
-    assert lab.main(["probe", "--task", task["_file"]]) == 1
-    assert "FAIL  step_21_grep_late_home  (tool not available" in capsys.readouterr().out
-
-
-def test_probe_a_tool_missing_from_the_session_is_not_applicable(task, monkeypatch, capsys):
-    # live probe b5da123f22 (20.11): Grep was not in the session's init tools; steps 21-22 are n/a, not failures
+    # live probes c157de6666 (Glob, 19.11) and b5da123f22 (Grep, 20.11): "No such tool" is no refusal
     monkeypatch.setenv("FAKE_ABSENT_TOOLS", "Grep")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_22_sub_grep_late_home  (tool not available" in out and "boundary BROKEN" in out
+
+
+def test_probe_runs_grep_and_glob_in_the_grep_subagent(task, capsys):
+    # PR #8 review: the main session of 2.1.326 has no Grep/Glob, the lab's grep subagent has both
     assert lab.main(["probe", "--task", task["_file"]]) == 0
     out = capsys.readouterr().out
-    assert "n/a   step_21_grep_late_home  (n/a: Grep is not in this session's tools)" in out
-    assert "n/a   step_22_grep_climbs_out" in out
-    assert "boundary HOLDS" in out and "not applicable: 21_grep_late_home, 22_grep_climbs_out" in out
-    rj = json.loads(next(p for p in (lab.lab_root() / "runs").glob("*/run.json")
-                         if (json.loads(p.read_text()).get("probe") or {}).get("not_applicable")).read_text())
-    assert rj["probe"]["not_applicable"] == ["21_grep_late_home", "22_grep_climbs_out"]
+    for label in ("21_task_grep_agent", "22_sub_grep_late_home", "23_sub_grep_climbs_out", "24_sub_grep_tilde_project",
+                  "25_sub_grep_space_project", "26_sub_glob_project", "27_sub_glob_tilde_project"):
+        assert f"ok    step_{label}" in out, label
 
 
-def test_probe_a_required_tool_missing_from_the_session_fails(task, monkeypatch, capsys):
-    # Read, Write and Bash cannot be n/a: without Read the boundary checks prove nothing
-    monkeypatch.setenv("FAKE_ABSENT_TOOLS", "Read")
+def test_probe_catches_a_guard_that_misreads_a_tilde_path(task, monkeypatch, capsys, tmp_path):
+    # the bypass of the PR #8 review: the old guard joined '~/...' and ' /abs' to the working copy; Claude Code
+    # expands and trims them (the fake does too) - the probe must see the read go through
+    src = (Path(lab.REPO) / "readguard.py").read_text()
+    old = (src.replace('    if path.startswith("~"):\n        return f"path starts with ~: {path!r}"\n', "")
+              .replace("    if path and (path[0].isspace()", "    if False and (path[0].isspace()"))
+    assert old != src
+    (tmp_path / "readguard.py").write_text(old)
+    real = lab.read_guard_hook
+
+    def broken(work, task_):
+        h = real(work, task_)
+        h["hooks"][0]["command"] = h["hooks"][0]["command"].replace(str(Path(lab.REPO) / "readguard.py"),
+                                                                    str(tmp_path / "readguard.py"))
+        return h
+    monkeypatch.setattr(lab, "read_guard_hook", broken)
     assert lab.main(["probe", "--task", task["_file"]]) == 1
     out = capsys.readouterr().out
-    assert "FAIL  step_2_tool_read_canary  (tool not available" in out and "boundary BROKEN" in out
+    assert "FAIL  step_24_sub_grep_tilde_project  (allowed" in out
+    assert "FAIL  step_25_sub_grep_space_project  (allowed" in out
+    assert "FAIL  step_27_sub_glob_tilde_project  (allowed" in out
+    assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
 
 
-def test_judge_steps_n_a_needs_the_session_tool_list():
-    calls = [("Grep", {"path": "/x"}, {"is_error": True, "text": "No such tool available: Grep"})]
-    step = [("21_grep_late_home", "Grep", "/x", True)]
-    assert lab.judge_steps(calls, step, ["Read", "Bash"])["21_grep_late_home"]["na"] is True
-    assert lab.judge_steps(calls, step, ["Read", "Grep"])["21_grep_late_home"]["ok"] is False   # listed tool
-    assert lab.judge_steps(calls, step, None)["21_grep_late_home"]["ok"] is False             # unknown list
+def test_judge_steps_takes_sub_steps_only_from_the_grep_subagent():
+    calls = [("Grep", {"path": "/x"}, {"is_error": True, "text": "denied"}, None, "m1"),
+             ("Task", {"subagent_type": "grep"}, {"is_error": False, "text": "launched"}, None, "t9"),
+             ("Grep", {"path": "/x"}, {"is_error": True, "text": "denied"}, "other", "s0"),
+             ("Grep", {"path": "/x"}, {"is_error": True, "text": "No such tool available: Grep"}, "t9", "s1")]
+    step = [("22_sub_grep_late_home", "Grep", '"path": "/x"', True, "sub")]
+    # the main session's call and another agent's do not count; the grep subagent's "No such tool" fails
+    assert lab.judge_steps(calls, step)["22_sub_grep_late_home"]["ok"] is False
+    assert lab.judge_steps(calls[:3], step)["22_sub_grep_late_home"]["why"] == "not attempted in the grep subagent"
+    assert lab.judge_steps(calls[:3] + [calls[2][:3] + ("t9", "s2")], step)["22_sub_grep_late_home"]["ok"] is True
+    assert lab.judge_steps([c for c in calls if c[0] != "Task"], step)["22_sub_grep_late_home"]["ok"] is False
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):

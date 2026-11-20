@@ -123,3 +123,37 @@ def test_main_hook_no_longer_decides_on_reads(tree, tmp_path):
                        input=json.dumps(call("Read", {"file_path": str(t / "late" / "f")}, work, proj)),
                        capture_output=True, text=True, env=env, cwd=str(work))
     assert r.stdout.strip() == ""
+
+
+def test_paths_claude_code_would_rewrite_are_denied(tree, monkeypatch):
+    # PR #8 review (ac8fd50), reproduced on the real Claude Code 2.1.326 through the lab's grep subagent: Grep/Glob
+    # get their path with '~' expanded and edge whitespace trimmed by Claude Code, after the guard; the guard joined
+    # '~/...' and ' /abs' to the working copy and let them through, and so did the audit (read_outside)
+    t, work, proj = tree
+    monkeypatch.setenv("HOME", str(t))
+    spec = {"allow": [str(work)]}
+    other = str(proj / "S2" / "tool-results")
+    for tool, ti in [("Grep", {"pattern": "k", "path": "~/cfg/projects/-w"}),
+                     ("Grep", {"pattern": "k", "path": "~"}),
+                     ("Grep", {"pattern": "k", "path": " " + other}), ("Grep", {"pattern": "k", "path": other + " "}),
+                     ("Grep", {"pattern": "k", "path": "\t" + other}), ("Grep", {"pattern": "k", "path": "﻿" + other}),
+                     ("Grep", {"pattern": "k", "path": other + "​"}),
+                     ("Grep", {"pattern": "k", "path": str(work) + "\n" + other}),
+                     ("Glob", {"pattern": "**/*", "path": "~/cfg"}), ("Glob", {"pattern": "~/cfg/**"}),
+                     ("Glob", {"pattern": " " + other + "/*"}), ("Glob", {"pattern": "*", "path": " " + other}),
+                     ("LS", {"path": "~/cfg"}), ("Read", {"file_path": "~/cfg/projects/-w/S2.jsonl"}),
+                     ("Read", {"file_path": " " + other + "/x.txt"}), ("NotebookRead", {"notebook_path": "~/n.ipynb"}),
+                     ("Grep", {"pattern": "k", "path": ["/"]})]:
+        reason = readguard.check(call(tool, ti, work, proj), spec)
+        assert reason, (tool, ti)
+        assert readguard.targets(tool, ti, str(work))[1], (tool, ti)        # the audit sees the same problem
+
+
+def test_ordinary_paths_still_pass(tree):
+    t, work, proj = tree
+    spec = {"allow": [str(work)]}
+    for tool, ti in [("Grep", {"pattern": "  spaced pattern  ", "path": "src"}),   # the pattern is not a path
+                     ("Grep", {"pattern": "k", "path": str(work / "src") + "/"}),
+                     ("Grep", {"pattern": "k", "path": "src/a b.py"}),
+                     ("Glob", {"pattern": "src/**/*.py"}), ("Read", {"file_path": "src/~x.py"})]:
+        assert readguard.check(call(tool, ti, work, proj), spec) is None, (tool, ti)
