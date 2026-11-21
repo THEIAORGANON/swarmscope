@@ -42,7 +42,7 @@
   "deviations": [
     "wzf-cond cost $7.38 for 3 runs against the 'about $2-3' estimate given to the author (estimate, not part of this declaration); Opus, called voluntarily three times per run, was about 54% of it",
     "pk-prerel: session budget raised to 1800 s for the corrected task (all modes), declared after debugging batch 20261121-095543-9d9f, before any run on the corrected task",
-    "pk-prerel: one A run invalid on the subscription's five-hour rate limit, replaced in a new batch with seed 612 (602 left a planned repeat unrun)"
+    "pk-prerel: repeat #2 of batch 20261121-121818-2958 (seed 602) ran and was invalid on the subscription's five-hour rate limit (api_interrupted); its slot was replaced by one run in a new batch with seed 612"
   ],
   "result": null,
   "screened": {
