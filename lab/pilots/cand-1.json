@@ -132,5 +132,13 @@
       ],
       "kept": "run directories and costs stay; the corrected manifest has a new task hash, so reports keep the versions apart"
     }
+  },
+  "operator_reported_failures": {
+    "rule": "ChatGPT, 21.11: a known infrastructure failure that the logs cannot show (e.g. the author's network outage) is excluded by hand, for the analysis only",
+    "record": "source operator_reported, time or interval of the failure, affected runs, reason",
+    "scope": "every attempt that falls under it is excluded alike, successful ones included",
+    "kept": "the original run.json, the machine 'valid' and all costs stay as they are; the exclusion lives here",
+    "not_enough": "a suspicion that arises only from a failed outcome is no ground",
+    "entries": []
   }
 }

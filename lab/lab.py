@@ -1588,7 +1588,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         if gap == "mismatch":
             problems.append(f"cost mismatch: claude code {cc:.4f} vs costs.py {c['total_usd']:.4f}")
         rj["costs"]["run_usd"], rj["costs"]["run_usd_status"] = run_usd(rj["costs"])
-        rj["models_seen"], p = check_models(result, c, modes, mode)
+        rj["models_seen"], p = check_models(result, full, modes, mode)   # the whole run, tail included
         problems += p
         web = web_tool_uses(tp)
         rj["observation"]["web_tool_uses"] = len(web)
@@ -1761,6 +1761,8 @@ def calibration(run_jsons, mode="A", batch=None):
             t["cost_usd"].append(run_cost(rj))         # the whole run; how far confirmed is counted beside it
             if run_cost_status(rj) != "confirmed":
                 t["cost_unconfirmed"] = t.get("cost_unconfirmed", 0) + 1
+            else:
+                t.setdefault("cost_usd_confirmed", []).append(run_cost(rj))
         for name in h.get("not_passed") or []:
             t["not_passed"][name] = t["not_passed"].get(name, 0) + 1
     return out
@@ -1846,8 +1848,9 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None, manifests=None, repla
         if (not plan.get("paired") or rj.get("mode") not in modes or not in_scope(plan.get("batch_id"))
                 or is_diagnostic(rj)):
             continue
-        sp = spend.setdefault(rj.get("task_id"), {"usd": 0.0, "runs": 0, "outside_pairs_usd": 0.0})
+        sp = spend.setdefault(rj.get("task_id"), {"usd": 0.0, "runs": 0, "outside_pairs_usd": 0.0, "unconfirmed": 0})
         sp["usd"] += run_cost(rj)
+        sp["unconfirmed"] += run_cost_status(rj) != "confirmed"
         sp["runs"] += 1
         if not (rj.get("finished_at") and rj.get("verdict")):
             sp["outside_pairs_usd"] += run_cost(rj)
@@ -2007,12 +2010,16 @@ def cmd_pairs(a):
         print("corrected report: revalidated.json applied where present (run.json records unchanged)")
     for row, t in sorted(report["rows"].items()):
         n = len(t["pairs"])
-        tot = totals.setdefault(t["setup"], {ma: 0.0, mb: 0.0, "pairs": 0, "tasks": set()})
+        tot = totals.setdefault(t["setup"], {ma: 0.0, mb: 0.0, "pairs": 0, "tasks": set(), "unconfirmed": 0,
+                                             "conf_pairs": 0, "conf_diff": 0.0})
         if n:
             tot[ma] += t[f"{ma}_usd_total"]
             tot[mb] += t[f"{mb}_usd_total"]
             tot["pairs"] += n
             tot["tasks"].add(t["task_id"])
+            tot["unconfirmed"] += sum((x[m]["usd_status"] != "confirmed") for x in t["pairs"] for m in (ma, mb))
+            tot["conf_pairs"] += t["confirmed_cost_pairs"]
+            tot["conf_diff"] += sum(x["diff_usd"] for x in t["pairs"] if x["cost_confirmed"])
         md = f"{t['mean_diff_usd']:+.3f}" if t["mean_diff_usd"] is not None else "-"
         print(f"{row:<23} pairs {n}  mean {mb}-{ma} ${md}  success {ma} {t[f'{ma}_success']}/{n} {mb} {t[f'{mb}_success']}/{n}"
               + (f"  (+{t['invalid_pairs']} invalid)" if t["invalid_pairs"] else "")
@@ -2031,8 +2038,12 @@ def cmd_pairs(a):
         print(f"note: {len(totals)} different setups; totals are given per setup and never pooled")
     for sk, tot in sorted(totals.items()):
         if tot["pairs"]:
-            print(f"total [setup {sk}] over {tot['pairs']} pairs, {len(tot['tasks'])} tasks: {ma} ${tot[ma]:.2f}  "
-                  f"{mb} ${tot[mb]:.2f}  mean {mb}-{ma} ${(tot[mb] - tot[ma]) / tot['pairs']:+.3f}")
+            est = "~" if tot["unconfirmed"] else ""
+            print(f"total [setup {sk}] over {tot['pairs']} pairs, {len(tot['tasks'])} tasks: {ma} {est}${tot[ma]:.2f}  "
+                  f"{mb} {est}${tot[mb]:.2f}  mean {mb}-{ma} {est}${(tot[mb] - tot[ma]) / tot['pairs']:+.3f}"
+                  + (f"  ({tot['unconfirmed']} run cost(s) estimated; confirmed pairs {tot['conf_pairs']}/{tot['pairs']}"
+                     + (f": mean ${tot['conf_diff'] / tot['conf_pairs']:+.3f})" if tot["conf_pairs"] else ")")
+                     if tot["unconfirmed"] else ""))
     if not any(t["pairs"] for t in report["rows"].values()):
         print("no valid pairs")
     if report["accounting"]:
@@ -2045,8 +2056,11 @@ def cmd_pairs(a):
     if sp:
         allu = sum(v["usd"] for v in sp.values())
         out_ = sum(v["outside_pairs_usd"] for v in sp.values())
-        print(f"spent: ${allu:.2f} over {sum(v['runs'] for v in sp.values())} runs, of it ${out_:.2f} outside the "
-              f"valid pairs (interrupted, invalid, unpaired, replaced)")
+        unc = sum(v.get("unconfirmed", 0) for v in sp.values())
+        est = "~" if unc else ""
+        print(f"spent: {est}${allu:.2f} over {sum(v['runs'] for v in sp.values())} runs, of it {est}${out_:.2f} outside the "
+              f"valid pairs (interrupted, invalid, unpaired, replaced)"
+              + (f"; {unc} run cost(s) estimated, not confirmed by Claude Code's total" if unc else ""))
     return 0
 
 
@@ -2118,7 +2132,11 @@ def cmd_calib(a):
     for key in table:
         seen[table[key]["task_id"]] = seen.get(table[key]["task_id"], 0) + 1
     for key, t in sorted(table.items(), key=lambda kv: str(kv[0])):
-        cost = f"${sum(t['cost_usd']) / len(t['cost_usd']):.3f}" if t["cost_usd"] else "-"
+        unc = t.get("cost_unconfirmed", 0)
+        conf = t.get("cost_usd_confirmed") or []
+        cost = (("~" if unc else "") + f"${sum(t['cost_usd']) / len(t['cost_usd']):.3f}" if t["cost_usd"] else "-") + (
+            f" ({unc} of {len(t['cost_usd'])} estimated; confirmed mean "
+            + (f"${sum(conf) / len(conf):.3f} over {len(conf)})" if conf else "none)") if unc else "")
         print(f"{key:<20} {a.mode}: {t['success']}/{t['valid']} success  hidden {t['passed']} of "
               f"{t['expected'] or '-'}  mean {cost}" + (f"  (+{t['invalid']} invalid)" if t["invalid"] else "")
               + (f"  batches {', '.join(t['batches'])}" if t["batches"] else ""))

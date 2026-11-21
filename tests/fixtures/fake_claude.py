@@ -8,7 +8,7 @@ FAKE_SUSPEND=1|noretry  Claude Code bills $0.05 more than the transcript holds; 
 FAKE_ADVISOR_NO_RESULT=1|paid  an advisor request that never returns; paid: Claude Code still bills the advisor
 FAKE_ADVISOR_HANDOFF=1|only  on a block: Bash then an advisor call in one message, never run (only: no second call)
 FAKE_TAIL_AFTER_RESULT=<s>  after the result: a task notification and one more lead message, then sleep <s>
-FAKE_TAIL_SUB=1     with FAKE_TAIL_AFTER_RESULT: a subagent message after the result as well
+FAKE_TAIL_SUB=1     with FAKE_TAIL_AFTER_RESULT: a subagent message after the result as well (FAKE_TAIL_SUB_MODEL=<id>)
 FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never reached (as on 17.11),
                     mid: the API fails after work began, warn: the session still finishes normally"""
 import json
@@ -352,7 +352,7 @@ if os.environ.get("FAKE_TAIL_AFTER_RESULT"):
     out(tail_msg)
     if os.environ.get("FAKE_TAIL_SUB"):           # a subagent works on after the result too (ChatGPT, 21.11)
         sub_msg = {"type": "assistant", "timestamp": iso(), "parent_tool_use_id": "tsub", "message": {
-            "id": "msub", "model": model, "content": [{"type": "text", "text": "sub"}],
+            "id": "msub", "model": os.environ.get("FAKE_TAIL_SUB_MODEL", model), "content": [{"type": "text", "text": "sub"}],
             "usage": {"input_tokens": 30000, "output_tokens": 1500, "cache_read_input_tokens": 0,
                       "cache_creation_input_tokens": 0}}}
         sp = Path(str(tp)[:-6]) / "subagents" / "agent-s1.jsonl"

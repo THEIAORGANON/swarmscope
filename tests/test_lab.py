@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_TAIL_SUB_MODEL,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -373,6 +373,48 @@ def test_a_subagent_after_the_result_stays_in_the_tail(task, monkeypatch):
     assert c["by_model_reconciled"]["subagents"] == {} and c["by_model"]["subagents"]["s1"]["usd"] > 0
     assert c["run_usd_status"] == "partly_confirmed"
     assert abs(c["run_usd"] - (c["claude_code_total_usd"] + c["tail_after_result"]["usd"])) < 1e-6
+
+
+def test_models_are_checked_over_the_whole_run_tail_included(task, monkeypatch):
+    # ChatGPT review of PR #16 (P1): an Opus subagent after the result in A0 (no advisor) went unseen: check_models
+    # got the prefix only
+    modes_with(monkeypatch, timeout_s=3)
+    monkeypatch.setenv("FAKE_TAIL_AFTER_RESULT", "8")
+    monkeypatch.setenv("FAKE_TAIL_SUB", "1")
+    monkeypatch.setenv("FAKE_TAIL_SUB_MODEL", "claude-opus-5-5")
+    r = lab.attempt(task, "A0")
+    assert r["valid"] is False and "unexpected model ran: claude-opus-5-5" in r["integrity"], r["integrity"]
+    assert "claude-opus-5-5" in r["models_seen"]
+
+
+def test_text_totals_mark_estimated_costs(task, monkeypatch, capsys):
+    # ChatGPT review of PR #16 (P2): calib printed "mean $1.400" with cost_unconfirmed=1; pairs' total and spent
+    # had no mark either
+    a, b = _prj("A", 1, 1.0), _prj("B", 1, 1.0)
+    a["costs"].update(reconstruction="complete", tail_after_result={"messages": 1, "usd": 0.4}, run_usd=1.4,
+                      run_usd_status="partly_confirmed")
+    b["costs"].update(reconstruction="complete", run_usd=1.0, run_usd_status="confirmed")
+    for r in (a, b):
+        r["tests"]["hidden"].update(passed=1, expected=1)
+    monkeypatch.setattr(lab, "load_runs", lambda *x, **k: [a, b])
+    monkeypatch.setattr(lab, "load_manifests", lambda *x, **k: {})
+    import types
+    lab.cmd_pairs(types.SimpleNamespace(pilot=None, batch=None, modes="A,B", json=False, all=True, revalidated=False,
+                                        task=None))
+    out = capsys.readouterr().out
+    assert "total [setup" in out and "A ~$1.40" in out and "1 run cost(s) estimated; confirmed pairs 0/1)" in out
+    assert "spent: ~$2.40" in out and "1 run cost(s) estimated" in out.split("spent:")[1]
+    t = lab.calibration([a, _prj("A", 2, 0.6)], "A")
+    row = next(iter(t.values()))
+    assert row["cost_unconfirmed"] == 1 and row["cost_usd_confirmed"] == [0.6]
+    runs_dir = lab.lab_root() / "runs"
+    for r in (a, _prj("A", 2, 0.6)):
+        d = runs_dir / r["run_id"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "run.json").write_text(json.dumps(r))
+    lab.cmd_calib(types.SimpleNamespace(mode="A", batch=None, json=False))
+    out = capsys.readouterr().out
+    assert "mean ~$1.000 (1 of 2 estimated; confirmed mean $0.600 over 1)" in out
 
 
 def test_reports_count_the_whole_run_and_say_how_far_it_is_confirmed(capsys):
