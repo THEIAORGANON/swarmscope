@@ -6,6 +6,7 @@ FAKE_WEB=main|sub   a WebFetch/WebSearch call   FAKE_VOLUNTARY_ADVISOR=1  call t
 FAKE_SUSPEND=1|noretry  Claude Code bills $0.05 more than the transcript holds; 1: after a retried request
                     (the Mac slept: StreamSuspended, as on 18.11), noretry: with no retry in the transcript
 FAKE_ADVISOR_NO_RESULT=1|paid  an advisor request that never returns; paid: Claude Code still bills the advisor
+FAKE_ADVISOR_HANDOFF=1|only  on a block: Bash then an advisor call in one message, never run (only: no second call)
 FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never reached (as on 17.11),
                     mid: the API fails after work began, warn: the session still finishes normally"""
 import json
@@ -305,6 +306,17 @@ if not os.environ.get("FAKE_NO_STOP"):
     r = hook("Stop", stop_hook_active=False)
     if r and r.get("decision") == "block":
         time.sleep(0.05)
+        handoff = os.environ.get("FAKE_ADVISOR_HANDOFF")   # bj-diag-1 (21.11): Bash -> advisor in one message, never run
+        if handoff:
+            tr({"type": "assistant", "timestamp": iso(), "message": {"id": "mh", "model": model, "content": [
+                {"type": "tool_use", "id": "tu9", "name": "Bash", "input": {"command": "true"}},
+                {"type": "server_tool_use", "id": "srv0", "name": "advisor", "input": {}}],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "iterations": [
+                    {"type": "message", "input_tokens": 10, "output_tokens": 5}]}}})
+            tr({"type": "user", "timestamp": iso(), "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tu9", "content": "ok"}]}})
+            cost += 0.0001
+    if r and r.get("decision") == "block" and os.environ.get("FAKE_ADVISOR_HANDOFF") != "only":
         tr({"type": "assistant", "timestamp": iso(), "message": {"id": "m2", "model": model, "content": [
             {"type": "server_tool_use", "id": "srv1", "name": "advisor", "input": {}},
             {"type": "advisor_tool_result", "tool_use_id": "srv1", "content": {"type": "advisor_redacted_result", "encrypted_content": "x"}},
@@ -314,6 +326,7 @@ if not os.environ.get("FAKE_NO_STOP"):
                 {"type": "advisor_message", "model": advisor, "input_tokens": 10000, "output_tokens": 500}]}}})
         cost += 0.003 + 0.04 + 0.01
         adv_cost += 0.05
+    if r and r.get("decision") == "block":
         hook("Stop", stop_hook_active=True)
 if SUSPEND:                                      # the aborted attempt's usage is billed to the lead model only
     cost += 0.05
