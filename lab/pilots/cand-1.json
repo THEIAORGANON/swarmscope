@@ -1,7 +1,7 @@
 {
   "pilot": "cand-1",
   "kind": "screening",
-  "status": "in progress: wzf-cond not selected; pk-prerel batch 1 excluded (contract defect), rerun on the corrected task with 1800 s; at-gensetattr in review",
+  "status": "in progress: wzf-cond and pk-prerel not selected (3/3 clean each); at-gensetattr in review",
   "question": "Which new tasks leave room to improve the outcome? Agreed with ChatGPT (21.11) after bj-diag-1: longer connected changes (an API split, a subsystem, a feature across modules with a checkable contract), screened on mode A alone.",
   "not_asked": "Whether any policy helps. Screening runs are mode A only; they form no pairs.",
   "candidates": {
@@ -35,11 +35,14 @@
   "next": "selected candidates go into a fresh B / BJ / B12 pilot (Jev threshold 0.5), declared separately; primary metric hidden checks and regressions, secondary cost and time",
   "batches": [
     "20261121-053530-3de4",
-    "20261121-095543-9d9f"
+    "20261121-095543-9d9f",
+    "20261121-121818-2958",
+    "20261121-185502-00d8"
   ],
   "deviations": [
     "wzf-cond cost $7.38 for 3 runs against the 'about $2-3' estimate given to the author (estimate, not part of this declaration); Opus, called voluntarily three times per run, was about 54% of it",
-    "pk-prerel: session budget raised to 1800 s for the corrected task (all modes), declared after debugging batch 20261121-095543-9d9f, before any run on the corrected task"
+    "pk-prerel: session budget raised to 1800 s for the corrected task (all modes), declared after debugging batch 20261121-095543-9d9f, before any run on the corrected task",
+    "pk-prerel: one A run invalid on the subscription's five-hour rate limit, replaced in a new batch with seed 612 (602 left a planned repeat unrun)"
   ],
   "result": null,
   "screened": {
@@ -101,6 +104,116 @@
       ],
       "verdict": "not selected: three clean passes (all hidden tests, no regressions) leave no room to improve the outcome under A",
       "cost_usd": 7.377
+    },
+    "pk-prerel": {
+      "batches": [
+        "20261121-121818-2958",
+        "20261121-185502-00d8 (replacement)"
+      ],
+      "code": "main fc0d21e (PR #16): corrected contract, session_timeout_s 1800",
+      "runs": [
+        {
+          "run_id": "c2bc278659",
+          "repeat": 1,
+          "valid": true,
+          "success": true,
+          "hidden": "62511/62511",
+          "bug_tests": "28/28",
+          "regressions": 0,
+          "usd": 2.317,
+          "usd_status": "confirmed",
+          "lead_usd": 1.66,
+          "opus_usd": 0.657,
+          "session_s": 1163,
+          "advisor": "1 voluntary, returned",
+          "rules": "R1 triggered 2 / pass 1, R3 triggered 3 (observe)",
+          "jev": [
+            [
+              0.66,
+              true
+            ],
+            [
+              0.68,
+              true
+            ],
+            [
+              0.24,
+              false
+            ]
+          ]
+        },
+        {
+          "run_id": "9323a99825",
+          "repeat": 3,
+          "valid": true,
+          "success": true,
+          "hidden": "62511/62511",
+          "bug_tests": "28/28",
+          "regressions": 0,
+          "usd": 2.56,
+          "usd_status": "confirmed",
+          "lead_usd": 1.869,
+          "opus_usd": 0.691,
+          "session_s": 1248,
+          "advisor": "1 voluntary, returned",
+          "rules": "R1 triggered 5, R3 triggered 5 (observe)",
+          "jev": [
+            [
+              0.52,
+              true
+            ],
+            [
+              0.63,
+              true
+            ],
+            [
+              0.63,
+              true
+            ],
+            [
+              0.65,
+              true
+            ],
+            [
+              0.64,
+              true
+            ]
+          ]
+        },
+        {
+          "run_id": "085bc5cbee",
+          "repeat": "1 (replacement batch, seed 612)",
+          "valid": true,
+          "success": true,
+          "hidden": "62511/62511",
+          "bug_tests": "28/28",
+          "regressions": 0,
+          "usd": 3.041,
+          "usd_status": "confirmed",
+          "lead_usd": 1.592,
+          "opus_usd": 1.449,
+          "session_s": 1279,
+          "advisor": "2 voluntary, returned",
+          "rules": "R1/R2/R3 pass",
+          "jev": [
+            [
+              0.23,
+              false
+            ]
+          ]
+        }
+      ],
+      "invalid": [
+        {
+          "run_id": "116731a88e",
+          "repeat": 2,
+          "why": "api_interrupted: subscription rate limit rejected (five_hour), batch stopped; replaced by 085bc5cbee",
+          "usd": 0.434
+        }
+      ],
+      "verdict": "not selected: three valid clean passes (all hidden tests, no regressions)",
+      "observed_apart": "R3 triggered (observe) in 2 of 3 runs, and Jev answered would_consult True 7 times of 9 (p 0.52-0.68) - the first real-task yes answers after b-jev-1 (0.18-0.30) and wzf-cond (0.13-0.36). Recorded, not a selection criterion; the runs had the voluntary advisor already.",
+      "cost_usd": 8.352
     }
   },
   "excluded": {
