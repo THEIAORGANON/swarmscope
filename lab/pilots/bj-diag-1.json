@@ -1,7 +1,7 @@
 {
   "pilot": "bj-diag-1",
   "kind": "diagnostic",
-  "status": "declared 2026-11-20 before any run; not a comparison",
+  "status": "done 2026-11-21: passed (both runs valid, every chain complete)",
   "question": "Does the branch 'R3 blocks, the advisor is consulted' of BJ work end to end on the real Claude Code? In b-jev-1 Jev never said yes (6 gate calls, p 0.18-0.30), so that branch was never seen live.",
   "not_asked": "Whether Jev, R3 or the consultation helps. Nothing about Jev's value, cost or outcomes is concluded from these runs; they are left out of pairs and calib (r3_gate_force in the policy).",
   "modes": {
@@ -18,7 +18,62 @@
   "command": "lab.py batch --task pkf-prepared --modes BJd --repeats 2 --seed 501 --pilot bj-diag-1",
   "expected_cost_usd": "about 1 (two sessions with one consultation each)",
   "pass": "both runs valid and chain 'complete'; an 'incomplete' run (R3 never reached the gate) is reported as such and may be replaced once",
-  "batches": [],
-  "deviations": [],
-  "result": null
+  "batches": [
+    "20261121-032014-2490"
+  ],
+  "deviations": [
+    "cost $1.41 for the two runs against the declared 'about 1'"
+  ],
+  "result": "The branch 'R3 blocks -> the advisor is consulted -> the answer comes from the pinned Opus -> the lead goes on -> Opus cost reconciled' works end to end on Claude Code 2.1.326 (2/2). Nothing is concluded about Jev, R3 or the consultation's value; these runs stay out of pairs and calib.",
+  "code": {
+    "main": "51e522c (PR #9 merged, = 210854e)",
+    "bundle_sha256": "e68c0334d9cc…",
+    "claude_code": "2.1.326",
+    "tests_on_mac": "268 passed, 3 skipped"
+  },
+  "runs": [
+    {
+      "run_id": "f32e36edd3",
+      "valid": true,
+      "chain": "complete (1 chain)",
+      "usd": 0.729,
+      "opus_usd": {
+        "claude_code": 0.3131,
+        "transcript": 0.3131
+      },
+      "hidden": "63571/63571, 0 regressions",
+      "session_s": 519,
+      "stops": 2,
+      "blocks": 1,
+      "jev_real": {
+        "status": "ok",
+        "p_consult": 0.31,
+        "would_consult": false
+      }
+    },
+    {
+      "run_id": "22e83ab070",
+      "valid": true,
+      "chain": "complete (1 chain)",
+      "usd": 0.682,
+      "opus_usd": {
+        "claude_code": 0.297808,
+        "transcript": 0.297808
+      },
+      "hidden": "63571/63571, 0 regressions",
+      "session_s": 504,
+      "stops": 3,
+      "blocks": 2,
+      "jev_real": {
+        "status": "ok",
+        "p_consult": 0.32,
+        "would_consult": false
+      }
+    }
+  ],
+  "observations": [
+    "In both runs the forced R3 block was shared with R1_tests (requested); the consultation request comes from R3. Run 22e83ab070 had a second, R1-only block (no consultation asked, none made).",
+    "In both blocks the lead first sent Bash and an advisor call in one message (stop_reason tool_use): the server-side advisor call never ran (no advisor_tool_result, no advisor_message iteration, so unpaid; the next API request omits it), and after the Bash result the lead called the advisor again, which returned (~50-57k input, 4.7-5.7k output tokens on claude-opus-5-5). The runner counts the first as called with status no_result, unanswered_unpaid False; diag binds the chain to the returned call.",
+    "Jev's real answers at the gate (not used): p 0.31 and 0.32, would_consult False - in line with b-jev-1 (0.18-0.30)."
+  ]
 }
