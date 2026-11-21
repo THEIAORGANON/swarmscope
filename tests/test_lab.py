@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_TAIL_SUB_MODEL,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -319,12 +319,128 @@ def test_working_copy_hides_the_experiment(task):
 # --- validity, session status and the verdict are separate --------------------------------------------
 
 def test_timeout_is_never_success_even_when_hidden_tests_pass(task, monkeypatch):
+    # ChatGPT, 21.11: a session killed by its budget (no result message) still counts as an outcome - a failure -
+    # so the longest attempts do not drop out of the denominator; its cost is only an estimate
     modes_with(monkeypatch, timeout_s=1)
     monkeypatch.setenv("FAKE_SLEEP", "4")
     monkeypatch.setenv("FAKE_NO_STOP", "1")
     r = lab.attempt(task, "A")
-    assert r["session_status"] == "timeout" and r["success"] is False and r["valid"] is False
+    assert r["session_status"] == "timeout" and r["success"] is False
+    assert r["valid"] is True and r["timeout_class"] == "budget", r["integrity"]
+    assert r["costs"]["run_usd_status"] == "estimated" and r["costs"]["claude_code_total_usd"] is None
     assert r["verdict"]["session_completed"] is False
+
+
+def test_work_after_the_result_is_a_tail_not_a_cost_mismatch(task, monkeypatch):
+    # 2ec1703088 (ChatGPT, 21.11): a result at 936 s, then a background task notification woke the model; the
+    # budget killed it. Claude Code's total covers the session up to the result: the tail is reconstructed apart
+    modes_with(monkeypatch, timeout_s=3)
+    monkeypatch.setenv("FAKE_TAIL_AFTER_RESULT", "8")
+    r = lab.attempt(task, "A")
+    c = r["costs"]
+    assert r["session_status"] == "timeout" and r["timeout_class"] == "budget"
+    assert r["valid"] is True, r["integrity"]            # a budget timeout with full accounting: a valid failure
+    assert r["success"] is False and c["reconstruction"] == "complete"
+    t = c["tail_after_result"]
+    assert t["messages"] == 1 and t["usd"] > 0 and t["reconciled"] is False and t["claude_code_total"] is None
+    assert abs(c["computed_total_usd"] - c["reconciled_total_usd"] - t["usd"]) < 1e-9
+    assert abs(c["reconciled_total_usd"] - c["claude_code_total_usd"]) <= 0.01
+
+
+def test_timeout_classes():
+    init = {"session_id": "s"}
+    assert lab.timeout_class(init, [], None) == "budget"
+    assert lab.timeout_class(init, [{"attempt": 1}], None) == "infra_suspected"          # retried requests
+    assert lab.timeout_class(init, [], ("api_error", "rejected")) == "infra_suspected"  # api_failure
+    assert lab.timeout_class(None, [], None) == "not_started"
+    allowed = [{"rate_limit_info": {"status": "allowed"}}] * 11
+    assert lab.timeout_class(init, [], None, allowed) == "budget"
+    assert lab.timeout_class(init, [], None, allowed + [{"rate_limit_info": {"status": "rejected"}}]) == "infra_suspected"
+    # allowed rate-limit events are no failure (668882775e: 11 of them, finished normally): api_failure ignores them
+    assert lab.api_failure(None, [{"rate_limit_info": {"status": "allowed"}}] * 11) is None
+
+
+def test_a_subagent_after_the_result_stays_in_the_tail(task, monkeypatch):
+    # ChatGPT, 21.11 (P2): the prefix took every subagent message whole, so a subagent working after the result
+    # made a false mismatch; the split covers the lead, the advisor and the subagents
+    modes_with(monkeypatch, timeout_s=3)
+    monkeypatch.setenv("FAKE_TAIL_AFTER_RESULT", "8")
+    monkeypatch.setenv("FAKE_TAIL_SUB", "1")
+    r = lab.attempt(task, "A")
+    c = r["costs"]
+    assert r["valid"] is True, r["integrity"]
+    assert c["reconstruction"] == "complete" and c["tail_after_result"]["messages"] == 2
+    assert c["by_model_reconciled"]["subagents"] == {} and c["by_model"]["subagents"]["s1"]["usd"] > 0
+    assert c["run_usd_status"] == "partly_confirmed"
+    assert abs(c["run_usd"] - (c["claude_code_total_usd"] + c["tail_after_result"]["usd"])) < 1e-6
+
+
+def test_models_are_checked_over_the_whole_run_tail_included(task, monkeypatch):
+    # ChatGPT review of PR #16 (P1): an Opus subagent after the result in A0 (no advisor) went unseen: check_models
+    # got the prefix only
+    modes_with(monkeypatch, timeout_s=3)
+    monkeypatch.setenv("FAKE_TAIL_AFTER_RESULT", "8")
+    monkeypatch.setenv("FAKE_TAIL_SUB", "1")
+    monkeypatch.setenv("FAKE_TAIL_SUB_MODEL", "claude-opus-5-5")
+    r = lab.attempt(task, "A0")
+    assert r["valid"] is False and "unexpected model ran: claude-opus-5-5" in r["integrity"], r["integrity"]
+    assert "claude-opus-5-5" in r["models_seen"]
+
+
+def test_text_totals_mark_estimated_costs(task, monkeypatch, capsys):
+    # ChatGPT review of PR #16 (P2): calib printed "mean $1.400" with cost_unconfirmed=1; pairs' total and spent
+    # had no mark either
+    a, b = _prj("A", 1, 1.0), _prj("B", 1, 1.0)
+    a["costs"].update(reconstruction="complete", tail_after_result={"messages": 1, "usd": 0.4}, run_usd=1.4,
+                      run_usd_status="partly_confirmed")
+    b["costs"].update(reconstruction="complete", run_usd=1.0, run_usd_status="confirmed")
+    for r in (a, b):
+        r["tests"]["hidden"].update(passed=1, expected=1)
+    monkeypatch.setattr(lab, "load_runs", lambda *x, **k: [a, b])
+    monkeypatch.setattr(lab, "load_manifests", lambda *x, **k: {})
+    import types
+    lab.cmd_pairs(types.SimpleNamespace(pilot=None, batch=None, modes="A,B", json=False, all=True, revalidated=False,
+                                        task=None))
+    out = capsys.readouterr().out
+    assert "total [setup" in out and "A ~$1.40" in out and "1 run cost(s) estimated; confirmed pairs 0/1)" in out
+    assert "spent: ~$2.40" in out and "1 run cost(s) estimated" in out.split("spent:")[1]
+    t = lab.calibration([a, _prj("A", 2, 0.6)], "A")
+    row = next(iter(t.values()))
+    assert row["cost_unconfirmed"] == 1 and row["cost_usd_confirmed"] == [0.6]
+    runs_dir = lab.lab_root() / "runs"
+    for r in (a, _prj("A", 2, 0.6)):
+        d = runs_dir / r["run_id"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "run.json").write_text(json.dumps(r))
+    lab.cmd_calib(types.SimpleNamespace(mode="A", batch=None, json=False))
+    out = capsys.readouterr().out
+    assert "mean ~$1.000 (1 of 2 estimated; confirmed mean $0.600 over 1)" in out
+
+
+def test_reports_count_the_whole_run_and_say_how_far_it_is_confirmed(capsys):
+    # ChatGPT, 21.11 (P1): A $1 + $0.40 tail, B $1 + $0.90 tail - the reports showed $2 and +$0 instead of ~$3.30, +$0.50
+    a, b = _prj("A", 1, 1.0), _prj("B", 1, 1.0)
+    for r, tail in ((a, 0.40), (b, 0.90)):
+        r["costs"].update(reconstruction="complete", tail_after_result={"messages": 1, "usd": tail},
+                          run_usd=1.0 + tail, run_usd_status="partly_confirmed")
+    t = only_row(lab.pair_report([a, b]), "pk-x")
+    assert abs(t["mean_diff_usd"] - 0.50) < 1e-9 and abs(t["A_usd_total"] + t["B_usd_total"] - 3.30) < 1e-9
+    assert t["confirmed_cost_pairs"] == 0 and t["mean_diff_usd_confirmed"] is None
+    assert lab.run_cost(a) == 1.40 and lab.run_cost_status(a) == "partly_confirmed"
+    # an old-style run (no run_usd) with a reconciled total stays confirmed
+    old = _prj("A", 2, 0.7)
+    assert lab.run_cost(old) == 0.7 and lab.run_cost_status(old) == "confirmed"
+
+
+def test_a_task_sets_its_own_session_budget(task, monkeypatch):
+    # ChatGPT, 21.11: pk-prerel gets 1800 s; the same budget for every mode, recorded, part of the task hash
+    seen = []
+    real = lab.run_session
+    monkeypatch.setattr(lab, "run_session", lambda *a: seen.append(a[-1]) or real(*a))
+    r = lab.attempt(dict(task, session_timeout_s=1800), "A")
+    assert seen == [1800] and r["config"]["timeout_s"] == 1800 and r["config"]["timeout_source"] == "task"
+    r = lab.attempt(task, "B")
+    assert seen[-1] == lab.load_modes()[0]["common"]["timeout_s"] and r["config"]["timeout_source"] == "modes"
 
 
 def test_sh_timeout_partial_output_is_text():

@@ -172,7 +172,7 @@ def _subagent_files(transcript_path):
 _cache = {}
 
 
-def session_costs(transcript_path, advisor_model=None):
+def session_costs(transcript_path, advisor_model=None, exclude_ids=None):
     """Token/cost breakdown for one session.
 
     Returns {
@@ -180,7 +180,9 @@ def session_costs(transcript_path, advisor_model=None):
       "advisor": bucket + {"model", "source"}  source: "iterations" (read) | "estimate" | "none"
       "subs":    {agent_id: bucket + {"model"}},
       "total_usd", "estimated" (bool), "notes" [str], "seen": diagnostics
-    }"""
+    }
+    exclude_ids: message ids left out, in the lead's and the subagents' transcripts alike (the tail after Claude
+    Code's last result message, which no result total covers)."""
     if not transcript_path:
         return None
     files = [transcript_path] + sorted(_subagent_files(transcript_path).values())
@@ -188,6 +190,8 @@ def session_costs(transcript_path, advisor_model=None):
         key = tuple((p, os.path.getsize(p)) for p in files)
     except OSError:
         return None
+    ex = frozenset(exclude_ids or ())
+    key = key + (ex,)
     if _cache.get(transcript_path, (None,))[0] == key:
         return _cache[transcript_path][1]
 
@@ -199,6 +203,8 @@ def session_costs(transcript_path, advisor_model=None):
     adv_ctx = []                                 # context sizes at advisor calls without iteration data
 
     for mid, model, u, has_call in _messages(transcript_path):
+        if mid in ex:
+            continue
         seen["messages"] += 1
         seen["usage_keys"].update(u.keys())
         lead["model"] = lead["model"] or model
@@ -241,6 +247,8 @@ def session_costs(transcript_path, advisor_model=None):
     for aid, p in _subagent_files(transcript_path).items():
         b = dict(_zero(), model=None)
         for mid, model, u, _ in _messages(p):
+            if mid in ex:                        # the tail after the result covers subagents too (ChatGPT, 21.11)
+                continue
             b["model"] = b["model"] or model
             its = u.get("iterations")
             for i, it in enumerate(its if isinstance(its, list) and its else [u]):
