@@ -20,7 +20,34 @@
       "statusline-setup",
       "web-fetch"
     ],
-    "allowed_tools": ["Task", "Agent", "Bash", "CronCreate", "CronDelete", "CronList", "DesignSync", "Edit", "EnterWorktree", "ExitWorktree", "ListAgents", "Monitor", "NotebookEdit", "PushNotification", "Read", "RemoteTrigger", "ReportFindings", "ScheduleWakeup", "SendMessage", "TaskStop", "ToolSearch", "Write", "Glob", "Grep", "LS", "NotebookRead"],
+    "allowed_tools": [
+      "Task",
+      "Agent",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterWorktree",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "TaskStop",
+      "ToolSearch",
+      "Write",
+      "Glob",
+      "Grep",
+      "LS",
+      "NotebookRead"
+    ],
     "_why_allowed_tools": "init tools of the live probes b5da123f22 and c0a75b5374 (Claude Code 2.1.326, 20.11) plus Agent (Task's other name) and the reading tools the read guard covers (Glob, Grep, LS, NotebookRead). Any other tool makes a run invalid until reviewed: Workflow read files past the guard (PR #8 review).",
     "subagent_models": [
       "claude-haiku-5-5"
@@ -70,6 +97,16 @@
         ]
       },
       "about": "Control for BJ: R1 and R2 block as in B, R3 never blocks (recorded as triggered, not_enforced); Jev records"
+    },
+    "BJd": {
+      "policy_mode": "enforce",
+      "policy": {
+        "r3_gate": "jev",
+        "r3_gate_on_error": "enforce",
+        "r3_gate_force": "consult"
+      },
+      "diagnostic": true,
+      "about": "DIAGNOSTIC (BJ-diag), never compared: BJ, but the decision of an R3 that reached the Jev gate is forced to block (r3_gate_force consult). Jev is still asked; its real answer stays in jev_gate.real. Purpose: check the chain R3 block -> advisor call -> answer from the pinned model -> session continues -> Opus cost reconciled (lab.py diag). Left out of pairs and calib."
     }
   }
 }

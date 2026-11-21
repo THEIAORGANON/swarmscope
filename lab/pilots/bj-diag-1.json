@@ -1,0 +1,24 @@
+{
+  "pilot": "bj-diag-1",
+  "kind": "diagnostic",
+  "status": "declared 2026-11-20 before any run; not a comparison",
+  "question": "Does the branch 'R3 blocks, the advisor is consulted' of BJ work end to end on the real Claude Code? In b-jev-1 Jev never said yes (6 gate calls, p 0.18-0.30), so that branch was never seen live.",
+  "not_asked": "Whether Jev, R3 or the consultation helps. Nothing about Jev's value, cost or outcomes is concluded from these runs; they are left out of pairs and calib (r3_gate_force in the policy).",
+  "modes": {
+    "BJd": "BJ (b-6, r3_gate jev, r3_gate_on_error enforce, q-consult-2, jev-1.14.0, threshold 0.5, timeout 10 s), plus r3_gate_force consult: the decision of an R3 that reached the Jev gate is forced to block; Jev is still asked and its real answer is kept in jev_gate.real"
+  },
+  "conditions": {
+    "1_force_only_at_the_gate": "only an R3 that is triggered, enforced, not deferred and within max_blocks_per_turn is forced; if R3 never reaches the gate the run's chain is 'incomplete', not a failure of the chain",
+    "2_answers_apart": "jev_gate = {decided_by: forced, forced: consult, real: {status, p_consult, would_consult, latency_ms, ctx_id, decided_by, would_have_blocked}}; r3_gate_summary counts forced apart (forced, forced_real), never as yes/no/fallback",
+    "3_left_out": "pairs and calib skip a run when its policy has r3_gate_force (is_diagnostic), whatever the plan says",
+    "4_whole_chain": "lab.py diag, link by link: r3_reached_gate, r3_blocked, advisor_called_in_block (call and result bound by tool_use_id, call inside the block's window), advisor_returned, pinned_model (advisor_message.model of that message = claude-opus-5-5), session_continued (the lead model wrote after the answer, a later Stop, session success), opus_cost_reconciled (Claude Code modelUsage costUSD for the advisor = transcript reconstruction from usage.iterations within $0.01, reconstruction complete)"
+  },
+  "task": "pkf-prepared (calib-3 feature; R3 triggered there in b-jev-1)",
+  "repeats": 2,
+  "command": "lab.py batch --task pkf-prepared --modes BJd --repeats 2 --seed 501 --pilot bj-diag-1",
+  "expected_cost_usd": "about 1 (two sessions with one consultation each)",
+  "pass": "both runs valid and chain 'complete'; an 'incomplete' run (R3 never reached the gate) is reported as such and may be replaced once",
+  "batches": [],
+  "deviations": [],
+  "result": null
+}

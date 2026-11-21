@@ -838,6 +838,57 @@ def test_jev_is_not_asked_when_r3_would_not_block():
     assert calls == []                                                              # R3 not enforced
 
 
+# --- BJ-diag: r3_gate_force forces only the decision of an R3 that reached the gate ---------------------------
+
+def test_forced_r3_blocks_and_keeps_jevs_real_answer_apart():
+    p = pol(mode="enforce", r3_gate="jev", r3_gate_force="consult", enforce_rules=["R3_high_risk"])
+    recs, out, calls = _gate(p, {"status": "ok", "would_consult": False, "p_consult": 0.2, "ctx_id": "c1"})
+    r3 = by_rule(recs, "R3_high_risk")
+    g = r3["jev_gate"]
+    assert calls == [1] and r3["state"] == "requested" and out and "consult the advisor" in out["reason"]
+    assert g["decided_by"] == "forced" and g["forced"] == "consult"
+    assert "would_consult" not in g and "p_consult" not in g                  # never readable as Jev's decision
+    assert g["real"] == {"status": "ok", "p_consult": 0.2, "would_consult": False, "latency_ms": None,
+                         "ctx_id": "c1", "decided_by": "jev", "would_have_blocked": False}
+    blk = [r for r in recs if r.get("kind") == "block"]
+    assert blk and r3["id"] in blk[0]["ids"]
+    # a Jev failure is still recorded as such, and the decision is still forced
+    g = by_rule(_gate(p, {"status": "timeout"})[0], "R3_high_risk")["jev_gate"]
+    assert g["decided_by"] == "forced" and g["real"]["status"] == "timeout"
+    assert g["real"]["decided_by"] == "fallback_enforce" and g["real"]["would_have_blocked"] is True
+
+
+def test_force_never_reaches_past_the_gate():
+    # condition 1: only an R3 that reached the gate; deferrals, block limits, not-enforced R3 and a passing R3 stay
+    force = dict(mode="enforce", r3_gate="jev", r3_gate_force="consult")
+    yes = {"status": "ok", "would_consult": True}
+    recs, out, calls = _gate(pol(**force), yes, d=files(("src/a.py", 2, 0)))           # R3 passes
+    assert calls == [] and by_rule(recs, "R3_high_risk")["state"] == "pass"
+    recs, out, calls = _gate(pol(**force, enforce_rules=["R1_tests"]), yes)            # R3 not enforced
+    assert calls == [] and by_rule(recs, "R3_high_risk")["state"] == "triggered"
+    assert "jev_gate" not in by_rule(recs, "R3_high_risk")
+    recs, out, calls = _gate(pol(mode="observe", r3_gate="jev", r3_gate_force="consult"), yes)  # observe
+    assert calls == [] and by_rule(recs, "R3_high_risk")["state"] == "triggered" and out is None
+    recs, out, calls = _gate(pol(mode="enforce", r3_gate_force="consult"), yes)        # no Jev gate: plain b-5
+    assert calls == [] and "jev_gate" not in by_rule(recs, "R3_high_risk")
+    # the block limit: two blocks already this turn -> limited, no question, no force
+    p = pol(**force, enforce_rules=["R3_high_risk"])
+    events = [prompt(1), edit(5)]
+    times = [e["ts"] for e in events if e.get("tool_name") == "Edit"]
+    change = {"files": files(("src/a.py", 60, 0), ("src/b.py", 1, 0), ("src/c.py", 1, 0)), "src_times": times,
+              "since_advisor": None, "before_advisor": None}
+    log = [{"kind": "block", "ts": 50.0}, {"kind": "block", "ts": 60.0}]
+    asked = []
+    recs, out = rules.gate(events, {}, p, change, [], log, True, "sess1234", now=100.0,
+                           ask_jev=lambda: asked.append(1) or yes)
+    assert asked == [] and by_rule(recs, "R3_high_risk")["state"] == "limited" and out is None
+    # a running background agent: deferred, no question, no force
+    stop = {"background_tasks": [{"id": "a", "type": "local_agent", "status": "running"}]}
+    recs, out = rules.gate(events, stop, p, change, [], [], True, "sess1234", now=100.0,
+                           ask_jev=lambda: asked.append(1) or yes)
+    assert asked == [] and by_rule(recs, "R3_high_risk")["state"] == "deferred" and out is None
+
+
 def test_git_in_tests_ignores_the_users_global_config():
     # regression: on the lab Mac the global config signs commits with an SSH key and the suite asked for its
     # passphrase; tests/conftest.py keeps the user's config out of every git call made by the tests

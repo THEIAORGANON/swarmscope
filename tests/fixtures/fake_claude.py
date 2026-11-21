@@ -315,10 +315,10 @@ if not os.environ.get("FAKE_NO_STOP"):
         cost += 0.003 + 0.04 + 0.01
         adv_cost += 0.05
         hook("Stop", stop_hook_active=True)
-usage = {model: {}, **({advisor: {}} if cost > 0.01 and advisor else {})}
 if SUSPEND:                                      # the aborted attempt's usage is billed to the lead model only
     cost += 0.05
-    usage = {model: {"costUSD": cost - adv_cost}, **({advisor: {"costUSD": adv_cost}} if adv_cost else {})}
+# per-model costUSD as Claude Code reports it
+usage = {model: {"costUSD": round(cost - adv_cost, 7)}, **({advisor: {"costUSD": adv_cost}} if adv_cost and advisor else {})}
 if os.environ.get("FAKE_ADVISOR_NO_RESULT") == "paid":
     usage[advisor] = {"costUSD": 0.02}
     cost += 0.02
