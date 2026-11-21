@@ -609,21 +609,43 @@ def claude_cmd(modes, settings, mode=None):
     return cmd + list(c.get("extra_args", []))
 
 
-def timeout_class(result, reconstruction, retries, limits):
-    """Why a session that hit its budget is (in)valid (ChatGPT, 21.11). budget: a result message exists and the
-    cost up to it reconciles - the run is a valid failure (the agent ran out of time). incomplete_accounting: no
-    result message, so no Claude Code total to check the costs against - invalid. infra_suspected: as
-    incomplete_accounting, with API retries or rate-limit events in the session (a network outage looks like this) -
-    invalid. Old runs are not re-judged."""
-    if result and reconstruction == "complete":
-        return "budget"
-    if result:
-        return "incomplete_accounting"
-    return "infra_suspected" if (retries or limits) else "incomplete_accounting"
+def timeout_class(init, retries, failure, limits=()):
+    """A session that hit its budget (ChatGPT, 21.11): the outcome and the cost are judged apart.
+    budget: it started (init) and nothing shows the infrastructure failed - a valid failure, success False, whether
+    or not a result message came (its cost is then estimated or partly confirmed, see run_usd).
+    infra_suspected: a substantive sign of failure - an API failure (api_failure), a REJECTED rate-limit event, or
+    requests Claude Code had to retry (transcript api_error records) - invalid. A missing result or allowed rate-limit events
+    prove nothing (668882775e had 11 allowed events and finished). not_started: no init."""
+    if not init:
+        return "not_started"
+    rejected = [r for r in limits if (r.get("rate_limit_info") or {}).get("status") == "rejected"]
+    return "infra_suspected" if (retries or failure or rejected) else "budget"
+
+
+def by_model(c):
+    return {"lead": {k: c["lead"].get(k) for k in ("model", "usd", "in", "out", "cr", "cw5", "cw1h")},
+            "advisor": {k: c["advisor"].get(k) for k in ("model", "usd", "source", "in", "out", "cr")},
+            "subagents": {a: {"model": b.get("model"), "usd": b.get("usd")} for a, b in c["subs"].items()}}
+
+
+def run_usd(costs_):
+    """The whole run's cost and how far it is confirmed (ChatGPT, 21.11). confirmed: Claude Code's total, reconciled
+    with the transcript, covers the whole session. partly_confirmed: the total covers the session up to its last
+    result, reconciled; the tail after it is the transcript's estimate. estimated: no Claude Code total (a session
+    killed by its budget): the transcript reconstruction alone. unreconciled: the total and the transcript disagree:
+    the transcript's figure, which never stands as confirmed."""
+    cc, rec = costs_.get("claude_code_total_usd"), costs_.get("reconstruction")
+    tail = (costs_.get("tail_after_result") or {}).get("usd") or 0.0
+    if cc is None:
+        return costs_.get("computed_total_usd"), "estimated"
+    if rec in ("complete", "incomplete"):           # incomplete: retries Claude Code billed, its sum is primary
+        return round(cc + tail, 7), ("partly_confirmed" if tail else "confirmed")
+    return costs_.get("computed_total_usd"), "unreconciled"
 
 
 def tail_after_result(stream_path):
-    """Assistant message ids that come after the last result message of the stream (none without a result)."""
+    """Assistant message ids that come after the last result message of the stream (none without a result),
+    the lead's and any subagent's (subagent messages stream with parent_tool_use_id)."""
     recs, _ = jl(stream_path)
     recs = recs or []
     last = max((i for i, r in enumerate(recs) if r.get("type") == "result"), default=None)
@@ -909,7 +931,7 @@ def diag_chain(rj, transcript, advisor, tol=0.01):
     by_msg = advisor_models_by_message(transcript) if transcript and Path(transcript).exists() else {}
     costs_ = rj.get("costs") or {}
     cc_adv = (((rj.get("result") or {}).get("modelUsage") or {}).get(advisor) or {}).get("costUSD")
-    tr = (costs_.get("by_model") or {}).get("advisor") or {}
+    tr = (costs_.get("by_model_reconciled") or costs_.get("by_model") or {}).get("advisor") or {}
     info["opus_usd"] = {"claude_code": cc_adv, "transcript": tr.get("usd"), "source": tr.get("source"),
                         "reconstruction": costs_.get("reconstruction")}
     cost_ok = (cc_adv is not None and tr.get("usd") is not None and tr.get("source") == "iterations"
@@ -1461,8 +1483,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
                             + ", ".join(sorted({str(d.get('tool_name')) for d in denials if isinstance(d, dict)})))
         if sid and result.get("session_id") and result["session_id"] != sid:
             problems.append(f"result session_id {result['session_id']} != init {sid}")
-    else:
-        problems.append("no result message in stream")
+    elif not (sess["timed_out"] and init):
+        problems.append("no result message in stream")   # a budget kill has none; its outcome still counts
     rj["session_status"] = ("timeout" if sess["timed_out"] else (result or {}).get("subtype") or
                             f"exit_{sess['exit_code']}") + ("" if not (result or {}).get("is_error") else ":is_error")
     limits = rate_limit_events(run_dir / "stream.jsonl")
@@ -1547,9 +1569,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         c = costs.session_costs(tp, advisor_model=advisor_for(modes, mode), exclude_ids=tail["message_ids"]) \
             if tail["message_ids"] else full
         rj["costs"] = {"claude_code_total_usd": (result or {}).get("total_cost_usd"),
-                       "by_model": {"lead": {k: c["lead"].get(k) for k in ("model", "usd", "in", "out", "cr", "cw5", "cw1h")},
-                                    "advisor": {k: c["advisor"].get(k) for k in ("model", "usd", "source", "in", "out", "cr")},
-                                    "subagents": {a: {"model": b.get("model"), "usd": b.get("usd")} for a, b in c["subs"].items()}},
+                       "by_model": by_model(full),
+                       "by_model_reconciled": by_model(c),
                        "computed_total_usd": full["total_usd"], "reconciled_total_usd": c["total_usd"],
                        "tail_after_result": ({"messages": len(tail["message_ids"]),
                                               "usd": round(full["total_usd"] - c["total_usd"], 6),
@@ -1566,10 +1587,9 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
             rj["costs"]["reconstruction_gap"] = details
         if gap == "mismatch":
             problems.append(f"cost mismatch: claude code {cc:.4f} vs costs.py {c['total_usd']:.4f}")
+        rj["costs"]["run_usd"], rj["costs"]["run_usd_status"] = run_usd(rj["costs"])
         rj["models_seen"], p = check_models(result, c, modes, mode)
         problems += p
-        if sess["timed_out"]:
-            rj["timeout_class"] = timeout_class(result, rj["costs"]["reconstruction"], retries, limits)
         web = web_tool_uses(tp)
         rj["observation"]["web_tool_uses"] = len(web)
         if web:
@@ -1622,6 +1642,11 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     rj["diff"] = final_diff(run_dir / "base", snapshot, run_dir)
     tests = {}
     wb = check_root(modes)
+    if sess["timed_out"]:
+        rj["timeout_class"] = timeout_class(init, (rj.get("observation") or {}).get("api_retries") or [], failure,
+                                            limits)
+        if rj["timeout_class"] == "infra_suspected":
+            problems.append("timeout with signs of an infrastructure failure (API failure or retried requests)")
     suite_timeout = int(task.get("tests_timeout_s", 300))     # large upstream suites (packaging: ~63k tests)
     if task.get("public_tests"):
         tests["public"] = run_suite("public", task["public_tests"], snapshot, run_dir, timeout=suite_timeout,
@@ -1683,11 +1708,12 @@ def advisor_brief(adv):
 def line(rj):
     h = (rj.get("tests") or {}).get("hidden") or {}
     adv = rj.get("advisor") or {}
-    cost = (rj.get("costs") or {}).get("claude_code_total_usd")
+    cost = run_cost(rj) if rj.get("costs") else None     # the whole run; ~ when (partly) estimated
+    approx = "~" if cost is not None and run_cost_status(rj) != "confirmed" else ""
     probe = (rj.get("plan") or {}).get("probe")
     return (f"{rj['run_id']}  {rj['task_id']:<10} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
             f"hidden {h.get('passed', '-')}/{h.get('expected') or h.get('tests', '-')}  "
-            f"${cost if cost is not None else float('nan'):.3f}  {advisor_brief(adv)}  "
+            f"{approx}${cost if cost is not None else float('nan'):.3f}  {advisor_brief(adv)}  "
             f"{(rj.get('session') or {}).get('wall_s', '-')} s  "
             f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}"
             + ("  DIAGNOSTIC" if is_diagnostic(rj) else ""))   # forced policy: never a comparison, whatever the mode name
@@ -1731,9 +1757,10 @@ def calibration(run_jsons, mode="A", batch=None):
         if "bug_tests" in h:                     # historical tasks: was the bug fixed, did anything else break
             t.setdefault("bug_fixed", []).append(not h["bug_tests"]["not_passed"])
             t.setdefault("regressions", []).append(len(h.get("regressions") or []))
-        cost = (rj.get("costs") or {}).get("claude_code_total_usd")
-        if cost is not None:
-            t["cost_usd"].append(cost)
+        if rj.get("costs"):
+            t["cost_usd"].append(run_cost(rj))         # the whole run; how far confirmed is counted beside it
+            if run_cost_status(rj) != "confirmed":
+                t["cost_unconfirmed"] = t.get("cost_unconfirmed", 0) + 1
         for name in h.get("not_passed") or []:
             t["not_passed"][name] = t["not_passed"].get(name, 0) + 1
     return out
@@ -1759,14 +1786,32 @@ def setup_key(a, b):
 
 
 def run_cost(rj):
-    """What a run cost, whatever became of it: Claude Code's total, else the transcript reconstruction."""
+    """What a whole run cost, whatever became of it: costs.run_usd (Claude Code's total plus any tail after its
+    last result, or the transcript's estimate); runs from before run_usd: Claude Code's total, else the transcript."""
     c = rj.get("costs") or {}
+    if c.get("run_usd") is not None:
+        return c["run_usd"]
     v = c.get("claude_code_total_usd")
     if v is None:
         v = ((rj.get("result") or {}).get("total_cost_usd"))
     if v is None:
         v = c.get("computed_total_usd")
     return v or 0.0
+
+
+def usd_txt(v):
+    """$x.xxx when confirmed, ~$x.xxx when the figure is (partly) an estimate."""
+    return ("" if v.get("usd_status") == "confirmed" else "~") + f"${v['usd']:.3f}"
+
+
+def run_cost_status(rj):
+    c = rj.get("costs") or {}
+    if c.get("run_usd_status"):
+        return c["run_usd_status"]
+    # runs from before run_usd: Claude Code's total, unless the reconstruction disagreed with it
+    if c.get("claude_code_total_usd") is None:
+        return "estimated"
+    return "unreconciled" if c.get("reconstruction") == "mismatch" else "confirmed"
 
 
 def with_revalidation(rj, overlay):
@@ -1821,7 +1866,8 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None, manifests=None, repla
         answers = (rj.get("jev") or {}).get("answers") or []
         stops = (rj.get("decisions") or {}).get("stops") or 0
         return {"run_id": rj.get("run_id"), "valid": bool(rj.get("valid")), "success": bool(rj.get("success")),
-                "usd": c.get("claude_code_total_usd"), "sonnet_usd": (bm.get("lead") or {}).get("usd"),
+                "usd": run_cost(rj) if c else None, "usd_status": run_cost_status(rj),
+                "sonnet_usd": (bm.get("lead") or {}).get("usd"),
                 "opus_usd": (bm.get("advisor") or {}).get("usd"),
                 "regressions": len(h.get("regressions") or []), "session_s": (rj.get("session") or {}).get("wall_s"),
                 "first_stop_would_consult": answers[0].get("would_consult") if answers else None,
@@ -1856,13 +1902,18 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None, manifests=None, repla
             status[(task, batch, rep_)] = "invalid"
             continue
         status[(task, batch, rep_)] = "valid"
-        x = {"batch": batch, "repeat": rep_, ma: a, mb: b, "diff_usd": b["usd"] - a["usd"]}
+        x = {"batch": batch, "repeat": rep_, ma: a, mb: b, "diff_usd": b["usd"] - a["usd"],
+             "cost_confirmed": a["usd_status"] == b["usd_status"] == "confirmed"}
         if (batch, rep_) in replacements:
             x["replaces"] = list(replacements[(batch, rep_)])
         t["pairs"].append(x)
     for t in out.values():
         p = t["pairs"]
         t["mean_diff_usd"] = sum(x["diff_usd"] for x in p) / len(p) if p else None
+        # cost comparisons carry their reliability: the mean over pairs whose both costs are confirmed, apart
+        conf = [x for x in p if x["cost_confirmed"]]
+        t["confirmed_cost_pairs"] = len(conf)
+        t["mean_diff_usd_confirmed"] = sum(x["diff_usd"] for x in conf) / len(conf) if conf else None
         t["revalidated_pairs"] = sum(1 for x in p if x[ma]["revalidated"] or x[mb]["revalidated"])
         for m in modes:
             t[f"{m}_success"] = sum(x[m]["success"] for x in p)
@@ -1965,11 +2016,14 @@ def cmd_pairs(a):
         md = f"{t['mean_diff_usd']:+.3f}" if t["mean_diff_usd"] is not None else "-"
         print(f"{row:<23} pairs {n}  mean {mb}-{ma} ${md}  success {ma} {t[f'{ma}_success']}/{n} {mb} {t[f'{mb}_success']}/{n}"
               + (f"  (+{t['invalid_pairs']} invalid)" if t["invalid_pairs"] else "")
-              + (f"  ({t['revalidated_pairs']} revalidated)" if t["revalidated_pairs"] else ""))
+              + (f"  ({t['revalidated_pairs']} revalidated)" if t["revalidated_pairs"] else "")
+              + (f"  [cost confirmed in {t['confirmed_cost_pairs']}/{n}: mean ${t['mean_diff_usd_confirmed']:+.3f}]"
+                 if t["confirmed_cost_pairs"] != n and t["mean_diff_usd_confirmed"] is not None
+                 else f"  [cost confirmed in 0/{n}]" if t["confirmed_cost_pairs"] != n else ""))
         for x in t["pairs"]:
             A, B = x[ma], x[mb]
-            print(f"    {x['batch']}#{x['repeat']} {ma} ${A['usd']:.3f} {A['session_s']:.0f}s regr {A['regressions']}  |  "
-                  f"{mb} ${B['usd']:.3f} (sonnet ${B['sonnet_usd'] or 0:.3f}, opus ${B['opus_usd'] or 0:.3f}) "
+            print(f"    {x['batch']}#{x['repeat']} {ma} {usd_txt(A)} {A['session_s']:.0f}s regr {A['regressions']}  |  "
+                  f"{mb} {usd_txt(B)} (sonnet ${B['sonnet_usd'] or 0:.3f}, opus ${B['opus_usd'] or 0:.3f}) "
                   f"{B['session_s']:.0f}s regr {B['regressions']} blocks {B['blocks']} extra stops {B['extra_stops']}  |  "
                   f"jev@1st stop {ma} {A['first_stop_would_consult']} {mb} {B['first_stop_would_consult']}"
                   + (f"  replaces {x['replaces'][0]}#{x['replaces'][1]}" if x.get("replaces") else ""))

@@ -181,8 +181,8 @@ def session_costs(transcript_path, advisor_model=None, exclude_ids=None):
       "subs":    {agent_id: bucket + {"model"}},
       "total_usd", "estimated" (bool), "notes" [str], "seen": diagnostics
     }
-    exclude_ids: message ids of the lead's transcript left out (the tail after Claude Code's last result
-    message, which no result total covers)."""
+    exclude_ids: message ids left out, in the lead's and the subagents' transcripts alike (the tail after Claude
+    Code's last result message, which no result total covers)."""
     if not transcript_path:
         return None
     files = [transcript_path] + sorted(_subagent_files(transcript_path).values())
@@ -247,6 +247,8 @@ def session_costs(transcript_path, advisor_model=None, exclude_ids=None):
     for aid, p in _subagent_files(transcript_path).items():
         b = dict(_zero(), model=None)
         for mid, model, u, _ in _messages(p):
+            if mid in ex:                        # the tail after the result covers subagents too (ChatGPT, 21.11)
+                continue
             b["model"] = b["model"] or model
             its = u.get("iterations")
             for i, it in enumerate(its if isinstance(its, list) and its else [u]):
