@@ -1465,6 +1465,31 @@ def test_batch_replaces_declares_the_slot_it_stands_in_for(task):
                   "--paired", "--replaces", "a:1,b:2"])
 
 
+def test_a_diagnostic_replacement_leaves_research_pairs_alone():
+    # ChatGPT review of PR #9 (P2): a diagnostic manifest declared as a replacement made the A/B pair "replaced"
+    manifests = {"p1": {"batch_id": "p1", "task": "pk-x", "paired": True, "order": [["A", 1], ["B", 1]]},
+                 "d1": {"batch_id": "d1", "task": "pk-x", "paired": True, "order": [["BJd", 1]],
+                        "replaces": [{"batch_id": "p1", "repeat": 1}]}}
+    diag = _prj("BJd", 1, 0.5, batch="d1")
+    diag["config"]["policy"] = {"r3_gate_force": "consult"}
+    runs = [_prj("A", 1, 0.1), _prj("B", 1, 0.3), diag]
+    rep = lab.replacements_from(manifests)
+    r = lab.pair_report(runs, manifests=manifests, replacements=rep)
+    assert len(only_row(r, "pk-x")["pairs"]) == 1 and r["accounting"]["pk-x"]["replaced"] == 0
+    # a replacement slot of other modes (no A/B pair in it) does not knock the pair out either
+    other = {"p1": manifests["p1"], "x1": {"batch_id": "x1", "task": "pk-x", "paired": True,
+                                           "order": [["C", 1], ["D", 1]], "replaces": [{"batch_id": "p1", "repeat": 1}]}}
+    r = lab.pair_report(runs[:2] + [_prj("C", 1, 0.2, batch="x1"), _prj("D", 1, 0.2, batch="x1")],
+                        manifests=other, replacements=lab.replacements_from(other))
+    assert len(only_row(r, "pk-x")["pairs"]) == 1
+
+
+def test_batch_refuses_a_diagnostic_replacement(task):
+    with pytest.raises(SystemExit, match="diagnostic"):
+        lab.main(["batch", "--task", task["_file"], "--modes", "B,BJd", "--repeats", "1", "--seed", "3",
+                  "--paired", "--replaces", "20261118-023802-ee05:3"])
+
+
 def test_cost_gap_after_a_retried_request_is_an_incomplete_reconstruction(task):
     """18.11, 3ef45c38c8: the Mac slept, Claude Code retried a request and billed more than the transcript holds.
     Claude Code's sum is consistent and only exceeds the transcript: the run stays valid, marked incomplete."""
@@ -1613,10 +1638,13 @@ def test_bjd_forces_the_block_and_the_chain_is_complete(task, monkeypatch, jev_s
     d = r["diag"]
     assert d["verdict"] == "complete", d
     assert all(d["links"][k] for k in lab.DIAG_LINKS)
-    assert d["info"]["jev_real"][0]["would_consult"] is False and d["info"]["advisor_models_of_call"] == ["claude-opus-5-5"]
+    assert d["info"]["jev_real"][0]["would_consult"] is False and d["chains"][0]["advisor_models_of_call"] == ["claude-opus-5-5"]
     assert lab.main(["diag"]) == 0
     out = capsys.readouterr().out
     assert "chain: complete" in out and "jev real answer (not used): status ok, p=0.30" in out
+    assert "chain 1/1 (decision" in out
+    lab.main(["summary"])
+    assert "BJd" in capsys.readouterr().out.split("DIAGNOSTIC")[0]
 
 
 def test_diagnostic_runs_stay_out_of_pairs_and_calib(task, monkeypatch, jev_stub):
@@ -1685,6 +1713,27 @@ def test_diag_chain_reports_the_first_missing_link(tmp_path):
     assert lab.diag_chain(est, tp, "claude-opus-5-5")["verdict"] == "broken at opus_cost_reconciled"
     off = _diag_rj(result={"modelUsage": {"claude-opus-5-5": {"costUSD": 0.40}}})
     assert lab.diag_chain(off, tp, "claude-opus-5-5")["verdict"] == "broken at opus_cost_reconciled"
+    # ChatGPT review of PR #9 (P2): only advisor results after the answer are no lead continuation
+    only_srv = tmp_path / "srv.jsonl"
+    only_srv.write_text("".join(json.dumps(r) + "\n" for r in [
+        {"type": "assistant", "message": {"id": "m1", "content": [
+            {"type": "server_tool_use", "id": "srv1", "name": "advisor"},
+            {"type": "advisor_tool_result", "tool_use_id": "srv1", "content": {"type": "advisor_redacted_result"}},
+            {"type": "advisor_tool_result", "tool_use_id": "srv1", "content": {"type": "advisor_redacted_result"}}],
+            "usage": {"iterations": [{"type": "advisor_message", "model": "claude-opus-5-5"}]}}},
+        {"type": "assistant", "message": {"id": "m2", "content": [
+            {"type": "server_tool_use", "id": "srv2", "name": "advisor"}, {"type": "text", "text": "  "}]}}]))
+    assert lab.diag_chain(_diag_rj(), str(only_srv), "claude-opus-5-5")["verdict"] == "broken at session_continued"
+    # ChatGPT review of PR #9 (P2): every forced decision has its own chain; the second block got no consultation
+    two = _diag_rj()
+    two["decisions"]["decisions"].append({"id": "s-7", "rule": "R3_high_risk", "state": "requested",
+                                          "jev_gate": {"decided_by": "forced", "real": {"status": "ok"}}})
+    two["advisor"]["blocks"].append({"ts": 300.0, "until": 400.0, "decision_ids": ["s-7"], "requests_consult": True,
+                                     "calls": []})
+    d = lab.diag_chain(two, tp, "claude-opus-5-5")
+    assert d["verdict"] == "broken at advisor_called_in_block" and d["info"]["forced_decisions"] == 2
+    assert [c["verdict"] for c in d["chains"]] == ["complete", "broken at advisor_called_in_block"]
+    assert d["links"]["advisor_called_in_block"] is False and d["links"]["r3_blocked"] is True
     # a call outside the R3 block's window is not this block's answer
     stray = _diag_rj()
     stray["advisor"]["calls"][0]["answers_block"] = None

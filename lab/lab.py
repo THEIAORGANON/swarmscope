@@ -792,10 +792,23 @@ def advisor_models_by_message(transcript):
     return out
 
 
+LEAD_BLOCKS = ("text", "tool_use", "thinking", "redacted_thinking")
+
+
+def _lead_content(b):
+    """A content block the lead model itself produced and that carries something: not an advisor call or its
+    result (server_tool_use / advisor_tool_result), not an empty text."""
+    if b.get("type") not in LEAD_BLOCKS:
+        return False
+    if b.get("type") == "text":
+        return bool((b.get("text") or "").strip())
+    return True
+
+
 def assistant_after(transcript, call_id):
-    """Did the lead model go on after the advisor's answer to `call_id`? Either content after the
-    advisor_tool_result in the same message, or any later assistant record. By order in the transcript, not by
-    timestamp (two records can share a millisecond)."""
+    """Did the lead model go on after the advisor's answer to `call_id`? Lead content (text, tool_use, thinking)
+    after that advisor_tool_result, in the same message or a later assistant record; further advisor calls and
+    results do not count (ChatGPT review of PR #9). By order in the transcript, not by timestamp."""
     recs, _ = jl(transcript)
     seen = False
     for r in recs or []:
@@ -804,7 +817,7 @@ def assistant_after(transcript, call_id):
         for b in (r.get("message") or {}).get("content") or []:
             if not isinstance(b, dict):
                 continue
-            if seen:
+            if seen and _lead_content(b):
                 return True
             if b.get("type") == "advisor_tool_result" and b.get("tool_use_id") == call_id:
                 seen = True
@@ -816,50 +829,56 @@ DIAG_LINKS = ("r3_reached_gate", "r3_blocked", "advisor_called_in_block", "advis
 
 
 def diag_chain(rj, transcript, advisor, tol=0.01):
-    """BJ-diag: did the forced consultation go through the whole chain? Each link is checked on recorded data:
-    the R3 decision forced at the gate -> its block record -> an advisor call inside that block's window (call and
-    result bound by tool_use_id) -> a returned result -> from the pinned advisor model (advisor_message.model of
-    that very message) -> the lead model went on after it and the session finished -> Opus cost: Claude Code's
-    modelUsage for the advisor equals the transcript reconstruction (from usage.iterations), and the whole
-    reconstruction is complete. verdict: complete | incomplete (R3 never reached the gate: nothing was forced) |
-    broken at <link>. Says nothing about whether Jev or the consultation helped."""
+    """BJ-diag: did every forced consultation go through the whole chain? For EACH R3 decision forced at the gate
+    (ChatGPT review of PR #9: not only the first): its block record -> an advisor call inside that block's window
+    (call and result bound by tool_use_id) -> a returned result -> from the pinned advisor model
+    (advisor_message.model of that very message) -> the lead model produced content after it, the block ended in a
+    later Stop and the session succeeded. Once per run: Opus cost, Claude Code's modelUsage for the advisor equals
+    the transcript reconstruction (usage.iterations), and the reconstruction is complete.
+    verdict: complete (every chain whole) | incomplete (R3 never reached the gate) | broken at <link> (first
+    broken link of the first broken chain; chains lists all). Says nothing about whether Jev or the consultation
+    helped."""
     dec = (rj.get("decisions") or {}).get("decisions") or []
     adv = rj.get("advisor") or {}
-    links, info = {}, {}
+    info = {"r3_states": [d.get("state") for d in dec if d.get("rule") == "R3_high_risk"]}
     forced = [d for d in dec if d.get("rule") == "R3_high_risk" and (d.get("jev_gate") or {}).get("decided_by") == "forced"]
-    info["r3_states"] = [d.get("state") for d in dec if d.get("rule") == "R3_high_risk"]
     info["forced_decisions"] = len(forced)
     info["jev_real"] = [((d.get("jev_gate") or {}).get("real") or {}) for d in forced]
-    links["r3_reached_gate"] = bool(forced)
     if not forced:
-        return {"verdict": "incomplete", "why": "R3 never reached the gate: nothing was forced", "links": links,
-                "info": info}
-    d = forced[0]
-    block = next((b for b in adv.get("blocks") or [] if d.get("id") in (b.get("decision_ids") or [])), None)
-    links["r3_blocked"] = bool(block and block.get("requests_consult") and d.get("state") == "requested")
-    calls = [c for c in adv.get("calls") or [] if block and c.get("answers_block") == block.get("ts")
-             and c.get("id") in (block.get("calls") or [])]
-    links["advisor_called_in_block"] = bool(calls)
-    returned = [c for c in calls if c.get("status") == "returned"]
-    links["advisor_returned"] = bool(returned)
+        return {"verdict": "incomplete", "why": "R3 never reached the gate: nothing was forced",
+                "links": {"r3_reached_gate": False}, "chains": [], "info": info}
     by_msg = advisor_models_by_message(transcript) if transcript and Path(transcript).exists() else {}
-    c0 = returned[0] if returned else None
-    models = sorted(by_msg.get(c0.get("message_id"), set()), key=str) if c0 else []
-    info["advisor_models_of_call"] = models
-    links["pinned_model"] = bool(c0) and models == [advisor]
-    links["session_continued"] = (bool(c0) and assistant_after(transcript, c0.get("id"))
-                                  and block.get("until") is not None and rj.get("session_status") == "success")
     costs_ = rj.get("costs") or {}
     cc_adv = (((rj.get("result") or {}).get("modelUsage") or {}).get(advisor) or {}).get("costUSD")
     tr = (costs_.get("by_model") or {}).get("advisor") or {}
     info["opus_usd"] = {"claude_code": cc_adv, "transcript": tr.get("usd"), "source": tr.get("source"),
                         "reconstruction": costs_.get("reconstruction")}
-    links["opus_cost_reconciled"] = (cc_adv is not None and tr.get("usd") is not None and tr.get("source") == "iterations"
-                                     and abs(cc_adv - tr["usd"]) <= tol and costs_.get("reconstruction") == "complete")
-    broken = next((k for k in DIAG_LINKS if not links.get(k)), None)
-    return {"verdict": "complete" if broken is None else f"broken at {broken}", "links": links, "info": info,
-            "decision_id": d.get("id"), "block_ts": block.get("ts") if block else None,
-            "calls": [{k: c.get(k) for k in ("id", "ts", "status", "message_id")} for c in calls]}
+    cost_ok = (cc_adv is not None and tr.get("usd") is not None and tr.get("source") == "iterations"
+               and abs(cc_adv - tr["usd"]) <= tol and costs_.get("reconstruction") == "complete")
+    chains = []
+    for d in forced:
+        lk = {"r3_reached_gate": True}
+        block = next((b for b in adv.get("blocks") or [] if d.get("id") in (b.get("decision_ids") or [])), None)
+        lk["r3_blocked"] = bool(block and block.get("requests_consult") and d.get("state") == "requested")
+        calls = [c for c in adv.get("calls") or [] if block and c.get("answers_block") == block.get("ts")
+                 and c.get("id") in (block.get("calls") or [])]
+        lk["advisor_called_in_block"] = bool(calls)
+        returned = [c for c in calls if c.get("status") == "returned"]
+        lk["advisor_returned"] = bool(returned)
+        c0 = returned[0] if returned else None
+        models = sorted(by_msg.get(c0.get("message_id"), set()), key=str) if c0 else []
+        lk["pinned_model"] = bool(c0) and models == [advisor]
+        lk["session_continued"] = (bool(c0) and assistant_after(transcript, c0.get("id"))
+                                   and block.get("until") is not None and rj.get("session_status") == "success")
+        lk["opus_cost_reconciled"] = cost_ok
+        broken = next((k for k in DIAG_LINKS if not lk.get(k)), None)
+        chains.append({"decision_id": d.get("id"), "verdict": "complete" if broken is None else f"broken at {broken}",
+                       "links": lk, "block_ts": block.get("ts") if block else None, "advisor_models_of_call": models,
+                       "calls": [{k: c.get(k) for k in ("id", "ts", "status", "message_id")} for c in calls]})
+    links = {k: all(c["links"].get(k) for c in chains) for k in DIAG_LINKS}
+    first = next((c for c in chains if c["verdict"] != "complete"), None)
+    return {"verdict": "complete" if first is None else first["verdict"], "links": links, "chains": chains,
+            "info": info}
 
 
 def blocks_from_log(decision_recs, stop_times):
@@ -1574,7 +1593,8 @@ def line(rj):
             f"${cost if cost is not None else float('nan'):.3f}  opus {adv.get('called', '-')} "
             f"(req {adv.get('requested', '-')}, vol {adv.get('voluntary', '-')})  "
             f"{(rj.get('session') or {}).get('wall_s', '-')} s  "
-            f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}")
+            f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}"
+            + ("  DIAGNOSTIC" if is_diagnostic(rj) else ""))   # forced policy: never a comparison, whatever the mode name
 
 
 def experiment_key(rj):
@@ -1713,7 +1733,11 @@ def pair_report(run_jsons, modes=("A", "B"), batches=None, manifests=None, repla
                 "advisor_called": (rj.get("advisor") or {}).get("called"),
                 "revalidated": bool(rj.get("revalidated"))}
 
-    superseded = set(replacements.values())
+    # a replacement link counts only when its slot holds a pair of this comparison's research runs (any validity):
+    # a diagnostic batch, or one of other modes, declared as a replacement must not knock out an existing pair
+    # (ChatGPT review of PR #9)
+    superseded = {target for (b, r), target in replacements.items()
+                  if any((t, b, r, ma) in runs and (t, b, r, mb) in runs for t in {k[0] for k in runs})}
     out, status = {}, {}                              # status[(task, batch, repeat)] = valid | invalid | ...
     for (task, batch, rep_, mode), rj in runs.items():
         if mode != ma or (task, batch, rep_, mb) not in runs:
@@ -1976,9 +2000,15 @@ def cmd_diag(a):
         print(f"{rj.get('run_id')}  {rj.get('task_id')}  {rj.get('mode')}  "
               f"{'VALID' if rj.get('valid') else 'INVALID'}  chain: {d.get('verdict', 'not computed')}"
               + (f"  ({d['why']})" if d.get("why") else ""))
-        for k in DIAG_LINKS:
-            if k in (d.get("links") or {}):
-                print(f"    {'ok  ' if d['links'][k] else 'FAIL'}  {k}")
+        chains = d.get("chains") or []
+        for i, c in enumerate(chains):
+            print(f"    chain {i + 1}/{len(chains)} (decision {c.get('decision_id')}): {c.get('verdict')}")
+            for k in DIAG_LINKS:
+                if k in (c.get("links") or {}):
+                    print(f"      {'ok  ' if c['links'][k] else 'FAIL'}  {k}")
+        if not chains:
+            for k, v in (d.get("links") or {}).items():
+                print(f"    {'ok  ' if v else 'FAIL'}  {k}")
         info = d.get("info") or {}
         for j in info.get("jev_real") or []:
             p = j.get("p_consult")
@@ -2443,6 +2473,9 @@ def cmd_batch(a):
         raise SystemExit(f"--replaces names {len(replaces)} slots for {a.repeats} repeat(s)")
     if replaces and not getattr(a, "paired", False):
         raise SystemExit("--replaces needs --paired")
+    diag_modes = [m for m in modes if build_policy(modes_cfg, m).get("r3_gate_force")]
+    if replaces and diag_modes:
+        raise SystemExit(f"--replaces with diagnostic mode(s) {', '.join(diag_modes)}: a diagnostic batch replaces no research slot")
     manifest = {"batch_id": batch_id, "seed": a.seed, "paired": bool(getattr(a, "paired", False)), "task": task["task_id"], "order": order,
                 **({"pilot": a.pilot} if getattr(a, "pilot", None) else {}),
                 "replaces": replaces,
