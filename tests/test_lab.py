@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -325,6 +325,41 @@ def test_timeout_is_never_success_even_when_hidden_tests_pass(task, monkeypatch)
     r = lab.attempt(task, "A")
     assert r["session_status"] == "timeout" and r["success"] is False and r["valid"] is False
     assert r["verdict"]["session_completed"] is False
+
+
+def test_work_after_the_result_is_a_tail_not_a_cost_mismatch(task, monkeypatch):
+    # 2ec1703088 (ChatGPT, 21.11): a result at 936 s, then a background task notification woke the model; the
+    # budget killed it. Claude Code's total covers the session up to the result: the tail is reconstructed apart
+    modes_with(monkeypatch, timeout_s=3)
+    monkeypatch.setenv("FAKE_TAIL_AFTER_RESULT", "8")
+    r = lab.attempt(task, "A")
+    c = r["costs"]
+    assert r["session_status"] == "timeout" and r["timeout_class"] == "budget"
+    assert r["valid"] is True, r["integrity"]            # a budget timeout with full accounting: a valid failure
+    assert r["success"] is False and c["reconstruction"] == "complete"
+    t = c["tail_after_result"]
+    assert t["messages"] == 1 and t["usd"] > 0 and t["reconciled"] is False and t["claude_code_total"] is None
+    assert abs(c["computed_total_usd"] - c["reconciled_total_usd"] - t["usd"]) < 1e-9
+    assert abs(c["reconciled_total_usd"] - c["claude_code_total_usd"]) <= 0.01
+
+
+def test_timeout_classes():
+    assert lab.timeout_class({"x": 1}, "complete", [], []) == "budget"
+    assert lab.timeout_class({"x": 1}, "mismatch", [], []) == "incomplete_accounting"
+    assert lab.timeout_class(None, None, [], []) == "incomplete_accounting"
+    assert lab.timeout_class(None, None, [{"attempt": 1}], []) == "infra_suspected"
+    assert lab.timeout_class(None, None, [], [{"status": "rejected"}]) == "infra_suspected"
+
+
+def test_a_task_sets_its_own_session_budget(task, monkeypatch):
+    # ChatGPT, 21.11: pk-prerel gets 1800 s; the same budget for every mode, recorded, part of the task hash
+    seen = []
+    real = lab.run_session
+    monkeypatch.setattr(lab, "run_session", lambda *a: seen.append(a[-1]) or real(*a))
+    r = lab.attempt(dict(task, session_timeout_s=1800), "A")
+    assert seen == [1800] and r["config"]["timeout_s"] == 1800 and r["config"]["timeout_source"] == "task"
+    r = lab.attempt(task, "B")
+    assert seen[-1] == lab.load_modes()[0]["common"]["timeout_s"] and r["config"]["timeout_source"] == "modes"
 
 
 def test_sh_timeout_partial_output_is_text():

@@ -7,6 +7,7 @@ FAKE_SUSPEND=1|noretry  Claude Code bills $0.05 more than the transcript holds; 
                     (the Mac slept: StreamSuspended, as on 18.11), noretry: with no retry in the transcript
 FAKE_ADVISOR_NO_RESULT=1|paid  an advisor request that never returns; paid: Claude Code still bills the advisor
 FAKE_ADVISOR_HANDOFF=1|only  on a block: Bash then an advisor call in one message, never run (only: no second call)
+FAKE_TAIL_AFTER_RESULT=<s>  after the result: a task notification and one more lead message, then sleep <s>
 FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never reached (as on 17.11),
                     mid: the API fails after work began, warn: the session still finishes normally"""
 import json
@@ -338,3 +339,14 @@ if os.environ.get("FAKE_ADVISOR_NO_RESULT") == "paid":
 out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "total_cost_usd": cost,
      "duration_ms": 1234, "num_turns": 3,
      "permission_denials": [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {}}] if os.environ.get("FAKE_DENY") else [], "modelUsage": usage})
+if os.environ.get("FAKE_TAIL_AFTER_RESULT"):
+    # 2ec1703088 (21.11): after the result a background task notification wakes the model, which works on until
+    # the session budget kills it; Claude Code's total does not cover that tail
+    out({"type": "system", "subtype": "task_notification", "session_id": sid})
+    tail_msg = {"type": "assistant", "timestamp": iso(), "message": {"id": "mtail", "model": model, "content": [
+        {"type": "tool_use", "id": "tt1", "name": "Bash", "input": {"command": "true"}}],
+        "usage": {"input_tokens": 20000, "output_tokens": 800, "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0}}}
+    tr(tail_msg)
+    out(tail_msg)
+    time.sleep(float(os.environ["FAKE_TAIL_AFTER_RESULT"]))

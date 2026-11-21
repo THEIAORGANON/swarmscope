@@ -1,7 +1,7 @@
 {
   "pilot": "cand-1",
   "kind": "screening",
-  "status": "in progress: wzf-cond screened (not selected); pk-prerel and at-gensetattr pending review",
+  "status": "in progress: wzf-cond not selected; pk-prerel batch 1 excluded (contract defect), rerun on the corrected task with 1800 s; at-gensetattr in review",
   "question": "Which new tasks leave room to improve the outcome? Agreed with ChatGPT (21.11) after bj-diag-1: longer connected changes (an API split, a subsystem, a feature across modules with a checkable contract), screened on mode A alone.",
   "not_asked": "Whether any policy helps. Screening runs are mode A only; they form no pairs.",
   "candidates": {
@@ -34,10 +34,12 @@
   "selection": "Mixed A outcomes (some runs fail hidden tests or regress) mark a candidate as having room; three clean passes do not. R3 reach and Jev's answers are recorded apart and are not a selection criterion on their own; a high p is never the only criterion. The diff size is only a prior; the runs decide.",
   "next": "selected candidates go into a fresh B / BJ / B12 pilot (Jev threshold 0.5), declared separately; primary metric hidden checks and regressions, secondary cost and time",
   "batches": [
-    "20261121-053530-3de4"
+    "20261121-053530-3de4",
+    "20261121-095543-9d9f"
   ],
   "deviations": [
-    "wzf-cond cost $7.38 for 3 runs against the 'about $2-3' estimate given to the author (estimate, not part of this declaration); Opus, called voluntarily three times per run, was about 54% of it"
+    "wzf-cond cost $7.38 for 3 runs against the 'about $2-3' estimate given to the author (estimate, not part of this declaration); Opus, called voluntarily three times per run, was about 54% of it",
+    "pk-prerel: session budget raised to 1800 s for the corrected task (all modes), declared after debugging batch 20261121-095543-9d9f, before any run on the corrected task"
   ],
   "result": null,
   "screened": {
@@ -99,6 +101,36 @@
       ],
       "verdict": "not selected: three clean passes (all hidden tests, no regressions) leave no room to improve the outcome under A",
       "cost_usd": 7.377
+    }
+  },
+  "excluded": {
+    "20261121-095543-9d9f": {
+      "task": "pk-prerel (manifest at main 1fa34ad, before the contract fix)",
+      "why": "contract defect: the prompt said every pre-release outside the opt-in region is dropped when a final appears, which contradicts the base behaviour that a === literal admits the pre-release it names (hidden test test_named_literal_prerelease_is_force_admitted, passing on the base). All three runs regressed on exactly that test. Excluded as a whole, no verdict on the candidate (ChatGPT, 21.11).",
+      "runs": [
+        {
+          "run_id": "46a3e7ae77",
+          "valid": false,
+          "status": "timeout 1200 s during the author's network outage, no result message",
+          "hidden": "62510/62511, bug_tests 28/28, 1 regression"
+        },
+        {
+          "run_id": "2ec1703088",
+          "valid": false,
+          "status": "timeout 1200 s; result at 936.7 s, then a background task notification woke the model; cost mismatch = exactly the $0.036263 tail after the result (since fixed in accounting, not re-judged)",
+          "usd": 2.304762,
+          "hidden": "62510/62511, 28/28, 1 regression"
+        },
+        {
+          "run_id": "668882775e",
+          "valid": true,
+          "success": false,
+          "status": "session success at 1187.6 s, task not passed",
+          "usd": 2.907,
+          "hidden": "62510/62511, 28/28, 1 regression"
+        }
+      ],
+      "kept": "run directories and costs stay; the corrected manifest has a new task hash, so reports keep the versions apart"
     }
   }
 }

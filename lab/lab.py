@@ -609,6 +609,34 @@ def claude_cmd(modes, settings, mode=None):
     return cmd + list(c.get("extra_args", []))
 
 
+def timeout_class(result, reconstruction, retries, limits):
+    """Why a session that hit its budget is (in)valid (ChatGPT, 21.11). budget: a result message exists and the
+    cost up to it reconciles - the run is a valid failure (the agent ran out of time). incomplete_accounting: no
+    result message, so no Claude Code total to check the costs against - invalid. infra_suspected: as
+    incomplete_accounting, with API retries or rate-limit events in the session (a network outage looks like this) -
+    invalid. Old runs are not re-judged."""
+    if result and reconstruction == "complete":
+        return "budget"
+    if result:
+        return "incomplete_accounting"
+    return "infra_suspected" if (retries or limits) else "incomplete_accounting"
+
+
+def tail_after_result(stream_path):
+    """Assistant message ids that come after the last result message of the stream (none without a result)."""
+    recs, _ = jl(stream_path)
+    recs = recs or []
+    last = max((i for i, r in enumerate(recs) if r.get("type") == "result"), default=None)
+    if last is None:
+        return {"message_ids": []}
+    ids = []
+    for r in recs[last + 1:]:
+        mid = (r.get("message") or {}).get("id") if r.get("type") == "assistant" else None
+        if mid and mid not in ids:
+            ids.append(mid)
+    return {"message_ids": ids}
+
+
 def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s):
     t0 = time.time()
     with open(stream_path, "w") as out, open(err_path, "w") as err:
@@ -1380,11 +1408,15 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
                       "python": sys.version.split()[0], "python_exe": sys.executable, "swarmscope": code_versions(),
                       "modes_file_sha256": modes_sha, "modes_version": modes.get("version")}
     rj["config_fingerprint"] = config_fingerprint(cfg)
+    # the session budget: the task's own session_timeout_s (in its manifest, so in task_sha256 and the experiment
+    # version) for every mode alike, else the modes' common timeout_s (ChatGPT, 21.11: pk-prerel needed 1800 s)
+    session_timeout = int(task.get("session_timeout_s") or modes["common"]["timeout_s"])
+    timeout_source = "task" if task.get("session_timeout_s") else "modes"
     rj["config"] = {"model": modes["common"]["model"], "advisor": advisor_for(modes, mode),
                     "effort_requested": effort_for(modes, mode), "permission_mode": modes["common"]["permission_mode"],
                     "policy": pol, "policy_sha256": file_sha(policy_file), "settings_sha256": file_sha(settings),
                     "argv": cmd, "env_passed": sorted(env), "env_dropped": dropped,
-                    "timeout_s": modes["common"]["timeout_s"], "work_root": str(work.parent),
+                    "timeout_s": session_timeout, "timeout_source": timeout_source, "work_root": str(work.parent),
                     "jev_key_source": key_src if key else None, "task_summary": summary}
     if expect:                                   # batch manifest: everything must match what the batch started with
         got = {"work_tree": rj["base"]["work_tree"], "code_bundle": rj["versions"]["swarmscope"]["bundle_sha256"],
@@ -1406,9 +1438,9 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         return stop("; ".join(problems[:]))
     rj["session_status"] = "running"
     save()
-    print(f"{run_id}: {task['task_id']} mode {mode} → session running (limit {modes['common']['timeout_s']} s)")
+    print(f"{run_id}: {task['task_id']} mode {mode} → session running (limit {session_timeout} s)")
     sess = run_session(cmd, work, env, prompt or task["prompt"], run_dir / "stream.jsonl", run_dir / "stderr.txt",
-                       modes["common"]["timeout_s"])
+                       session_timeout)
     rj["session"] = sess
     init, result, bad = parse_stream(run_dir / "stream.jsonl")
     sid = (init or {}).get("session_id")
@@ -1508,12 +1540,22 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     if rj["observation"]["transcript_ok"]:
         sys.path.insert(0, str(REPO))
         import costs
-        c = costs.session_costs(tp, advisor_model=advisor_for(modes, mode))
+        tail = tail_after_result(run_dir / "stream.jsonl")
+        full = costs.session_costs(tp, advisor_model=advisor_for(modes, mode))
+        # Claude Code's total covers the session up to its last result message; work after it (a background task
+        # notification woke the model, 2ec1703088) is reconstructed apart and never compared with that total
+        c = costs.session_costs(tp, advisor_model=advisor_for(modes, mode), exclude_ids=tail["message_ids"]) \
+            if tail["message_ids"] else full
         rj["costs"] = {"claude_code_total_usd": (result or {}).get("total_cost_usd"),
                        "by_model": {"lead": {k: c["lead"].get(k) for k in ("model", "usd", "in", "out", "cr", "cw5", "cw1h")},
                                     "advisor": {k: c["advisor"].get(k) for k in ("model", "usd", "source", "in", "out", "cr")},
                                     "subagents": {a: {"model": b.get("model"), "usd": b.get("usd")} for a, b in c["subs"].items()}},
-                       "computed_total_usd": c["total_usd"], "estimated": c["estimated"], "notes": c["notes"],
+                       "computed_total_usd": full["total_usd"], "reconciled_total_usd": c["total_usd"],
+                       "tail_after_result": ({"messages": len(tail["message_ids"]),
+                                              "usd": round(full["total_usd"] - c["total_usd"], 6),
+                                              "claude_code_total": None, "reconciled": False}
+                                             if tail["message_ids"] else None),
+                       "estimated": c["estimated"], "notes": c["notes"],
                        "prices_as_of": c.get("prices_as_of"), "jev_usd_est": (rj.get("jev") or {}).get("cost_usd_est")}
         cc = rj["costs"]["claude_code_total_usd"]
         retries = transcript_retries(tp)
@@ -1526,6 +1568,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
             problems.append(f"cost mismatch: claude code {cc:.4f} vs costs.py {c['total_usd']:.4f}")
         rj["models_seen"], p = check_models(result, c, modes, mode)
         problems += p
+        if sess["timed_out"]:
+            rj["timeout_class"] = timeout_class(result, rj["costs"]["reconstruction"], retries, limits)
         web = web_tool_uses(tp)
         rj["observation"]["web_tool_uses"] = len(web)
         if web:
