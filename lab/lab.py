@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import io
 import json
+from collections import Counter
 import os
 import random
 import re
@@ -737,18 +738,37 @@ def classify_cost_gap(result, c, retries, tol=0.01):
 
 
 def advisor_calls(transcript):
-    """Every advisor call in the transcript, its result matched by tool_use_id: returned | failed | no_result."""
-    calls, results = {}, {}
+    """Every advisor call in the transcript, its result matched by tool_use_id: returned | failed | no_result.
+    A call whose id later gets a result is one continued attempt (returned / failed), however long the pause.
+    A no_result call gets no_result_reason from what the transcript shows, never a guess at the cause:
+      client_tool_handoff_not_resumed - in its message a client tool_use came BEFORE the advisor call, that message
+        has no advisor_message usage, and the call's id appears nowhere after it (not in any later request either).
+        bj-diag-1 (21.11): Bash -> advisor in one message; the documented resumption after the client tool result
+        did not happen and the lead called the advisor again. Advisor and a client tool in one message are legitimate
+        (the advisor should resume after the tool result), so the order and the absence of resumption are recorded,
+        not the mere pairing.
+      unobserved - anything else; no_result_signs holds the three observations either way."""
+    calls, results, order = {}, {}, []
+    msg_blocks, msg_usage, later_ids = {}, {}, {}
     recs, _ = jl(transcript)
-    for r in recs or []:
+    for i, r in enumerate(recs or []):
+        raw = json.dumps(r, ensure_ascii=False) if calls else ""
+        for cid in list(calls):
+            if i > calls[cid]["_i"] and cid in raw:
+                later_ids[cid] = True
         if r.get("type") != "assistant":
             continue
         msg = r.get("message") or {}
+        mid = msg.get("id")
+        for it in (msg.get("usage") or {}).get("iterations") or []:
+            if isinstance(it, dict) and it.get("type") == "advisor_message":
+                msg_usage[mid] = True
         for b in msg.get("content") or []:
             if not isinstance(b, dict):
                 continue
+            msg_blocks.setdefault(mid, []).append((b.get("type"), b.get("id")))
             if b.get("type") == "server_tool_use" and b.get("name") == "advisor" and b.get("id") not in calls:
-                calls[b["id"]] = {"id": b["id"], "ts": r.get("timestamp"), "message_id": msg.get("id")}
+                calls[b["id"]] = {"id": b["id"], "ts": r.get("timestamp"), "message_id": mid, "_i": i}
             elif b.get("type") == "advisor_tool_result" and b.get("tool_use_id") not in results:
                 c = b.get("content")
                 ctype = c.get("type") if isinstance(c, dict) else type(c).__name__
@@ -760,7 +780,18 @@ def advisor_calls(transcript):
                 results[b["tool_use_id"]] = rec
     out = []
     for cid, c in calls.items():
+        c.pop("_i", None)
         c.update(results.get(cid) or {"status": "no_result"})
+        if c["status"] == "no_result":
+            blocks = msg_blocks.get(c["message_id"]) or []
+            pos = next((k for k, (t, bid) in enumerate(blocks) if bid == cid), len(blocks))
+            signs = {"client_tool_before": any(t == "tool_use" for t, _ in blocks[:pos]),
+                     "advisor_usage_in_message": bool(msg_usage.get(c["message_id"])),
+                     "id_seen_later": bool(later_ids.get(cid))}
+            c["no_result_signs"] = signs
+            c["no_result_reason"] = ("client_tool_handoff_not_resumed"
+                                     if signs["client_tool_before"] and not signs["advisor_usage_in_message"]
+                                     and not signs["id_seen_later"] else "unobserved")
         out.append(c)
     return out
 
@@ -1511,11 +1542,17 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         calls, per_block = attribute(advisor_calls(tp), blocks)
         consult_blocks = [b for b in per_block if b["requests_consult"]]
         rj["advisor"] = {"unit": "blocked Stop", "attribution": "time_window (block → next Stop)",
+                         "counts_version": 2,       # 21.11: requested_answered = a RETURNED call (was: any call)
                          "requested": len(consult_blocks),
-                         "requested_answered": sum(1 for b in consult_blocks if b["calls"]),
+                         "requested_called": sum(1 for b in consult_blocks if b["calls"]),
+                         "requested_answered": sum(1 for b in consult_blocks
+                                                   if any(x["id"] in b["calls"] and x["status"] == "returned"
+                                                          for x in calls)),
                          "called": len(calls), "returned": sum(1 for x in calls if x["status"] == "returned"),
                          "failed": sum(1 for x in calls if x["status"] == "failed"),
                          "no_result": sum(1 for x in calls if x["status"] == "no_result"),
+                         "no_result_reasons": dict(Counter(x["no_result_reason"] for x in calls
+                                                           if x["status"] == "no_result")),
                          "voluntary": sum(1 for x in calls if x["voluntary"]),
                          "unattributed_no_ts": sum(1 for x in calls if x["attribution"] == "no_timestamp"),
                          "advisor_models_named": named, "blocks": per_block, "calls": calls}
@@ -1583,6 +1620,22 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
 
 # --- commands -----------------------------------------------------------------------------------------------
 
+def advisor_brief(adv):
+    """'advisor: 2 attempts, 1 returned, 1 no_result; consult blocks 1, answered 1' - not 'opus 2' (ChatGPT, 21.11)."""
+    if not adv or adv.get("called") is None:
+        return "advisor -"
+    parts = [f"{adv.get('called')} attempt{'s' if adv.get('called') != 1 else ''}"]
+    for k in ("returned", "failed", "no_result"):
+        if adv.get(k):
+            parts.append(f"{adv[k]} {k}")
+    tail = f"consult blocks {adv.get('requested', 0)}"
+    if adv.get("counts_version") == 2:
+        tail += f", answered {adv.get('requested_answered', 0)}"
+    if adv.get("voluntary"):
+        tail += f", voluntary {adv['voluntary']}"
+    return "advisor: " + ", ".join(parts) + "; " + tail
+
+
 def line(rj):
     h = (rj.get("tests") or {}).get("hidden") or {}
     adv = rj.get("advisor") or {}
@@ -1590,8 +1643,7 @@ def line(rj):
     probe = (rj.get("plan") or {}).get("probe")
     return (f"{rj['run_id']}  {rj['task_id']:<10} {'prb' if probe else rj['mode']:<3} {rj.get('session_status', '?'):<10} "
             f"hidden {h.get('passed', '-')}/{h.get('expected') or h.get('tests', '-')}  "
-            f"${cost if cost is not None else float('nan'):.3f}  opus {adv.get('called', '-')} "
-            f"(req {adv.get('requested', '-')}, vol {adv.get('voluntary', '-')})  "
+            f"${cost if cost is not None else float('nan'):.3f}  {advisor_brief(adv)}  "
             f"{(rj.get('session') or {}).get('wall_s', '-')} s  "
             f"{'VALID' if rj.get('valid') else 'INVALID ' + str(len(rj.get('integrity') or []))}"
             + ("  DIAGNOSTIC" if is_diagnostic(rj) else ""))   # forced policy: never a comparison, whatever the mode name

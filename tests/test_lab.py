@@ -104,7 +104,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     lab.cmd_setup(None)
@@ -1533,6 +1533,62 @@ def test_unanswered_unpaid_advisor_request_is_telemetry(task, monkeypatch):
     r = lab.attempt(task, "A")
     assert r["valid"] is True, r["integrity"]
     assert r["advisor"]["no_result"] == 1 and r["advisor"]["unanswered_unpaid"] is True
+
+
+def _adv_tp(tmp_path, name, recs):
+    p = tmp_path / name
+    p.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    return str(p)
+
+
+def _am(mid, blocks, advisor_usage=False):
+    its = [{"type": "message"}] + ([{"type": "advisor_message", "model": "claude-opus-5-5"}] if advisor_usage else [])
+    return {"type": "assistant", "timestamp": "2026-11-21T01:00:00.000Z",
+            "message": {"id": mid, "content": blocks, "usage": {"iterations": its}}}
+
+
+BASH = {"type": "tool_use", "id": "tu1", "name": "Bash"}
+SRV = {"type": "server_tool_use", "id": "srv1", "name": "advisor"}
+RES = {"type": "advisor_tool_result", "tool_use_id": "srv1", "content": {"type": "advisor_redacted_result"}}
+
+
+def test_no_result_reason_is_read_from_the_transcript(tmp_path):
+    # ChatGPT, 21.11 (bj-diag-1): a subtype of no_result from observed signs, not a guessed cause
+    tp = _adv_tp(tmp_path, "a.jsonl", [_am("m1", [BASH]), _am("m1", [SRV]),
+                                       {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1"}]}},
+                                       {"type": "api-request-blob", "message": {"content": [BASH]}}])
+    c = lab.advisor_calls(tp)[0]
+    assert c["status"] == "no_result" and c["no_result_reason"] == "client_tool_handoff_not_resumed"
+    assert c["no_result_signs"] == {"client_tool_before": True, "advisor_usage_in_message": False, "id_seen_later": False}
+    # advisor first, then Bash: the order bj-diag-1 saw on the call that returned - not this pattern
+    c = lab.advisor_calls(_adv_tp(tmp_path, "b.jsonl", [_am("m1", [SRV]), _am("m1", [BASH])]))[0]
+    assert c["no_result_reason"] == "unobserved" and c["no_result_signs"]["client_tool_before"] is False
+    # the id is carried into a later request: resumption may be under way, so not "not resumed"
+    c = lab.advisor_calls(_adv_tp(tmp_path, "c.jsonl", [_am("m1", [BASH, SRV]),
+                                                       {"type": "api-request-blob", "message": {"content": [SRV]}}]))[0]
+    assert c["no_result_reason"] == "unobserved" and c["no_result_signs"]["id_seen_later"] is True
+    # advisor usage in that message: something ran
+    c = lab.advisor_calls(_adv_tp(tmp_path, "d.jsonl", [_am("m1", [BASH, SRV], advisor_usage=True)]))[0]
+    assert c["no_result_reason"] == "unobserved"
+    # the same id answered later: one continued attempt, returned, no reason
+    c = lab.advisor_calls(_adv_tp(tmp_path, "e.jsonl", [_am("m1", [BASH, SRV]), _am("m2", [RES], advisor_usage=True)]))
+    assert len(c) == 1 and c[0]["status"] == "returned" and "no_result_reason" not in c[0]
+
+
+def test_advisor_counts_split_called_and_answered(task, monkeypatch, capsys):
+    # ChatGPT, 21.11: requested_answered counted a block with ANY call; "opus 2" read as two consultations
+    monkeypatch.setenv("FAKE_ADVISOR_HANDOFF", "1")
+    r = lab.attempt(task, "B")
+    a = r["advisor"]
+    assert r["valid"] is True, r["integrity"]
+    assert (a["called"], a["returned"], a["no_result"]) == (2, 1, 1)
+    assert (a["requested"], a["requested_called"], a["requested_answered"]) == (1, 1, 1)
+    assert a["no_result_reasons"] == {"client_tool_handoff_not_resumed": 1} and a["counts_version"] == 2
+    lab.main(["summary"])
+    assert "advisor: 2 attempts, 1 returned, 1 no_result; consult blocks 1, answered 1" in capsys.readouterr().out
+    monkeypatch.setenv("FAKE_ADVISOR_HANDOFF", "only")              # the block got an attempt but no answer
+    a = lab.attempt(task, "B")["advisor"]
+    assert (a["requested"], a["requested_called"], a["requested_answered"], a["returned"]) == (1, 1, 0, 0)
 
 
 def test_paid_advisor_without_a_model_name_still_invalidates(task, monkeypatch):
