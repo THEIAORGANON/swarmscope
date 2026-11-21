@@ -1,7 +1,7 @@
 {
   "pilot": "cand-1",
   "kind": "screening",
-  "status": "declared 2026-11-21 before any run",
+  "status": "in progress: wzf-cond screened (not selected); pk-prerel and at-gensetattr pending review",
   "question": "Which new tasks leave room to improve the outcome? Agreed with ChatGPT (21.11) after bj-diag-1: longer connected changes (an API split, a subsystem, a feature across modules with a checkable contract), screened on mode A alone.",
   "not_asked": "Whether any policy helps. Screening runs are mode A only; they form no pairs.",
   "candidates": {
@@ -9,15 +9,96 @@
     "pk-prerel": "packaging #1311: pre-release opt-in clipped to range bounds (base 9377ef405915 -> fix c411a96fea8d); after its contract and hidden-test selection are settled",
     "at-gensetattr": "attrs #1592: on_setattr hooks accept generators; third; hidden tests adapted to public behaviour (no _lazy_is_generator / _IS_GENERATOR_RESULTS)"
   },
-  "deferred": {"werkzeug #3333": "much of it is docs; little source change (ChatGPT review 21.11)"},
-  "modes": {"A": "as in modes.json: Sonnet 5.5 + pinned Opus 5.5 advisor that it calls itself, effort high; rules (b-5) and Jev only record (observe)"},
+  "deferred": {
+    "werkzeug #3333": "much of it is docs; little source change (ChatGPT review 21.11)"
+  },
+  "modes": {
+    "A": "as in modes.json: Sonnet 5.5 + pinned Opus 5.5 advisor that it calls itself, effort high; rules (b-5) and Jev only record (observe)"
+  },
   "repeats": "3 VALID A runs per candidate; an invalid run is replaced, never counted",
   "per_candidate_command": "lab.py batch --task <id> --modes A --repeats 3 --seed <seed> --pilot cand-1",
-  "seeds": {"wzf-cond": 601, "pk-prerel": 602, "at-gensetattr": 603},
-  "recorded_per_run": ["hidden passed/expected", "regressions", "session_s", "cost (Sonnet / Opus)", "advisor attempts and returns", "whether R3 would trigger (observe log)", "Jev's answers (shadow)"],
+  "seeds": {
+    "wzf-cond": 601,
+    "pk-prerel": 602,
+    "at-gensetattr": 603
+  },
+  "recorded_per_run": [
+    "hidden passed/expected",
+    "regressions",
+    "session_s",
+    "cost (Sonnet / Opus)",
+    "advisor attempts and returns",
+    "whether R3 would trigger (observe log)",
+    "Jev's answers (shadow)"
+  ],
   "selection": "Mixed A outcomes (some runs fail hidden tests or regress) mark a candidate as having room; three clean passes do not. R3 reach and Jev's answers are recorded apart and are not a selection criterion on their own; a high p is never the only criterion. The diff size is only a prior; the runs decide.",
   "next": "selected candidates go into a fresh B / BJ / B12 pilot (Jev threshold 0.5), declared separately; primary metric hidden checks and regressions, secondary cost and time",
-  "batches": [],
-  "deviations": [],
-  "result": null
+  "batches": [
+    "20261121-053530-3de4"
+  ],
+  "deviations": [
+    "wzf-cond cost $7.38 for 3 runs against the 'about $2-3' estimate given to the author (estimate, not part of this declaration); Opus, called voluntarily three times per run, was about 54% of it"
+  ],
+  "result": null,
+  "screened": {
+    "wzf-cond": {
+      "batch": "20261121-053530-3de4",
+      "code": "main 3b38254 (PR #12)",
+      "runs": [
+        {
+          "run_id": "7da5989629",
+          "valid": true,
+          "hidden": "1038/1038",
+          "bug_tests": "48/48",
+          "regressions": 0,
+          "usd": 2.473,
+          "lead_usd": 1.125,
+          "opus_usd": 1.348,
+          "session_s": 670,
+          "advisor": "3 attempts, 2 returned, 1 no_result (client_tool_handoff_not_resumed), all voluntary",
+          "rules": "R1/R2/R3 pass",
+          "jev": {
+            "p_consult": 0.16,
+            "would_consult": false
+          }
+        },
+        {
+          "run_id": "177acc574d",
+          "valid": true,
+          "hidden": "1038/1038",
+          "bug_tests": "48/48",
+          "regressions": 0,
+          "usd": 2.435,
+          "lead_usd": 1.111,
+          "opus_usd": 1.324,
+          "session_s": 617,
+          "advisor": "3 attempts, 2 returned, 1 no_result (client_tool_handoff_not_resumed), all voluntary",
+          "rules": "R1/R2/R3 pass",
+          "jev": {
+            "p_consult": 0.13,
+            "would_consult": false
+          }
+        },
+        {
+          "run_id": "4213c9eec4",
+          "valid": true,
+          "hidden": "1038/1038",
+          "bug_tests": "48/48",
+          "regressions": 0,
+          "usd": 2.468,
+          "lead_usd": 1.139,
+          "opus_usd": 1.329,
+          "session_s": 712,
+          "advisor": "3 attempts, 2 returned, 1 no_result (client_tool_handoff_not_resumed), all voluntary",
+          "rules": "R1 triggered (observe), R2/R3 pass",
+          "jev": {
+            "p_consult": 0.36,
+            "would_consult": false
+          }
+        }
+      ],
+      "verdict": "not selected: three clean passes (all hidden tests, no regressions) leave no room to improve the outcome under A",
+      "cost_usd": 7.377
+    }
+  }
 }
