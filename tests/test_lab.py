@@ -862,7 +862,7 @@ def test_probe_reads_its_own_task_output_and_nothing_beside_it(task, capsys):
     for label in TASK_STEPS:
         assert f"ok    step_{label}" in out, label
     assert "ok    step_30_reads_the_output_of_step_28" in out and "ok    task_files_planted" in out
-    assert "ok    task_folder_replaced_by_step_35" in out
+    assert "ok    task_folder_swap_conclusive" in out
     root = Path(lab.claude_tmp_root())
     assert not list(root.glob("-probe-other-*")) and not list(root.glob("*/probe-other-session-*"))
     assert not list(root.glob("*/*/tasks/neighbour.txt")) and not list(root.glob("*/*/tasks/link.output"))
@@ -910,10 +910,19 @@ def test_probe_catches_a_guard_that_resolves_the_task_folder(task, monkeypatch, 
     assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
 
 
-def test_probe_needs_step_35_to_have_replaced_the_folder(task, monkeypatch, capsys):
+def test_probe_needs_step_35_to_be_conclusive(task, monkeypatch, capsys):
+    # a Bash step that "worked" but replaced nothing proves nothing about step 36
     monkeypatch.setenv("FAKE_NO_REPLACE", "1")
     assert lab.main(["probe", "--task", task["_file"]]) == 1
-    assert "FAIL  task_folder_replaced_by_step_35" in capsys.readouterr().out
+    assert "FAIL  task_folder_swap_conclusive" in capsys.readouterr().out
+
+
+def test_probe_accepts_a_swap_the_sandbox_refused(task, monkeypatch, capsys):
+    # lab Mac, probe ed5f9459d1: Seatbelt refused the mv of the tasks folder - the attack is impossible there
+    monkeypatch.setenv("FAKE_NO_REPLACE", "refused")
+    assert lab.main(["probe", "--task", task["_file"]]) == 0
+    out = capsys.readouterr().out
+    assert "ok    task_folder_swap_conclusive" in out and "blocked by the sandbox" in out
 
 
 def test_probe_catches_a_guard_without_the_task_output_rule(task, monkeypatch, capsys, tmp_path):
@@ -2061,13 +2070,24 @@ def test_b12_never_blocks_on_r3(task):
 
 class Clocks:
     """Injected clocks: monotonic is the real one (it stops in sleep on macOS); the budget clock is monotonic plus
-    `slept`, which the test raises to stand for a sleep; the calendar clock is monotonic plus `shift`."""
-    def __init__(self):
+    `slept`, which the test raises to stand for a sleep; the calendar clock is monotonic plus `shift`.
+    then_slept / then_shift apply from the second reading on, i.e. after the session's start: a timer is no good
+    for that, because the scans before the start take ~1 s on the Mac (lsof) and a 0.2 s timer fired before the
+    first reading (Mac pytest, 22.11)."""
+    def __init__(self, then_slept=0.0, then_shift=0.0):
         self.slept, self.shift = 0.0, 0.0
+        self.then_slept, self.then_shift, self.reads = then_slept, then_shift, {"b": 0, "w": 0}
+
+    def _b(self):
+        self.reads["b"] += 1
+        return time.monotonic() + self.slept + (self.then_slept if self.reads["b"] > 1 else 0.0)
+
+    def _w(self):
+        self.reads["w"] += 1
+        return time.time() + self.shift + (self.then_shift if self.reads["w"] > 1 else 0.0)
 
     def __call__(self):
-        return {"budget": ("FAKE_CONTINUOUS", lambda: time.monotonic() + self.slept), "monotonic": time.monotonic,
-                "wall": lambda: time.time() + self.shift}
+        return {"budget": ("FAKE_CONTINUOUS", self._b), "monotonic": time.monotonic, "wall": self._w}
 
 
 def _session(tmp_path, script, timeout_s, clocks, **kw):
@@ -2089,8 +2109,7 @@ def test_budget_ordinary_deadline(tmp_path):
 
 def test_budget_runs_through_a_sleep_and_marks_it(tmp_path):
     # 6fe8f53cc9: the budget clock passes the deadline in sleep; on waking the session is stopped and marked
-    c = Clocks()
-    _later(0.3, lambda: setattr(c, "slept", 4000.0))
+    c = Clocks(then_slept=4000.0)
     t0 = time.monotonic()
     r = _session(tmp_path, "sleep 30", 1800, c)
     assert time.monotonic() - t0 < 10
@@ -2100,19 +2119,22 @@ def test_budget_runs_through_a_sleep_and_marks_it(tmp_path):
 def test_budget_sleep_then_a_quick_exit_is_still_caught(tmp_path):
     # the process ends on its own right after waking, before any deadline check: the end check catches the sleep
     c = Clocks()
-    _later(0.2, lambda: setattr(c, "slept", 120.0))
-    r = _session(tmp_path, "sleep 0.6; exit 0", 1800, c, )
+    real = lab.ProcTracker.scan
+
+    def scan(self, *a, **k):                                 # the "sleep" happens once the agent is running
+        c.slept = 120.0
+        return real(self, *a, **k)
+    import unittest.mock as um
+    with um.patch.object(lab.ProcTracker, "scan", scan):
+        r = _session(tmp_path, "sleep 0.6; exit 0", 1800, c)
     assert r["exit_code"] == 0 and not r["timed_out"] and r["host_slept"], r
 
 
 def test_budget_ignores_the_calendar_clock_and_short_gaps(tmp_path):
-    c = Clocks()
-    _later(0.2, lambda: setattr(c, "shift", 3600.0))          # the calendar clock is set an hour ahead
-    r = _session(tmp_path, "sleep 0.6", 2, c)
-    assert not r["timed_out"] and not r["host_slept"] and r["wall_s"] > 3000 and r["budget_s"] < 2, r
-    c = Clocks()
-    _later(0.2, lambda: setattr(c, "slept", 4.0))             # under the 5 s tolerance
-    assert not _session(tmp_path, "sleep 0.6", 30, c)["host_slept"]
+    c = Clocks(then_shift=3600.0)                            # the calendar clock is set an hour ahead
+    r = _session(tmp_path, "sleep 0.6", 5, c)
+    assert not r["timed_out"] and not r["host_slept"] and r["wall_s"] > 3000 and r["budget_s"] < 5, r
+    assert not _session(tmp_path, "sleep 0.6", 30, Clocks(then_slept=4.0))["host_slept"]   # under the 5 s tolerance
 
 
 def _gone(pid):
@@ -2238,8 +2260,12 @@ def test_a_detached_child_by_the_tag_alone(tmp_path, monkeypatch):
     monkeypatch.setattr(lab, "process_table", lambda: {pid: (1, pid, st, start)
                                                        for pid, (_, _, st, start) in real().items()})
     r = _session(tmp_path, script, 30, Clocks())
-    assert r["stopped_after_session"], r
     assert r["tag_scan"] == ("ps_E" if sys.platform == "darwin" else "proc_environ"), r
+    if sys.platform == "darwin" and not r["stopped_after_session"]:
+        # lab Mac, 22.11: ps -E did not show the tag in the environment of /bin/sh: on macOS the tag scan is
+        # best effort (README); the method is checked, the stop by the tag alone is not promised there
+        pytest.xfail("macOS: ps -E did not reveal the run tag of a /bin/sh child (tag scan best effort)")
+    assert r["stopped_after_session"], r
     assert _no_late_write(f)
 
 

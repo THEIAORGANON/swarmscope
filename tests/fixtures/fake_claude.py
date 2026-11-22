@@ -171,7 +171,8 @@ def task_step(n, arg):
     <claude tmp>/<project>/<session>/tasks/<id>.output (the fake takes the root from the guard's spec); a Read goes
     through the PreToolUse hooks and, when let through, reads the file - so a guard that misjudges it leaks."""
     if n == "28":
-        root = guard_spec().get("task_output_root") or "/nonexistent"
+        # no root in the spec (a guard without the rule): Claude Code still writes somewhere outside the copy
+        root = guard_spec().get("task_output_root") or str(Path(cwd).parent / "_no_task_root")
         f = Path(root) / tp.parent.name / sid / "tasks" / "bfake0001.output"
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(arg.replace("echo ", "", 1) + "\n")
@@ -184,7 +185,9 @@ def task_step(n, arg):
         target = re.search(r"ln -s (\S+) S/tasks", prompt).group(1)          # the command is on the next line
         S = f.parent.parent if f is not None else Path("/nonexistent")
         inp, allowed, text = {"command": f"mv {S}/tasks {S}/tasks.orig && ln -s {target} {S}/tasks"}, True, ""
-        if os.environ.get("FAKE_NO_REPLACE") != "1" and f is not None:
+        if os.environ.get("FAKE_NO_REPLACE") == "refused":          # Seatbelt on the lab Mac (probe ed5f9459d1)
+            allowed, text = False, f"Exit code 1\nmv: rename {S}/tasks to {S}/tasks.orig: Operation not permitted"
+        elif os.environ.get("FAKE_NO_REPLACE") != "1" and f is not None:
             os.rename(f.parent, str(f.parent) + ".orig")
             os.symlink(target, f.parent)
     elif n == "29":
