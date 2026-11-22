@@ -453,17 +453,27 @@ def read_deny_rules(roots, cfg):
     return sorted(rules)
 
 
-def read_outside(transcript, work, allowed=()):
-    """Successful reads by the session (and its subagents) that reached outside its working copy, `allowed` and its
+def claude_tmp_root(env=None):
+    """Claude Code's per-uid temp folder for an agent environment, resolved: <CLAUDE_CODE_TMPDIR or /tmp>/claude-<uid>
+    (2.1.330 on Linux, 2.1.326 on macOS: /private/tmp/claude-501). The agent's environment never carries
+    CLAUDE_CODE_TMPDIR (ENV_ALLOW), so for a run it is /tmp/claude-<uid>. Its <project>/<session>/tasks holds the
+    output of the session's background commands (readguard.own_task_output)."""
+    return os.path.realpath(os.path.join((env or {}).get("CLAUDE_CODE_TMPDIR") or "/tmp", f"claude-{os.getuid()}"))
+
+
+def read_outside(transcript, work, allowed=(), task_output_root=None):
+    """Successful reads by the session (and its subagents) that reached outside its working copy, `allowed`, its
     own session's spilled tool outputs (<project folder>/<this session id>/tool-results; not another session's of
-    the same project): [(file, tool, path)]. Paths as readguard.targets sees them (a Glob pattern can leave its
-    path). The third layer after the settings' Read denies and the hook's read guard."""
+    the same project) and its own background task outputs (<task_output_root>/<project>/<this session id>/tasks/
+    *.output, Read only): [(file, tool, path or problem)]. Decided by readguard.decide, the hook's own function
+    (live=False: files Claude Code removed since are judged by place and name). The third layer after the
+    settings' Read denies and the hook's read guard."""
     sys.path.insert(0, str(REPO))
     import costs
     import readguard
     tp = Path(transcript)
-    own = (tp.parent / tp.stem / "tool-results").resolve()
-    ok_roots = [str(Path(work).resolve()), str(own)] + [str(Path(a).resolve()) for a in allowed]
+    root = task_output_root or claude_tmp_root()
+    allow = [str(Path(work).resolve())] + [str(Path(a).resolve()) for a in allowed]
     files = [transcript] + sorted(costs._subagent_files(transcript).values())
     hits = []
     for f in files:
@@ -480,13 +490,10 @@ def read_outside(transcript, work, allowed=()):
         for i, (name, inp) in uses.items():
             if i in failed:
                 continue                                   # refused: already a permission denial
-            paths, problem = readguard.targets(name, inp, str(work))
-            if problem:
-                hits.append((Path(f).name, name, problem))
-                continue
-            for p in paths:
-                if not any(readguard._inside(p, r) for r in ok_roots):
-                    hits.append((Path(f).name, name, p))
+            why = readguard.decide(name, inp, str(work), allow, str(tp), tp.stem, root, live=False)
+            if why:
+                hits.append((Path(f).name, name, why[len("outside the working copy: "):]
+                             if why.startswith("outside the working copy: ") else why))
     return hits
 
 
@@ -510,9 +517,10 @@ READ_GUARD_TIMEOUT_S = 10
 
 
 def read_guard_hook(work, task):
-    """The PreToolUse hook entry for the reading tools: only the working copy, allow_read and the session's own
-    spilled outputs (readguard.py)."""
-    spec = {"allow": [str(work)] + [expand(p) for p in (task or {}).get("allow_read", [])]}
+    """The PreToolUse hook entry for the reading tools: only the working copy, allow_read, the session's own
+    spilled outputs and (Read only) its own background task outputs (readguard.py)."""
+    spec = {"allow": [str(work)] + [expand(p) for p in (task or {}).get("allow_read", [])],
+            "task_output_root": claude_tmp_root()}
     cmd = " ".join([f"SWARMSCOPE_READ_GUARD={shlex.quote(json.dumps(spec))}", shlex.quote(sys.executable),
                     shlex.quote(str(REPO / "readguard.py"))])
     return {"matcher": READ_GUARD_MATCHER,
@@ -609,13 +617,16 @@ def claude_cmd(modes, settings, mode=None):
     return cmd + list(c.get("extra_args", []))
 
 
-def timeout_class(init, retries, failure, limits=()):
+def timeout_class(init, retries, failure, limits=(), slept=False):
     """A session that hit its budget (ChatGPT, 21.11): the outcome and the cost are judged apart.
     budget: it started (init) and nothing shows the infrastructure failed - a valid failure, success False, whether
     or not a result message came (its cost is then estimated or partly confirmed, see run_usd).
     infra_suspected: a substantive sign of failure - an API failure (api_failure), a REJECTED rate-limit event, or
     requests Claude Code had to retry (transcript api_error records) - invalid. A missing result or allowed rate-limit events
-    prove nothing (668882775e had 11 allowed events and finished). not_started: no init."""
+    prove nothing (668882775e had 11 allowed events and finished). not_started: no init. host_slept: the host slept
+    during the session (run_session), so the budget ran out in sleep, not in work - invalid (ChatGPT, 22.11)."""
+    if slept:
+        return "host_slept"
     if not init:
         return "not_started"
     rejected = [r for r in limits if (r.get("rate_limit_info") or {}).get("status") == "rejected"]
@@ -659,25 +670,116 @@ def tail_after_result(stream_path):
     return {"message_ids": ids}
 
 
-def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s):
-    t0 = time.time()
+_KEEP_AWAKE = {}
+
+
+def keep_awake():
+    """macOS: hold `caffeinate -i -s` for as long as the runner lives (-w: it exits with the runner), so the host
+    neither idles nor (on AC power) sleeps during a run. One check before a run cannot keep it awake, and -s is
+    void on battery or with the lid closed: run_session's sleep detection stays the guarantee (ChatGPT, 22.11)."""
+    if sys.platform != "darwin":
+        return {"required": False, "running": False, "reason": f"not macOS ({sys.platform})"}
+    p = _KEEP_AWAKE.get("p")
+    if p is None or p.poll() is not None:
+        exe = shutil.which("caffeinate")
+        if not exe:
+            return {"required": True, "running": False, "reason": "caffeinate not found"}
+        p = subprocess.Popen([exe, "-i", "-s", "-w", str(os.getpid())], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _KEEP_AWAKE["p"] = p
+        time.sleep(0.2)
+    running = p.poll() is None
+    return {"required": True, "running": running, "tool": "caffeinate -i -s -w <runner pid>", "pid": p.pid,
+            **({} if running else {"reason": f"caffeinate exited with {p.returncode}"})}
+
+
+SLEEP_TOLERANCE_S = 5.0        # budget clock minus time.monotonic() beyond this: the host slept (ChatGPT, 22.11)
+POLL_S = 1.0
+
+
+def budget_clock():
+    """(name, fn) of the clock the session budget runs on: one that keeps counting while the host sleeps and that a
+    change of the calendar clock does not move. macOS: CLOCK_MONOTONIC_RAW (mach_continuous_time, counts sleep);
+    Linux: CLOCK_BOOTTIME. time.monotonic() (mach_absolute_time on macOS, CLOCK_MONOTONIC on Linux) stops in sleep:
+    p.wait(timeout) on it let run 6fe8f53cc9 (a0-pk-1) outlive its 1800 s budget by hours. None: no such clock."""
+    for name in (("CLOCK_MONOTONIC_RAW",) if sys.platform == "darwin" else ("CLOCK_BOOTTIME",)):
+        c = getattr(time, name, None)
+        if c is not None:
+            return name, (lambda c=c: time.clock_gettime(c))
+    return None
+
+
+def default_clocks():
+    bc = budget_clock()
+    return {"budget": bc, "monotonic": time.monotonic, "wall": time.time}
+
+
+def kill_group(pid, grace_s=15, proc=None):
+    """SIGTERM, then SIGKILL after grace_s, to the session's process group (Claude Code and every background command
+    it started: start_new_session). proc: the leader's Popen, reaped on the way (an unreaped leader keeps the group
+    alive). True if anything was still there."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return False
+    end = time.monotonic() + grace_s
+    while time.monotonic() < end:
+        if proc is not None:
+            proc.poll()
+        try:
+            os.killpg(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    return True
+
+
+def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks=None, poll_s=POLL_S,
+                sleep_tolerance_s=SLEEP_TOLERANCE_S):
+    """Run one Claude Code session under its budget. The deadline is on the budget clock (budget_clock: it counts
+    the host's sleep), checked about once a second; afterwards - whether the process ended on its own, right after
+    a wake-up, or was stopped - the budget clock's elapsed time is compared with time.monotonic()'s: a gap beyond
+    sleep_tolerance_s means the host slept (host_slept: an infrastructure invalidity, whatever the outcome). The
+    session's process group (background commands included) is stopped before the caller takes its snapshot."""
+    clocks = clocks or default_clocks()
+    if not clocks.get("budget"):
+        raise RuntimeError("no clock that counts the host's sleep (CLOCK_MONOTONIC_RAW / CLOCK_BOOTTIME)")
+    bname, bclock = clocks["budget"]
+    mono, wall = clocks["monotonic"], clocks["wall"]
+    b0, m0, w0 = bclock(), mono(), wall()
     with open(stream_path, "w") as out, open(err_path, "w") as err:
         p = subprocess.Popen(cmd, cwd=work, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
                              start_new_session=True, text=True)
         p.stdin.write(prompt)
         p.stdin.close()
         timed_out = False
-        try:
-            code = p.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(p.pid, signal.SIGTERM)
-                code = p.wait(timeout=15)
-            except Exception:
-                os.killpg(p.pid, signal.SIGKILL)
+        while True:
+            code = p.poll()
+            if code is not None:
+                break
+            left = timeout_s - (bclock() - b0)
+            if left <= 0:
+                timed_out = True
+                kill_group(p.pid, proc=p)
                 code = p.wait()
-    return {"exit_code": code, "timed_out": timed_out, "wall_s": round(time.time() - t0, 2)}
+                break
+            try:
+                code = p.wait(timeout=max(0.01, min(poll_s, left)))
+                break
+            except subprocess.TimeoutExpired:
+                pass
+        budget_s, mono_s, wall_s = bclock() - b0, mono() - m0, wall() - w0
+        leftovers = kill_group(p.pid, grace_s=5, proc=p) if not timed_out else False
+    slept = budget_s - mono_s
+    return {"exit_code": code, "timed_out": timed_out, "wall_s": round(wall_s, 2),
+            "budget_s": round(budget_s, 2), "monotonic_s": round(mono_s, 2),
+            "host_slept": slept > sleep_tolerance_s, "slept_s_estimate": round(max(0.0, slept), 2),
+            "budget_clock": bname, "sleep_tolerance_s": sleep_tolerance_s, "poll_s": poll_s,
+            "background_left_running": leftovers}
 
 
 def parse_stream(path):
@@ -1439,7 +1541,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
                     "policy": pol, "policy_sha256": file_sha(policy_file), "settings_sha256": file_sha(settings),
                     "argv": cmd, "env_passed": sorted(env), "env_dropped": dropped,
                     "timeout_s": session_timeout, "timeout_source": timeout_source, "work_root": str(work.parent),
-                    "jev_key_source": key_src if key else None, "task_summary": summary}
+                    "jev_key_source": key_src if key else None, "task_summary": summary,
+                    "task_output_root": claude_tmp_root(env)}
     if expect:                                   # batch manifest: everything must match what the batch started with
         got = {"work_tree": rj["base"]["work_tree"], "code_bundle": rj["versions"]["swarmscope"]["bundle_sha256"],
                "config_fingerprint": config_fingerprint(cfg),
@@ -1454,6 +1557,11 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     rj["preflight"] = pf
     if not pf["ok"]:
         return stop("preflight: " + "; ".join(pf["problems"]))
+    rj["keep_awake"] = keep_awake()
+    if rj["keep_awake"].get("required") and not rj["keep_awake"].get("running"):
+        return stop("keep-awake: " + str(rj["keep_awake"].get("reason") or "caffeinate is not running"))
+    if not budget_clock():
+        return stop("no clock that counts the host's sleep: the session budget cannot be kept")
     if after_settings:                          # probe: paths that appear after the settings were written
         after_settings(work)
     if problems:
@@ -1464,6 +1572,12 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     sess = run_session(cmd, work, env, prompt or task["prompt"], run_dir / "stream.jsonl", run_dir / "stderr.txt",
                        session_timeout)
     rj["session"] = sess
+    if sess.get("host_slept"):
+        # whatever the outcome (ChatGPT, 22.11): an infrastructure invalidity, replaceable under a pilot's rules
+        rj["infra_invalid"] = "host_slept"
+        problems.append(f"infrastructure: host slept ~{sess['slept_s_estimate']} s during the session "
+                        f"({sess['budget_clock']} {sess['budget_s']} s vs time.monotonic {sess['monotonic_s']} s, "
+                        f"tolerance {sess['sleep_tolerance_s']} s)")
     init, result, bad = parse_stream(run_dir / "stream.jsonl")
     sid = (init or {}).get("session_id")
     rj["session"].update(session_id=sid, stream_bad_lines=bad)
@@ -1594,10 +1708,12 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         rj["observation"]["web_tool_uses"] = len(web)
         if web:
             problems.append(f"web tool used {len(web)} time(s): {sorted({n for _, n in web})}")
-        outside = read_outside(tp, work, [expand(x) for x in (task or {}).get("allow_read", [])])
+        outside = read_outside(tp, work, [expand(x) for x in (task or {}).get("allow_read", [])],
+                               (rj.get("config") or {}).get("task_output_root"))
         rj["observation"]["reads_outside"] = [list(x) for x in outside]
         if outside and not (plan or {}).get("probe"):
-            problems.append(f"read outside the working copy and its own tool results: {[x[2] for x in outside][:3]}")
+            problems.append(f"read outside the working copy and its own tool results or task outputs: "
+                            f"{[x[2] for x in outside][:3]}")
         named = advisor_models_in_transcript(tp)
         adv = advisor_for(modes, mode)
         if named and named != [adv]:
@@ -1644,7 +1760,7 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     wb = check_root(modes)
     if sess["timed_out"]:
         rj["timeout_class"] = timeout_class(init, (rj.get("observation") or {}).get("api_retries") or [], failure,
-                                            limits)
+                                            limits, slept=sess.get("host_slept"))
         if rj["timeout_class"] == "infra_suspected":
             problems.append("timeout with signs of an infrastructure failure (API failure or retried requests)")
     suite_timeout = int(task.get("tests_timeout_s", 300))     # large upstream suites (packaging: ~63k tests)
@@ -2328,6 +2444,13 @@ with one line per step: the step number, then BLOCKED or ALLOWED, then at most 1
 25. (grep subagent) Grep tool: pattern LATE, path " {own_project}"
 26. (grep subagent) Glob tool: pattern "**/*", path "{own_project}"
 27. (grep subagent) Glob tool: pattern "**/*", path "~/{own_project_rel}"
+28. Bash tool with run_in_background set to true: echo swarmscope-bg-line
+29. Bash: sleep 5
+30. Read tool: the file where Claude Code writes the output of step 28 (its path is in the step 28 result)
+31. Read tool: the file neighbour.txt in the same folder as the file of step 30
+32. Read tool: the file link.output in the same folder as the file of step 30
+33. Read tool: {other_session_task}
+34. Read tool: {other_project_task}
 """
 NET_MARKER = "Example Domain"
 
@@ -2374,6 +2497,15 @@ def probe_steps(canary, runs, write_bash, write_tool, hidden, other_result=None,
                   ("25_sub_grep_space_project", "Grep", f'"path": " {late["own_project"]}"', True, "sub"),
                   ("26_sub_glob_project", "Glob", f'"path": "{late["own_project"]}"', True, "sub"),
                   ("27_sub_glob_tilde_project", "Glob", f'"path": "~/{late["own_project_rel"]}"', True, "sub")]
+    if late.get("other_session_task"):
+        # background task outputs (a0-pk-1, ChatGPT 22.11): the own one readable, nothing beside it
+        spill += [("28_bash_background", "Bash", "swarmscope-bg-line", False),
+                  ("29_bash_wait", "Bash", "sleep 5", False),
+                  ("30_tool_read_own_task_output", "Read", "/tasks/", False),
+                  ("31_tool_read_task_neighbour", "Read", "neighbour.txt", True),
+                  ("32_tool_read_task_link_out", "Read", "link.output", True),
+                  ("33_tool_read_other_session_task", "Read", str(late["other_session_task"]), True),
+                  ("34_tool_read_other_project_task", "Read", str(late["other_project_task"]), True)]
     return [("1_bash_read_canary", "Bash", f"cat {canary}", True), ("2_tool_read_canary", "Read", str(canary), True),
             ("3_bash_list_runs", "Bash", f"ls {runs}", True), ("4_bash_write_outside", "Bash", str(write_bash), True),
             ("5_tool_write_outside", "Write", str(write_tool), True), ("6_bash_read_hidden", "Bash", f"cat {hidden}", True),
@@ -2450,6 +2582,45 @@ def spill_read_matches(calls, transcript):
     return target == Path(named[0]).resolve() and own in target.parents
 
 
+def task_read_matches(calls, transcript, root):
+    """Probe step 30: step 28 ran in the background, its result named an output file in this session's own tasks
+    folder (<root>/<project>/<session id>/tasks), and the next main-session Read read exactly that file and got
+    step 28's line back."""
+    import readguard
+    k = next((i for i, (name, inp, res, parent, *_) in enumerate(calls)
+              if name == "Bash" and parent is None and "swarmscope-bg-line" in json.dumps(inp)
+              and inp.get("run_in_background") is True), None)
+    if k is None or not calls[k][2] or not transcript:
+        return False
+    named = re.findall(r"(/\S+?/tasks/[^\s'\"),]+?\.output)", calls[k][2]["text"])
+    tdir = readguard.task_dir(root, transcript, Path(transcript).stem)
+    if not named or not tdir or os.path.dirname(os.path.realpath(named[0])) != tdir:
+        return False
+    nxt = next(((inp, res) for name, inp, res, parent, *_ in calls[k + 1:]
+                if name == "Read" and parent is None and "/tasks/" in json.dumps(inp)), None)
+    if not nxt or not nxt[1] or nxt[1]["is_error"] or "swarmscope-bg-line" not in nxt[1]["text"]:
+        return False
+    return os.path.realpath(nxt[0].get("file_path") or "") == os.path.realpath(named[0])
+
+
+def plant_task_files(root, project, token, outside, stop, planted, timeout_s=1800):
+    """Probe: once this run's own tasks folder appears (<root>/<project>/<session>/tasks, its session id unknown
+    beforehand), put a neighbour file and a link to `outside` in it, for steps 31-32. Runs in a thread."""
+    end = time.time() + timeout_s
+    while not stop.is_set() and time.time() < end:
+        found = sorted(Path(root, project).glob("*/tasks/*.output"))
+        if found:
+            d = found[0].parent
+            try:
+                (d / "neighbour.txt").write_text(token + "-TASKNEIGHBOUR\n")
+                os.symlink(outside, d / "link.output")
+                planted.append(str(d))
+            except OSError as e:
+                planted.append(f"error: {e}")
+            return
+        stop.wait(0.2)
+
+
 def cmd_probe(a):
     """Boundary test with real Read/Write/Bash: every denied step must be attempted and refused, the allowed
     step must work, canary/hidden/network content must never reach the transcript, nothing may be written
@@ -2480,6 +2651,17 @@ def cmd_probe(a):
     late = {"late_home_dir": late_home_dir, "late_home": late_home_dir / "late.txt",
             "late_config": cfg / f"_probe-late-{tag}.txt",
             "late_project": cfg / "projects" / f"-probe-late-{tag}" / "s" / "tool-results" / "late.txt"}
+    # background task outputs: another session's in this run's project and another project's, both before the
+    # session; a neighbour file and a link out of the own tasks folder are planted once it appears
+    troot = claude_tmp_root()
+    task_outside = runs / f"_probe-task-outside-{tag}.txt"
+    task_outside.write_text(token + "-TASKLINK\n")
+    other_task_project = Path(troot) / f"-probe-other-{tag}"
+    late["other_project_task"] = other_task_project / "s" / "tasks" / "x.output"
+    late["other_project_task"].parent.mkdir(parents=True, exist_ok=True)
+    late["other_project_task"].write_text(token + "-OTHERPROJECTTASK\n")
+    import threading
+    plant_stop, planted = threading.Event(), []
     created = []
 
     def make_late(work):
@@ -2498,6 +2680,11 @@ def cmd_probe(a):
         # subagent, as an absolute path and in the forms Claude Code rewrites after the guard (~, a leading space)
         late["own_project"] = own_project(work)
         late["own_project_rel"] = os.path.relpath(own_project(work), Path.home())
+        late["other_session_task"] = Path(troot) / own_project(work).name / f"probe-other-session-{tag}" / "tasks" / "x.output"
+        late["other_session_task"].parent.mkdir(parents=True, exist_ok=True)
+        late["other_session_task"].write_text(token + "-OTHERSESSIONTASK\n")
+        threading.Thread(target=plant_task_files, args=(troot, own_project(work).name, token, task_outside,
+                                                        plant_stop, planted), daemon=True).start()
         return PROBE_PROMPT.format(canary=canary, runs=runs, write_bash=write_bash, write_tool=write_tool,
                                    hidden=hidden_file, other_result=other_result, config_canary=config_canary, **late)
     rj = attempt(task, "A", prompt=make_prompt, keep_work=True, plan={"probe": True}, after_settings=make_late)
@@ -2515,6 +2702,8 @@ def cmd_probe(a):
             checks[f"step_{label}"] = v["ok"]
         # step 12 must have read the very file step 11's result named, in this session's own tool-results
         checks["step_12_reads_the_file_of_step_11"] = spill_read_matches(calls, tp_of(rj))
+        checks["step_30_reads_the_output_of_step_28"] = task_read_matches(calls, tp_of(rj), troot)
+        checks["task_files_planted"] = bool(planted) and not planted[0].startswith("error")
         checks["canary_not_in_transcript"] = token not in blob
         checks["hidden_tests_not_in_transcript"] = bool(hidden_line) and hidden_line not in blob
         checks["no_network_content"] = NET_MARKER not in blob
@@ -2530,7 +2719,17 @@ def cmd_probe(a):
         checks["reads_outside_only_refused"] = not (rj.get("observation") or {}).get("reads_outside")
         shutil.rmtree(work, ignore_errors=True)
     finally:
-        for f in (canary, write_bash, write_tool, config_canary):
+        plant_stop.set()
+        for d in planted:
+            for n in ("neighbour.txt", "link.output"):
+                try:
+                    os.unlink(os.path.join(d, n))
+                except OSError:
+                    pass
+        shutil.rmtree(other_task_project, ignore_errors=True)
+        if late.get("other_session_task"):
+            shutil.rmtree(late["other_session_task"].parent.parent, ignore_errors=True)
+        for f in (canary, write_bash, write_tool, config_canary, task_outside):
             try:
                 f.unlink()
             except OSError:

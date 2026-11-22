@@ -157,3 +157,95 @@ def test_ordinary_paths_still_pass(tree):
                      ("Grep", {"pattern": "k", "path": "src/a b.py"}),
                      ("Glob", {"pattern": "src/**/*.py"}), ("Read", {"file_path": "src/~x.py"})]:
         assert readguard.check(call(tool, ti, work, proj), spec) is None, (tool, ti)
+
+
+# own background task outputs (a0-pk-1, run 6fe8f53cc9: Read of <claude tmp>/<project>/<session>/tasks/<id>.output was
+# refused; ChatGPT, 22.11: allow only an existing *.output directly in the session's own tasks folder, from a trusted
+# root; hook and audit through one function)
+@pytest.fixture
+def tasks(tree):
+    t, work, proj = tree
+    root = t / "ctmp" / "claude-501"
+    own = root / "-w" / "S1" / "tasks"
+    for d in (own, root / "-w" / "S2" / "tasks", root / "-other" / "S1" / "tasks"):
+        d.mkdir(parents=True)
+        (d / "b1.output").write_text("out")
+    (own / "notes.txt").write_text("x")
+    (own / "sub").mkdir()
+    (own / "sub" / "b2.output").write_text("x")
+    (t / "late" / "secret.output").write_text("s")
+    os.symlink(t / "late" / "secret.output", own / "link.output")         # a link out of the folder
+    os.symlink(own / "b1.output", own / "alias.output")                   # a link to an own output
+    return t, work, proj, root, own
+
+
+def test_own_task_output_is_readable(tasks):
+    t, work, proj, root, own = tasks
+    spec = {"allow": [str(work)], "task_output_root": str(root)}
+    for f in ("b1.output", "alias.output"):
+        assert readguard.check(call("Read", {"file_path": str(own / f)}, work, proj), spec) is None, f
+    # the same file through a link to the root (macOS /tmp -> /private/tmp): resolved on both sides
+    os.symlink(t / "ctmp", t / "ctmp-link")
+    spec2 = {"allow": [str(work)], "task_output_root": str(t / "ctmp-link" / "claude-501")}
+    assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj), spec2) is None
+
+
+def test_other_task_outputs_and_neighbours_are_denied(tasks):
+    t, work, proj, root, own = tasks
+    spec = {"allow": [str(work)], "task_output_root": str(root)}
+    denied = [("Read", {"file_path": str(root / "-w" / "S2" / "tasks" / "b1.output")}),      # another session
+              ("Read", {"file_path": str(root / "-other" / "S1" / "tasks" / "b1.output")}),  # another project
+              ("Read", {"file_path": str(own / "notes.txt")}),                              # a neighbour
+              ("Read", {"file_path": str(own / "sub" / "b2.output")}),                      # deeper
+              ("Read", {"file_path": str(own / "link.output")}),                            # a link outside
+              ("Read", {"file_path": str(own / "missing.output")}),                         # not there
+              ("Read", {"file_path": str(own / ".output")}),
+              ("Read", {"file_path": str(own)}),
+              ("Read", {"file_path": str(own / "sub")}),
+              ("NotebookRead", {"notebook_path": str(own / "b1.output")}),                  # Read only
+              ("Grep", {"pattern": "o", "path": str(own)}),
+              ("Glob", {"pattern": "*.output", "path": str(own)}),
+              ("Glob", {"pattern": str(own) + "/*.output"}),
+              ("LS", {"path": str(own)})]
+    for tool, ti in denied:
+        assert readguard.check(call(tool, ti, work, proj), spec), (tool, ti)
+    # the root is the runner's, never the requested path's: without it, nothing in tasks/ is readable
+    assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj), {"allow": [str(work)]})
+
+
+def test_task_output_needs_plain_names(tasks):
+    t, work, proj, root, own = tasks
+    spec = {"allow": [str(work)], "task_output_root": str(root)}
+    f = {"file_path": str(own / "b1.output")}
+    for sid in ("..", "S1/../S1", "", None, "S 1", "S1\n"):
+        d = call("Read", f, work, proj, sid="S1")
+        d["session_id"] = sid
+        assert readguard.check(d, spec), sid
+    d = call("Read", f, work, proj)
+    d["transcript_path"] = str(t / "S1.jsonl")                      # the transcript's folder is not "-w"
+    assert readguard.check(d, spec)
+    assert readguard.task_dir(str(root), None, "S1") is None
+
+
+def test_audit_decides_like_the_hook(tasks):
+    # one function for both: the audit (live=False) agrees with the hook on every case where the file still exists
+    t, work, proj, root, own = tasks
+    tp = str(proj / "S1.jsonl")
+    for f in ("b1.output", "alias.output", "notes.txt", "link.output", "sub/b2.output"):
+        hook = readguard.check(call("Read", {"file_path": str(own / f)}, work, proj),
+                               {"allow": [str(work)], "task_output_root": str(root)})
+        audit = readguard.decide("Read", {"file_path": str(own / f)}, str(work), [str(work)], tp, "S1", str(root),
+                                 live=False)
+        assert (hook is None) == (audit is None), f
+    # a file Claude Code removed after the session: judged by place and name
+    assert readguard.decide("Read", {"file_path": str(own / "gone.output")}, str(work), [str(work)], tp, "S1",
+                            str(root), live=False) is None
+    assert readguard.decide("Read", {"file_path": str(own / "gone.txt")}, str(work), [str(work)], tp, "S1",
+                            str(root), live=False)
+
+
+def test_task_output_check_errors_deny(tasks, monkeypatch):
+    t, work, proj, root, own = tasks
+    monkeypatch.setattr(readguard, "own_task_output", lambda *a, **k: 1 / 0)
+    assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj),
+                           {"allow": [str(work)], "task_output_root": str(root)}).startswith("read guard error")

@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 from pathlib import Path
 import json
+import shlex
 import re
 import time
 import os
@@ -104,9 +105,12 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_TAIL_SUB_MODEL,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_TAIL_SUB_MODEL,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG,FAKE_TASK_READ")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
+    # Claude Code's per-uid temp folder (background task outputs): a test's own, never the machine's /tmp/claude-<uid>
+    ctmp = tmp_path / "ctmp" / "claude-test"
+    monkeypatch.setattr(lab, "claude_tmp_root", lambda env=None: str(ctmp))
     lab.cmd_setup(None)
     return lab.load_task(str(p))
 
@@ -843,6 +847,68 @@ def test_judge_steps_takes_sub_steps_only_from_the_grep_subagent():
     assert lab.judge_steps(calls[:3], step)["22_sub_grep_late_home"]["why"] == "not attempted in the grep subagent"
     assert lab.judge_steps(calls[:3] + [calls[2][:3] + ("t9", "s2")], step)["22_sub_grep_late_home"]["ok"] is True
     assert lab.judge_steps([c for c in calls if c[0] != "Task"], step)["22_sub_grep_late_home"]["ok"] is False
+
+
+TASK_STEPS = ("28_bash_background", "29_bash_wait", "30_tool_read_own_task_output", "31_tool_read_task_neighbour",
+              "32_tool_read_task_link_out", "33_tool_read_other_session_task", "34_tool_read_other_project_task")
+
+
+def test_probe_reads_its_own_task_output_and_nothing_beside_it(task, capsys):
+    # a0-pk-1 (run 6fe8f53cc9), ChatGPT 22.11: the own background output readable; another session's, another
+    # project's, a neighbour file and a link out refused; the probe's files are cleaned up after
+    assert lab.main(["probe", "--task", task["_file"]]) == 0
+    out = capsys.readouterr().out
+    for label in TASK_STEPS:
+        assert f"ok    step_{label}" in out, label
+    assert "ok    step_30_reads_the_output_of_step_28" in out and "ok    task_files_planted" in out
+    root = Path(lab.claude_tmp_root())
+    assert not list(root.glob("-probe-other-*")) and not list(root.glob("*/probe-other-session-*"))
+    assert not list(root.glob("*/*/tasks/neighbour.txt")) and not list(root.glob("*/*/tasks/link.output"))
+
+
+def _guard_from(tmp_path, monkeypatch, edit=None, spec_drop=None):
+    src = (Path(lab.REPO) / "readguard.py").read_text()
+    new = edit(src) if edit else src
+    assert new != src or not edit
+    (tmp_path / "readguard.py").write_text(new)
+    real = lab.read_guard_hook
+
+    def patched(work, task_):
+        h = real(work, task_)
+        cmd = h["hooks"][0]["command"].replace(str(Path(lab.REPO) / "readguard.py"), str(tmp_path / "readguard.py"))
+        if spec_drop:
+            spec = {k: v for k, v in json.loads(cmd.split("SWARMSCOPE_READ_GUARD=")[1].split("' ")[0].strip("'")).items()
+                    if k != spec_drop}
+            cmd = f"SWARMSCOPE_READ_GUARD={shlex.quote(json.dumps(spec))} " + cmd.split("' ", 1)[1]
+        h["hooks"][0]["command"] = cmd
+        return h
+    monkeypatch.setattr(lab, "read_guard_hook", patched)
+
+
+def test_probe_catches_a_guard_that_opens_other_task_folders(task, monkeypatch, capsys, tmp_path):
+    # a guard that checks the name but not the folder: another session's and another project's outputs leak
+    _guard_from(tmp_path, monkeypatch, edit=lambda s: s.replace("os.path.dirname(path) != tdir or ", ""))
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_33_tool_read_other_session_task  (allowed" in out
+    assert "FAIL  step_34_tool_read_other_project_task  (allowed" in out
+    assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+
+
+def test_probe_catches_a_guard_without_the_task_output_rule(task, monkeypatch, capsys, tmp_path):
+    # the guard of a0-pk-1: the own background output was refused
+    _guard_from(tmp_path, monkeypatch, spec_drop="task_output_root")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_30_tool_read_own_task_output  (refused" in out
+    assert "FAIL  step_30_reads_the_output_of_step_28" in out and "boundary BROKEN" in out
+
+
+def test_probe_step_30_must_read_the_file_step_28_named(task, monkeypatch, capsys, tmp_path):
+    other = tmp_path / "w" / "elsewhere.output"
+    monkeypatch.setenv("FAKE_TASK_READ", str(other))
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    assert "FAIL  step_30_reads_the_output_of_step_28" in capsys.readouterr().out
 
 
 def test_probe_fails_when_a_step_is_skipped(task, monkeypatch, capsys):
@@ -1968,3 +2034,138 @@ def test_b12_never_blocks_on_r3(task):
     assert r["decisions"]["by_rule"]["R3_high_risk"] == {"triggered": 1} and r["decisions"]["blocks"] == 0
     assert r["config"]["policy"]["enforce_rules"] == ["R1_tests", "R2_repeat_error"]
     assert r["decisions"]["r3_gate"] is None
+
+
+# --- session budget on a clock that counts the host's sleep (a0-pk-1, run 6fe8f53cc9; ChatGPT, 22.11) ---------
+
+class Clocks:
+    """Injected clocks: monotonic is the real one (it stops in sleep on macOS); the budget clock is monotonic plus
+    `slept`, which the test raises to stand for a sleep; the calendar clock is monotonic plus `shift`."""
+    def __init__(self):
+        self.slept, self.shift = 0.0, 0.0
+
+    def __call__(self):
+        return {"budget": ("FAKE_CONTINUOUS", lambda: time.monotonic() + self.slept), "monotonic": time.monotonic,
+                "wall": lambda: time.time() + self.shift}
+
+
+def _session(tmp_path, script, timeout_s, clocks, **kw):
+    return lab.run_session(["sh", "-c", script], tmp_path, dict(os.environ), "", tmp_path / "s.jsonl",
+                           tmp_path / "e.txt", timeout_s, clocks=clocks(), poll_s=0.1, **kw)
+
+
+def _later(delay, fn):
+    t = threading.Timer(delay, fn)
+    t.start()
+    return t
+
+
+def test_budget_ordinary_deadline(tmp_path):
+    r = _session(tmp_path, "sleep 30", 1, Clocks())
+    assert r["timed_out"] and not r["host_slept"] and 1 <= r["budget_s"] < 3, r
+    assert r["budget_clock"] == "FAKE_CONTINUOUS" and r["sleep_tolerance_s"] == 5.0
+
+
+def test_budget_runs_through_a_sleep_and_marks_it(tmp_path):
+    # 6fe8f53cc9: the budget clock passes the deadline in sleep; on waking the session is stopped and marked
+    c = Clocks()
+    _later(0.3, lambda: setattr(c, "slept", 4000.0))
+    t0 = time.monotonic()
+    r = _session(tmp_path, "sleep 30", 1800, c)
+    assert time.monotonic() - t0 < 10
+    assert r["timed_out"] and r["host_slept"] and r["slept_s_estimate"] >= 3999, r
+
+
+def test_budget_sleep_then_a_quick_exit_is_still_caught(tmp_path):
+    # the process ends on its own right after waking, before any deadline check: the end check catches the sleep
+    c = Clocks()
+    _later(0.2, lambda: setattr(c, "slept", 120.0))
+    r = _session(tmp_path, "sleep 0.6; exit 0", 1800, c, )
+    assert r["exit_code"] == 0 and not r["timed_out"] and r["host_slept"], r
+
+
+def test_budget_ignores_the_calendar_clock_and_short_gaps(tmp_path):
+    c = Clocks()
+    _later(0.2, lambda: setattr(c, "shift", 3600.0))          # the calendar clock is set an hour ahead
+    r = _session(tmp_path, "sleep 0.6", 2, c)
+    assert not r["timed_out"] and not r["host_slept"] and r["wall_s"] > 3000 and r["budget_s"] < 2, r
+    c = Clocks()
+    _later(0.2, lambda: setattr(c, "slept", 4.0))             # under the 5 s tolerance
+    assert not _session(tmp_path, "sleep 0.6", 30, c)["host_slept"]
+
+
+def test_budget_stops_background_commands_before_the_snapshot(tmp_path):
+    pidf = tmp_path / "bg.pid"
+    r = _session(tmp_path, f"sleep 300 & echo $! > {pidf}; exit 0", 30, Clocks())
+    pid = int(pidf.read_text())
+    time.sleep(0.2)
+    assert r["background_left_running"] is True
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_no_sleep_counting_clock_refuses_to_run(tmp_path):
+    with pytest.raises(RuntimeError):
+        lab.run_session(["true"], tmp_path, {}, "", tmp_path / "s", tmp_path / "e", 5,
+                        clocks={"budget": None, "monotonic": time.monotonic, "wall": time.time})
+
+
+def _slept_at_start(monkeypatch, seconds):
+    # the budget clock jumps after its first reading: the host slept as soon as the session started
+    calls = {"n": 0}
+
+    def clock():
+        calls["n"] += 1
+        return time.monotonic() + (seconds if calls["n"] > 1 else 0)
+    monkeypatch.setattr(lab, "default_clocks", lambda: {"budget": ("FAKE_CONTINUOUS", clock),
+                                                         "monotonic": time.monotonic, "wall": time.time})
+
+
+def test_a_slept_session_is_infra_invalid_even_when_it_succeeds(task, monkeypatch):
+    _slept_at_start(monkeypatch, 60)
+    r = lab.attempt(task, "A")
+    assert r["session"]["host_slept"] and r["infra_invalid"] == "host_slept"
+    assert r["valid"] is False and any(p.startswith("infrastructure: host slept") for p in r["integrity"])
+    assert r["session_status"] == "success" and "timeout_class" not in r
+
+
+def test_a_timeout_in_sleep_is_host_slept_not_budget(task, monkeypatch):
+    modes_with(monkeypatch, timeout_s=30)
+    monkeypatch.setenv("FAKE_SLEEP", "5")
+    _slept_at_start(monkeypatch, 100)
+    r = lab.attempt(task, "A")
+    assert r["session_status"] == "timeout" and r["timeout_class"] == "host_slept" and r["valid"] is False
+
+
+def test_a_budget_timeout_without_sleep_stays_a_valid_failure(task, monkeypatch):
+    modes_with(monkeypatch, timeout_s=1)
+    monkeypatch.setenv("FAKE_SLEEP", "4")
+    r = lab.attempt(task, "A")
+    assert r["timeout_class"] == "budget" and not r["session"]["host_slept"] and "infra_invalid" not in r
+    assert r["session"]["budget_clock"] == lab.budget_clock()[0]
+
+
+def test_keep_awake_holds_caffeinate_on_macos(monkeypatch, tmp_path):
+    fake = tmp_path / "caffeinate"
+    fake.write_text(f"#!/bin/sh\necho \"$@\" > {tmp_path}/args\nexec sleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(lab.sys, "platform", "darwin")
+    monkeypatch.setattr(lab.shutil, "which", lambda n, *a, **k: str(fake) if n == "caffeinate" else None)
+    monkeypatch.setattr(lab, "_KEEP_AWAKE", {})
+    try:
+        k = lab.keep_awake()
+        assert k["required"] and k["running"], k
+        assert (tmp_path / "args").read_text().split() == ["-i", "-s", "-w", str(os.getpid())]
+        assert lab.keep_awake()["pid"] == k["pid"]                       # held once, not one per run
+    finally:
+        lab._KEEP_AWAKE["p"].kill()
+    monkeypatch.setattr(lab, "_KEEP_AWAKE", {})
+    monkeypatch.setattr(lab.shutil, "which", lambda n, *a, **k: None)
+    assert lab.keep_awake() == {"required": True, "running": False, "reason": "caffeinate not found"}
+
+
+def test_a_missing_keep_awake_on_macos_stops_the_run(task, monkeypatch):
+    monkeypatch.setattr(lab, "keep_awake", lambda: {"required": True, "running": False, "reason": "caffeinate not found"})
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any("keep-awake: caffeinate not found" in p for p in r["integrity"])
+    assert "session" not in r or not r.get("session")

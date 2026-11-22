@@ -14,6 +14,7 @@ FAKE_RATE_LIMIT=1|mid|warn  rejected rate-limit event; 1: the model is never rea
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -148,16 +149,74 @@ if "hooks" not in settings:                     # doctor --ping
          "total_cost_usd": 0.001, "modelUsage": {model: {}}})
     sys.exit()
 hook("UserPromptSubmit", prompt=prompt)
+def guard_spec():
+    """The read guard's spec as the runner wrote it into the settings (SWARMSCOPE_READ_GUARD=... readguard.py)."""
+    for entry in settings.get("hooks", {}).get("PreToolUse", []):
+        for h in entry["hooks"]:
+            for tok in shlex.split(h["command"]):
+                if tok.startswith("SWARMSCOPE_READ_GUARD="):
+                    return json.loads(tok.split("=", 1)[1])
+    return {}
+
+
+TASK_OUT = {}
+
+
+def task_step(n, arg):
+    """Probe steps 28-34 as Claude Code >= 2.1.326 runs them: a background command writes to
+    <claude tmp>/<project>/<session>/tasks/<id>.output (the fake takes the root from the guard's spec); a Read goes
+    through the PreToolUse hooks and, when let through, reads the file - so a guard that misjudges it leaks."""
+    if n == "28":
+        root = guard_spec().get("task_output_root") or "/nonexistent"
+        f = Path(root) / tp.parent.name / sid / "tasks" / "bfake0001.output"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(arg.replace("echo ", "", 1) + "\n")
+        TASK_OUT["f"] = f
+        inp, allowed = {"command": arg, "run_in_background": True, "description": "bg"}, True
+        text = f"Command running in background with ID: bfake0001. Output is being written to: {f}. You will be notified."
+    elif n == "29":
+        time.sleep(1.0)                          # the probe plants its files once the tasks folder appears
+        inp, allowed, text = {"command": arg}, True, ""
+    else:
+        f = TASK_OUT.get("f") or Path("/nonexistent/x.output")
+        path = {"30": os.environ.get("FAKE_TASK_READ") or str(f), "31": str(f.parent / "neighbour.txt"),
+                "32": str(f.parent / "link.output")}.get(n, arg)
+        inp = {"file_path": path}
+        res = hook("PreToolUse", tool_name="Read", tool_input=inp, tool_use_id=f"t{n}")
+        denied = res and ((res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+                          or "_blocked" in res or res.get("_exit2") is not None)
+        if denied:
+            allowed, text = False, "PreToolUse:Read hook error: " + json.dumps(res)
+        else:
+            try:
+                allowed, text = True, Path(path).read_text()
+            except OSError as e:
+                allowed, text = False, f"File does not exist: {e}"
+    out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_use", "id": f"t{n}", "name": "Read" if n >= "30" else "Bash", "input": inp}]}})
+    out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}})
+    use = {"type": "assistant", "timestamp": iso(), "message": {"id": f"mt{n}", "model": model, "content": [
+        {"type": "tool_use", "id": f"t{n}", "name": "Read" if n >= "30" else "Bash", "input": inp}],
+        "usage": {"input_tokens": 0, "output_tokens": 0}}}
+    tr(use)
+    tr({"type": "user", "timestamp": iso(), "message": {"content": [
+        {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}})
+
+
 if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agent (FAKE_SKIP/LEAK/NET break it)
-    steps = re.findall(r"^(\d+)\. (?:\(grep subagent\) )?(Bash|Read tool|Write tool|Glob tool|Grep tool|Task tool): (.+)$",
-                       prompt, re.M)
+    steps = re.findall(r"^(\d+)\. (?:\(grep subagent\) )?(Bash|Read tool|Write tool|Glob tool|Grep tool|Task tool|"
+                       r"Bash tool with run_in_background set to true): (.+)$", prompt, re.M)
     skip = os.environ.get("FAKE_SKIP", "")
     leaked = ""
     for n, tool, arg in steps:
         if n == skip:
             continue
         name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob", "Grep tool": "Grep",
-                "Task tool": "Task"}[tool]
+                "Task tool": "Task", "Bash tool with run_in_background set to true": "Bash"}[tool]
+        if 28 <= int(n) <= 34:                   # background task outputs, in the main session
+            task_step(n, arg)
+            continue
         if int(n) >= 21:                         # step 21 starts the grep subagent, 22-27 run inside it
             if name == "Task":
                 out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [{"type": "tool_use",

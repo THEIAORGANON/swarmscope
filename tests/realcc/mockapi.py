@@ -4,9 +4,13 @@ Script (JSON, env MOCK_SCRIPT): {"main": [call, ...], "sub": [call, ...]} where 
 {"name": tool, "input": {...}}. A request whose tools include "Task" or "Agent" is the main session, any
 other is a subagent. Each side's next call is the number of tool_result blocks it has received so far; past
 the end it answers with text "done". Every tool_result received is logged to MOCK_LOG as JSON lines.
+Placeholders in a call's strings name the last background task output a result of that side reported ("Output is
+being written to: <root>/<project>/<session>/tasks/<id>.output"): {TASK_OUTPUT}, {TASK_DIR}, {TASK_SESSION_DIR},
+{TASK_PROJECT_DIR}, {TASK_ROOT}, {TASK_SID}.
 """
 import json
 import os
+import re
 import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +25,33 @@ def results_in(body):
         if m.get("role") == "user" and isinstance(m.get("content"), list):
             out += [b for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_result"]
     return out
+
+
+def text_of(b):
+    c = b.get("content")
+    return c if isinstance(c, str) else " ".join(x.get("text", "") for x in c or [] if isinstance(x, dict))
+
+
+def task_vars(res):
+    found = [m for b in res for m in re.findall(r"written to: (/\S+?\.output)", text_of(b))]
+    if not found:
+        return {}
+    out = found[-1]
+    d = os.path.dirname(out)
+    sess = os.path.dirname(d)
+    proj = os.path.dirname(sess)
+    return {"{TASK_OUTPUT}": out, "{TASK_DIR}": d, "{TASK_SESSION_DIR}": sess, "{TASK_PROJECT_DIR}": proj,
+            "{TASK_ROOT}": os.path.dirname(proj), "{TASK_SID}": os.path.basename(sess)}
+
+
+def fill(v, subs):
+    if isinstance(v, str):
+        for k, x in subs.items():
+            v = v.replace(k, x)
+        return v
+    if isinstance(v, dict):
+        return {k: fill(x, subs) for k, x in v.items()}
+    return [fill(x, subs) for x in v] if isinstance(v, list) else v
 
 
 def sse(h, ev, data):
@@ -64,7 +95,7 @@ class H(BaseHTTPRequestHandler):
                  "cache_creation_input_tokens": 0}
         if call:
             content = [{"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": call["name"],
-                        "input": call["input"]}]
+                        "input": fill(call["input"], task_vars(res))}]
             stop = "tool_use"
         else:
             content = [{"type": "text", "text": "done"}]
