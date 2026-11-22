@@ -874,8 +874,9 @@ class ProcTracker:
     def __init__(self, root, tag, work=None, reaper=False, baseline=None):
         self.root, self.tag, self.seen, self.tag_method = root, tag, {}, None
         self.work, self.reaper = work, reaper
-        # the runner's children from before the agent started (caffeinate, anything else), with their start
-        # times: never taken for adopted orphans of the session (PR #19 review, P1)
+        # every process that existed before the agent started (the runner's helpers such as caffeinate included),
+        # with its start time: never the session's, by any rule - orphan, group, tag or cwd (PR #19 review, P1);
+        # a reused pid with another start time is a new process and is judged as usual
         self.baseline = dict(baseline or {})
 
     def scan(self, cwd=False):
@@ -890,13 +891,12 @@ class ProcTracker:
         while grew:
             grew = False
             for pid, (ppid, pgid, _, start) in t.items():
-                if pid in self.seen or pid == os.getpid():
+                if pid in self.seen or pid == os.getpid() or self.baseline.get(pid) == start:
                     continue
                 child = ppid in self.seen and t.get(ppid, (0, 0, "", None))[3] == self.seen[ppid]
                 # with the runner as subreaper (Linux) an orphan of the session is the runner's child; the runner's
                 # own short-lived helpers (ps, lsof) are children too, but are gone before any stop
-                orphan = (self.reaper and ppid == me and pid != self.root
-                          and self.baseline.get(pid) != start)
+                orphan = self.reaper and ppid == me and pid != self.root
                 if child or orphan or pgid == self.root or pid in tagged:
                     self.seen[pid] = start
                     grew = True
@@ -1029,8 +1029,7 @@ def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks
     reaper = set_subreaper(True)
     if sys.platform.startswith("linux") and not reaper:
         raise RuntimeError("subreaper unavailable (prctl PR_SET_CHILD_SUBREAPER failed): the stop cannot be complete")
-    me = os.getpid()
-    baseline = {pid: v[3] for pid, v in process_table().items() if v[0] == me}
+    baseline = {pid: v[3] for pid, v in process_table().items()}
     b0, m0, w0 = bclock(), mono(), wall()
     timed_out, stopped, survivors, kept, scan_error, code, tracker = False, [], [], set(), None, None, None
     try:

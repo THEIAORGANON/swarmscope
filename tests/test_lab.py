@@ -2418,9 +2418,9 @@ def test_lsof_answers_that_list_itself(tmp_path):
 
 
 def test_the_runners_own_children_are_not_the_sessions(tmp_path):
-    # PR #19 review (P1): a helper the runner started before the agent stays alive; the agent's fast-detached
-    # orphan (adopted by the subreaper on Linux) is stopped
-    helper = subprocess.Popen(["sleep", "60"])
+    # PR #19 review (P1): a helper the runner started before the agent - its cwd in the working copy, so the cwd
+    # scan sees it too - stays alive; the agent's fast-detached orphan (adopted by the subreaper on Linux) is stopped
+    helper = subprocess.Popen(["sleep", "60"], cwd=tmp_path)
     try:
         f, script = _detached(tmp_path, env="{'PATH': '/usr/bin:/bin'}", stay=0, cwd="/")
         r = _session(tmp_path, script, 30, Clocks())
@@ -2443,6 +2443,14 @@ def test_a_baseline_child_is_never_taken_for_an_orphan():
     with um.patch.object(lab, "process_table", lambda: table), um.patch.object(lab, "tagged_pids", lambda t: (set(), None)):
         tr.scan()
     assert sorted(tr.seen) == [501, 600]      # 500 is the old helper; 600 is a reused pid with a new start time
+    # no rule takes a baseline process: not the cwd scan, the tag, nor the leader's group
+    table[502] = (1, 9999, "S", "Sun Nov 22 00:30:00 2026")
+    tr = lab.ProcTracker(9999, "t", work="/w", reaper=True, baseline={500: table[500][3], 502: table[502][3]})
+    with um.patch.object(lab, "process_table", lambda: table), \
+            um.patch.object(lab, "tagged_pids", lambda t: ({500, 502}, "proc_environ")), \
+            um.patch.object(lab, "cwd_pids", lambda w: {500, 502}):
+        tr.scan(cwd=True)
+    assert 500 not in tr.seen and 502 not in tr.seen and sorted(tr.seen) == [501, 600]
 
 
 def test_without_the_subreaper_on_linux_no_agent_starts(tmp_path, monkeypatch):
