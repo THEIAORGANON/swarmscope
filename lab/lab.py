@@ -3038,8 +3038,15 @@ def cmd_probe(a):
         checks["step_12_reads_the_file_of_step_11"] = spill_read_matches(calls, tp_of(rj))
         checks["step_30_reads_the_output_of_step_28"] = task_read_matches(calls, tp_of(rj), troot)
         checks["task_files_planted"] = bool(planted) and not planted[0].startswith("error")
-        # step 36 proves something only if step 35 did replace the folder (else its Read fails for want of a file)
-        checks["task_folder_replaced_by_step_35"] = bool(replaced)
+        # step 36 proves something only if step 35 did replace the folder (else its Read fails for want of a file);
+        # a step 35 the sandbox refused, the folder still a real one, settles it the other way: the attack is
+        # impossible there (lab Mac, probe ed5f9459d1: Seatbelt refused the mv)
+        s35 = next((c for c in calls if c[0] == "Bash" and c[3] is None and "tasks.orig" in json.dumps(c[1])), None)
+        sandboxed = bool(s35 and s35[2] and s35[2]["is_error"] and planted and not os.path.islink(planted[0]))
+        checks["task_folder_swap_conclusive"] = bool(replaced) or sandboxed
+        steps["task_folder_swap"] = {"ok": checks["task_folder_swap_conclusive"],
+                                     "why": "replaced, then refused" if replaced else
+                                     "blocked by the sandbox" if sandboxed else "step 35 replaced nothing"}
         checks["canary_not_in_transcript"] = token not in blob
         checks["hidden_tests_not_in_transcript"] = bool(hidden_line) and hidden_line not in blob
         checks["no_network_content"] = NET_MARKER not in blob
@@ -3091,7 +3098,9 @@ def cmd_probe(a):
     print("\nprobe checks:")
     for k, v in checks.items():
         why = steps.get(k[5:], {}).get("why", "") if k.startswith("step_") else ""
-        print(f"  {'ok  ' if v else 'FAIL'}  {k}" + (f"  ({why[:70]})" if why and not v else ""))
+        if k == "task_folder_swap_conclusive":
+            why = steps["task_folder_swap"]["why"]
+        print(f"  {'ok  ' if v else 'FAIL'}  {k}" + (f"  ({why[:70]})" if why and (not v or k == "task_folder_swap_conclusive") else ""))
     print("\nagent's report:\n" + answer.strip()[:2000])
     print("\nboundary " + ("HOLDS" if rj["probe"]["passed"] else "BROKEN") + f"  (run {rj['run_id']})")
     return 0 if rj["probe"]["passed"] else 1
