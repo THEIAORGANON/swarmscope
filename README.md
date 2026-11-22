@@ -116,6 +116,8 @@ Key: put it in `typesafe_key` in the swarmscope folder (`chmod 600`), or set `TY
 - Claude Code with its own `CLAUDE_CONFIG_DIR` and an allow-listed environment, hooks passed with `--settings`;
 - Bash in Claude Code's OS sandbox (home folder unreadable, writes only in the copy, no network), Read/Edit denied outside the copy;
 - the policy and Jev settings come from a runner-side file (`SWARMSCOPE_POLICY_FILE`); the hook logs the sha of the policy it used;
+- the session budget runs on a clock that counts the host's sleep; a session during which the host slept is invalid (`host_slept`), and on macOS the runner holds `caffeinate -i -s`;
+- when the session ends, every process it started is stopped before the snapshot (process group, descendants, a run tag in the environment, processes with their cwd in the copy); a survivor or a failed process scan makes the run invalid. On Linux the runner is the subreaper of the session's orphans, so the stop is complete. **On macOS it is not a complete guarantee:** a process that clears its environment, leaves the copy and detaches before the next scan (about once a second) can stay invisible;
 - tests run on separate copies of the final snapshot;
 - one `run.json` per attempt, with `valid` (infrastructure), `session_status` and `verdict` kept apart.
 

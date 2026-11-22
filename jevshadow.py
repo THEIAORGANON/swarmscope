@@ -302,6 +302,24 @@ def jev_file(base, sid):
     return pathlib.Path(base) / "jev" / f"{sid}.jsonl"
 
 
+def workers_file(base):
+    """The pids of the shadow workers this run's hooks started (one per line), in the runner's observation folder
+    ($SWARMSCOPE_DIR, which the agent can neither write nor read): the lab runner leaves these running past the
+    session's stop (lab.stop_tree) so their answers still arrive; every other process the session started is
+    stopped."""
+    return pathlib.Path(base) / "jev" / "workers.pids"
+
+
+def register_worker(base, pid):
+    f = workers_file(base)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, f"{int(pid)}\n".encode())
+    finally:
+        os.close(fd)
+
+
 def _append(path, rec):
     """One JSON line, one write() on an O_APPEND descriptor: concurrent writers never interleave lines."""
     path = pathlib.Path(path)
@@ -360,12 +378,18 @@ def shadow(sid, base, events, pol, change, adv_times, now, has_tests, rule_recor
         run_worker(str(path), ctx_id)
         return ctx_id
     try:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker", str(path), ctx_id],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True, close_fds=True)
+        w = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker", str(path), ctx_id],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
     except Exception as e:
         _append(path, {"kind": "jev", "ctx_id": ctx_id, "ts": time.time(), "status": "worker_failed",
                        "error": _clean(f"{type(e).__name__}: {e}", None)})
+        return ctx_id
+    try:
+        # not registered: the lab runner stops the worker with the session, and its answer shows as missing
+        register_worker(base, w.pid)
+    except Exception:
+        pass
     return ctx_id
 
 

@@ -1,8 +1,11 @@
 """Allow-list for the tools that read files (lab runs only).
 
 Run as its own PreToolUse command hook for the reading tools, with onFailure "block": SWARMSCOPE_READ_GUARD
-(JSON: {"allow": [dirs]}) names the allowed dirs, and a call is denied unless every path it can reach lies in an allowed dir or in the session's own
-spilled tool outputs (<project folder>/<session id>/tool-results, the project folder being the transcript's).
+(JSON: {"allow": [dirs], "task_output_root": dir}) names the allowed dirs, and a call is denied unless every path it can reach lies in an
+allowed dir or in the session's own spilled tool outputs (<project folder>/<session id>/tool-results, the project
+folder being the transcript's), or it is a Read of one of the session's own background task outputs
+(<task_output_root>/<project>/<session id>/tasks/<id>.output, own_task_output()). The hook (check) and the audit
+after the session (lab.read_outside) decide through the same function, decide().
 The settings' Read denies cannot name what appears only after they were written; this guard decides on the
 path as it is when the tool runs. Paths are resolved through symlinks.
 Failure: nothing is swallowed in main(): an error before the decision (import, bad spec, bad input) exits 1 and
@@ -10,6 +13,7 @@ Claude Code blocks the call (onFailure "block"), as it does for a timeout or a f
 error is a deny."""
 import json
 import os
+import re
 import sys
 import unicodedata
 
@@ -77,23 +81,66 @@ def targets(tool, ti, cwd):
     return [root], None
 
 
-def check(d, spec):
-    """None to let the call through, else the reason to deny it."""
-    try:
-        tool = d.get("tool_name")
-        if tool not in READ_TOOLS:
-            return None
-        allow = [os.path.realpath(a) for a in (spec or {}).get("allow") or []]
-        tp, sid = d.get("transcript_path"), d.get("session_id")
-        if tp and sid:
-            allow.append(os.path.realpath(os.path.join(os.path.dirname(tp), sid, "tool-results")))
-        paths, problem = targets(tool, d.get("tool_input"), d.get("cwd"))
-        if problem:
-            return problem
-        for p in paths:
-            if not any(_inside(p, a) for a in allow):
-                return f"outside the working copy: {p}"
+SAFE_NAME = re.compile(r"[A-Za-z0-9-]+")     # a project folder name ("-private-tmp-..."), a session id: no separator, no dot
+
+
+def task_dir(root, transcript_path, session_id):
+    """This session's own background task folder, <root>/<project>/<session id>/tasks (Claude Code >= 2.1.326:
+    "Output is being written to: /tmp/claude-<uid>/<project>/<session>/tasks/<id>.output"), as a fixed path that is
+    NOT resolved: the root comes from the runner, already resolved and pinned before the session (spec
+    "task_output_root"), the project folder is the transcript's, the session is the hook's - nothing from the
+    requested path. A folder on the way that was replaced by a link (the agent's Bash can write in the temp
+    folder) then no longer matches the resolved file (ChatGPT, 22.11, P1). None when a part is missing or not a
+    plain name, or the root is not an absolute normal path."""
+    if not (root and transcript_path and session_id) or not isinstance(root, str):
         return None
+    if not os.path.isabs(root) or os.path.normpath(root) != root:
+        return None
+    project = os.path.basename(os.path.dirname(transcript_path))
+    if not (SAFE_NAME.fullmatch(project) and isinstance(session_id, str) and SAFE_NAME.fullmatch(session_id)):
+        return None
+    return os.path.join(root, project, session_id, "tasks")
+
+
+def own_task_output(tool, path, tdir, live=True):
+    """A Read of one of this session's own background task outputs: the resolved path (every link followed: a file
+    link out of the folder and a folder on the way replaced by a link both fail) is a file *.output directly in
+    tdir, the unresolved, pinned task folder. live (the hook): it must exist as a
+    regular file now. The audit after the session (live=False) cannot see links or files Claude Code has since
+    removed; it checks the same place and name, the hook having checked the file when it was read."""
+    if tool != "Read" or not tdir:
+        return False
+    name = os.path.basename(path)
+    if os.path.dirname(path) != tdir or not name.endswith(".output") or name == ".output":
+        return False
+    return os.path.isfile(path) if live else not os.path.isdir(path)
+
+
+def decide(tool, tool_input, cwd, allow, transcript_path=None, session_id=None, task_output_root=None, live=True):
+    """None to let the call through, else the reason to deny it: every path the call can reach must lie in an
+    allowed dir or in this session's own tool-results, or the call is a Read of an own task output."""
+    if tool not in READ_TOOLS:
+        return None
+    allow = [os.path.realpath(a) for a in allow or []]
+    if transcript_path and session_id:
+        allow.append(os.path.realpath(os.path.join(os.path.dirname(transcript_path), session_id, "tool-results")))
+    paths, problem = targets(tool, tool_input, cwd)
+    if problem:
+        return problem
+    tdir = task_dir(task_output_root, transcript_path, session_id)
+    for p in paths:
+        if any(_inside(p, a) for a in allow) or own_task_output(tool, p, tdir, live):
+            continue
+        return f"outside the working copy: {p}"
+    return None
+
+
+def check(d, spec):
+    """The hook's decision: None to let the call through, else the reason to deny it."""
+    try:
+        spec = spec or {}
+        return decide(d.get("tool_name"), d.get("tool_input"), d.get("cwd"), spec.get("allow") or [],
+                      d.get("transcript_path"), d.get("session_id"), spec.get("task_output_root"))
     except Exception as e:                       # fail closed
         return f"read guard error: {type(e).__name__}"
 

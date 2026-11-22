@@ -79,13 +79,19 @@ def session(tmp_path, sub_calls, main_calls=None, deny_tools=True):
         init = next((json.loads(x) for x in p.stdout.splitlines() if '"subtype":"init"' in x), {})
         (tmp_path / "init_tools.json").write_text(json.dumps(init.get("tools")))
         recs = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
-        results = []
+        results, main_results = [], []
         for r in recs:
+            if r["side"] == "main" and r["results"]:
+                b = r["results"][0]
+                c = b.get("content")
+                text = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c or [] if isinstance(x, dict))
+                main_results.append({"is_error": bool(b.get("is_error")), "text": text})
             if r["side"] == "sub" and r["results"]:
                 b = r["results"][0]
                 c = b.get("content")
                 text = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c or [] if isinstance(x, dict))
                 results.append({"is_error": bool(b.get("is_error")), "text": text})
+        (tmp_path / "main_results.json").write_text(json.dumps(main_results))
         tps = sorted(own.glob("*.jsonl"))
         outside = L.read_outside(str(tps[0]), work) if tps else None
         return results, outside
@@ -144,3 +150,90 @@ def test_the_settings_deny_removes_workflow(tmp_path):
     if "Workflow" not in before:
         pytest.skip(f"this binary offers no Workflow: {before}")
     assert "Workflow" not in after and "Read" in after
+
+
+# a0-pk-1, run 6fe8f53cc9: the session Read its own background command's output (<claude tmp>/<project>/<session>/
+# tasks/<id>.output) and the guard refused it. ChatGPT, 22.11: own output readable; another session's, another
+# project's, a neighbour file, a link out and a missing file refused; the audit agrees.
+def task_output_calls(tmp_path, other_project):
+    outside = tmp_path / "outside.txt"
+    setup = (f"sleep 3; echo {SECRET} > {outside}; echo {SECRET} > {{TASK_DIR}}/neighbour.txt; "
+             f"ln -s {outside} {{TASK_DIR}}/link.output; "
+             f"mkdir -p {{TASK_PROJECT_DIR}}/other-session/tasks && echo {SECRET} > {{TASK_PROJECT_DIR}}/other-session/tasks/x.output; "
+             f"mkdir -p {{TASK_ROOT}}/{other_project}/{{TASK_SID}}/tasks && "
+             f"echo {SECRET} > {{TASK_ROOT}}/{other_project}/{{TASK_SID}}/tasks/x.output; echo set")
+    reads = ["{TASK_DIR}/neighbour.txt", "{TASK_PROJECT_DIR}/other-session/tasks/x.output",
+             f"{{TASK_ROOT}}/{other_project}/{{TASK_SID}}/tasks/x.output", "{TASK_DIR}/link.output",
+             "{TASK_DIR}/missing.output"]
+    return ([{"name": "Bash", "input": {"command": "echo OWN_BG_OUTPUT", "run_in_background": True,
+                                        "description": "bg"}},
+             {"name": "Bash", "input": {"command": setup, "description": "setup"}},
+             {"name": "Read", "input": {"file_path": "{TASK_OUTPUT}"}}]
+            + [{"name": "Read", "input": {"file_path": r}} for r in reads]), len(reads)
+
+
+@pytest.fixture
+def other_project():
+    sys.path.insert(0, str(REPO / "lab"))
+    import lab as L
+    name = "-swarmscope-test-other-" + os.urandom(4).hex()
+    yield name
+    shutil.rmtree(Path(L.claude_tmp_root()) / name, ignore_errors=True)
+
+
+def test_own_task_output_is_readable_and_nothing_beside_it(tmp_path, other_project):
+    calls, n = task_output_calls(tmp_path, other_project)
+    _, outside = session(tmp_path, [], main_calls=calls)
+    res = json.loads((tmp_path / "main_results.json").read_text())
+    assert len(res) == len(calls), res                                    # every scripted call ran
+    assert "tasks/" in res[0]["text"] and ".output" in res[0]["text"], res[0]
+    assert not res[2]["is_error"] and "OWN_BG_OUTPUT" in res[2]["text"], res[2]     # own output: readable
+    for call, r in zip(calls[3:], res[3:]):
+        assert r["is_error"] and SECRET not in r["text"], (call, r)
+    assert outside == []
+
+
+def test_audit_flags_a_task_folder_neighbour_but_not_the_own_output(tmp_path, other_project, monkeypatch):
+    sys.path.insert(0, str(REPO / "lab"))
+    import lab as L
+    monkeypatch.setattr(L, "read_guard_hook", lambda work, task: {"matcher": "^NoSuchTool$", "hooks": [
+        {"type": "command", "command": "true", "timeout": 5}]})
+    calls, n = task_output_calls(tmp_path, other_project)
+    _, outside = session(tmp_path, [], main_calls=calls[:4])
+    res = json.loads((tmp_path / "main_results.json").read_text())
+    assert SECRET in res[3]["text"], res                                  # the neighbour is readable without the guard
+    assert len(outside) == 1 and outside[0][2].endswith("/neighbour.txt"), outside
+
+
+def replace_calls():
+    # the agent's Bash replaces its own tasks folder by a link to another session's (ChatGPT, 22.11, P1)
+    setup = (f"sleep 3; mkdir -p {{TASK_PROJECT_DIR}}/other-session/tasks && "
+             f"echo {SECRET} > {{TASK_PROJECT_DIR}}/other-session/tasks/x.output && "
+             f"mv {{TASK_DIR}} {{TASK_DIR}}.orig && ln -s {{TASK_PROJECT_DIR}}/other-session/tasks {{TASK_DIR}} && echo replaced")
+    return [{"name": "Bash", "input": {"command": "echo OWN_BG_OUTPUT", "run_in_background": True, "description": "bg"}},
+            {"name": "Bash", "input": {"command": setup, "description": "replace"}},
+            {"name": "Read", "input": {"file_path": "{TASK_DIR}/x.output"}}]
+
+
+def test_a_task_folder_replaced_by_a_link_opens_nothing(tmp_path, other_project):
+    _, outside = session(tmp_path, [], main_calls=replace_calls())
+    res = json.loads((tmp_path / "main_results.json").read_text())
+    assert len(res) == 3 and "replaced" in res[1]["text"], res
+    assert res[2]["is_error"] and SECRET not in res[2]["text"], res[2]
+    assert outside == []
+
+
+def test_audit_flags_a_read_through_a_replaced_task_folder(tmp_path, other_project, monkeypatch):
+    sys.path.insert(0, str(REPO / "lab"))
+    import lab as L
+    monkeypatch.setattr(L, "read_guard_hook", lambda work, task: {"matcher": "^NoSuchTool$", "hooks": [
+        {"type": "command", "command": "true", "timeout": 5}]})
+    _, outside = session(tmp_path, [], main_calls=replace_calls())
+    res = json.loads((tmp_path / "main_results.json").read_text())
+    if "task output swap refused" in res[2]["text"]:
+        # Claude Code 2.1.330 refuses this itself ("task output swap refused (tasks dir moved or linked)"); the
+        # lab's guard must not rely on that (2.1.326 on the lab Mac): nothing got through, nothing to audit
+        assert SECRET not in res[2]["text"] and outside == []
+        pytest.skip("this binary refuses a swapped tasks folder on its own")
+    assert SECRET in res[2]["text"], res                                  # the bypass is real without the guard
+    assert len(outside) == 1 and "other-session/tasks/x.output" in outside[0][2], outside
