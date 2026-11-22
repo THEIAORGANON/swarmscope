@@ -1,7 +1,7 @@
 {
   "pilot": "a0-pk-1",
   "kind": "diagnostic",
-  "status": "declared 2026-11-21 before any run",
+  "status": "stopped 2026-11-22 under its own rule (an invalid attempt that was not infrastructural); incomplete",
   "question": "Does Sonnet 5.5 solve pk-prerel cleanly without the advisor too? cand-1 gave 3/3 clean A runs on wzf-cond and on pk-prerel, all with the voluntary Opus advisor available and used (1-3 calls per run). If A0 also passes 3/3, the advisor is not what makes these tasks easy (ChatGPT, 21.11, option 2).",
   "not_asked": "The causal effect of the advisor. The three earlier A runs on pk-prerel are a historical reference only; comparing them with new A0 runs proves nothing causal.",
   "task": {
@@ -61,7 +61,78 @@
     "A0 3/3 clean": "go to cand-1 option (1): larger cross-cutting tasks (migrations across several subsystems with checkable invariants)",
     "A0 fails or regresses at least once": "test the effect of the advisor being available in a separate fresh paired A/A0 series with the order shuffled within pairs, declared apart; pk-prerel stays 'not selected' for improving the outcome over A - the cand-1 criterion is not changed after the fact"
   },
-  "batches": [],
-  "deviations": [],
-  "result": null
+  "batches": [
+    "20261121-213534-adfe"
+  ],
+  "deviations": [
+    "attempt 3 invalid for a reason that is not infrastructural under the declaration (a permission denial): the pilot stopped for review instead of replacing it (ChatGPT, 22.11)"
+  ],
+  "result": "Incomplete: two valid successes (A0, no advisor, 0 regressions, $2.16 and $2.01 confirmed) and one invalid attempt; stopped by the declaration. Machine validity is not changed after the fact. The two successes stay a historical reference; they are not combined with later runs, because the runner's guard and budget changed (PR #19). Continued as a fresh declaration, a0-pk-2.",
+  "declaration_sha": "a80602d5a87f1ef7fa66a2af721cf7baa764e9d8 (published before any run; merged as 58149de)",
+  "runs": [
+    {
+      "run_id": "1142e06812",
+      "repeat": 1,
+      "valid": true,
+      "success": true,
+      "hidden": "62511/62511",
+      "bug_tests": "28/28",
+      "regressions": 0,
+      "session_s": 1198,
+      "run_usd": 2.16,
+      "run_usd_status": "confirmed",
+      "advisor_calls": 0,
+      "R3_observe_triggered": 6,
+      "jev_p_consult": [
+        0.39,
+        0.41,
+        0.49,
+        0.5,
+        0.51,
+        0.17
+      ],
+      "jev_would_consult": 2
+    },
+    {
+      "run_id": "69deb55239",
+      "repeat": 2,
+      "valid": true,
+      "success": true,
+      "hidden": "62511/62511",
+      "bug_tests": "28/28",
+      "regressions": 0,
+      "session_s": 1134,
+      "run_usd": 2.01,
+      "run_usd_status": "confirmed",
+      "advisor_calls": 0,
+      "R3_observe_triggered": 2,
+      "jev_p_consult": [
+        0.32,
+        0.34
+      ],
+      "jev_would_consult": 0
+    },
+    {
+      "run_id": "6fe8f53cc9",
+      "repeat": 3,
+      "valid": false,
+      "success": false,
+      "hidden": "62511/62511",
+      "bug_tests": "28/28",
+      "regressions": 0,
+      "session_s": 11331,
+      "run_usd": 1.531,
+      "run_usd_status": "confirmed",
+      "advisor_calls": 0,
+      "R3_observe_triggered": 1,
+      "jev_p_consult": [
+        0.53
+      ],
+      "jev_would_consult": 1,
+      "machine_invalidity": "1 permission denial(s): Read - the only reason in the original run.json, which is kept unchanged",
+      "access_defect": "the Read was of the session's own background command output (<claude tmp>/<project>/<session>/tasks/bp1cdkzyk.output); the read guard refused it as 'outside the working copy' - a runner defect, fixed in PR #19",
+      "operator_established": "the host slept after the session's last turn (last transcript record 22:48:34, result success at duration_ms 702060, 34 turns); Claude Code waited for a background task, the budget on time.monotonic did not fire in sleep, the session ended at 01:45 after waking (wall_s 11331, timed_out false). Recorded by the operator, not by the run; fixed in PR #19 (budget on a sleep-counting clock, host_slept)"
+    }
+  ],
+  "superseded_by": "a0-pk-2"
 }
