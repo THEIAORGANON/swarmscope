@@ -2275,6 +2275,9 @@ def test_scans_fail_loudly(tmp_path, monkeypatch):
     (bin_ / "ps").write_text("#!/bin/sh\nexit 0\n")             # succeeds, lists nothing
     with pytest.raises(lab.ScanError):
         lab.process_table()
+    (bin_ / "ps").write_text("#!/bin/sh\necho '1 0 1 S Sun Nov 22 00:00:00 2026'\n")   # lists others, not itself
+    with pytest.raises(lab.ScanError):
+        lab.process_table()
     monkeypatch.setenv("PATH", str(tmp_path / "nothing"))
     with pytest.raises(lab.ScanError):
         lab.process_table()
@@ -2393,3 +2396,73 @@ def test_the_cleanup_wait_runs_on_the_budget_clock(tmp_path):
     t0 = time.monotonic()
     found, left = lab.stop_tree(tr, p, c()["budget"][1])
     assert found and left == [] and time.monotonic() - t0 < 8, (found, left, time.monotonic() - t0)
+
+
+
+@pytest.mark.parametrize("code,out,err", [(0, "", ""), (1, "", ""), (1, "", "lsof: WARNING"), (0, "garbage\n", ""),
+                                          (0, "p999\nn/x\n", "")])
+def test_an_lsof_answer_without_itself_is_a_scan_error(code, out, err, tmp_path):
+    # PR #19 review (P2): lsof lists the cwd of every process of this user, itself included
+    with pytest.raises(lab.ScanError):
+        lab.parse_lsof_cwd(code, out, err, 4242, str(tmp_path))
+
+
+def test_lsof_answers_that_list_itself(tmp_path):
+    inside = tmp_path / "w"
+    inside.mkdir()
+    out = f"p4242\nn/\np77\nn{inside}\np78\nn{tmp_path}\n"
+    for code in (0, 1):
+        assert lab.parse_lsof_cwd(code, out, "", 4242, str(inside)) == {77}
+    with pytest.raises(lab.ScanError):
+        lab.parse_lsof_cwd(2, out, "", 4242, str(inside))           # any other exit code
+
+
+def test_the_runners_own_children_are_not_the_sessions(tmp_path):
+    # PR #19 review (P1): a helper the runner started before the agent stays alive; the agent's fast-detached
+    # orphan (adopted by the subreaper on Linux) is stopped
+    helper = subprocess.Popen(["sleep", "60"])
+    try:
+        f, script = _detached(tmp_path, env="{'PATH': '/usr/bin:/bin'}", stay=0, cwd="/")
+        r = _session(tmp_path, script, 30, Clocks())
+        assert helper.poll() is None and helper.pid not in r["stopped_after_session"], r
+        if sys.platform.startswith("linux"):
+            assert r["stopped_after_session"] and r["stop_failed"] == [], r
+            assert _no_late_write(f)
+    finally:
+        helper.kill()
+        helper.wait()
+
+
+def test_a_baseline_child_is_never_taken_for_an_orphan():
+    me = os.getpid()
+    table = {500: (me, 500, "S", "Sun Nov 22 01:00:00 2026"), 501: (me, 501, "S", "Sun Nov 22 01:05:00 2026"),
+             600: (me, 600, "S", "Sun Nov 22 01:06:00 2026")}
+    tr = lab.ProcTracker(9999, None, reaper=True,
+                         baseline={500: "Sun Nov 22 01:00:00 2026", 600: "Sun Nov 22 00:01:00 2026"})
+    import unittest.mock as um
+    with um.patch.object(lab, "process_table", lambda: table), um.patch.object(lab, "tagged_pids", lambda t: (set(), None)):
+        tr.scan()
+    assert sorted(tr.seen) == [501, 600]      # 500 is the old helper; 600 is a reused pid with a new start time
+
+
+def test_without_the_subreaper_on_linux_no_agent_starts(tmp_path, monkeypatch):
+    # PR #19 review (P2): the Linux mode promises a complete stop; without the subreaper it refuses to start
+    monkeypatch.setattr(lab.sys, "platform", "linux")
+    monkeypatch.setattr(lab, "scan_check", lambda work: None)
+    monkeypatch.setattr(lab, "set_subreaper", lambda on: False)
+    with pytest.raises(RuntimeError, match="subreaper unavailable"):
+        _session(tmp_path, "touch started", 30, Clocks())
+    assert not (tmp_path / "started").exists()
+
+
+def test_without_the_subreaper_the_attempt_does_not_start(task, monkeypatch):
+    monkeypatch.setattr(lab, "subreaper_check", lambda: "prctl PR_SET_CHILD_SUBREAPER failed")
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and r["session_status"] == "not_started"
+    assert any("subreaper unavailable" in p and "prctl" in p for p in r["integrity"])
+
+
+def test_the_stop_guarantee_is_recorded(tmp_path):
+    r = _session(tmp_path, "true", 30, Clocks())
+    expected = "complete (subreaper)" if sys.platform.startswith("linux") else "incomplete"
+    assert r["stop_guarantee"].startswith(expected), r

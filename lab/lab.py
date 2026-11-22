@@ -718,25 +718,37 @@ class ScanError(RuntimeError):
     """The process scan failed: no answer is not "no processes" (ChatGPT, 22.11, P1)."""
 
 
-def process_table():
-    """{pid: (ppid, pgid, stat, start)} of every process (ps: Linux procps and macOS alike); start (lstart) tells a
-    reused pid from the process first seen under it. ScanError when ps cannot run, fails or lists nothing (it
-    always lists at least itself)."""
+def _helper(cmd, timeout=30):
+    """Run one of the runner's own scan helpers (ps, lsof): (returncode, stdout, stderr, pid). The pid lets a scan
+    leave the helper itself out (it is a child of the runner, as an adopted orphan of the session would be)."""
     try:
-        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="], capture_output=True, text=True,
-                           timeout=30)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise ScanError(f"ps could not run: {type(e).__name__}: {e}") from e
-    if r.returncode != 0:
-        raise ScanError(f"ps exited with {r.returncode}: {r.stderr.strip()[-200:]}")
-    out = r.stdout
+        h = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as e:
+        raise ScanError(f"{cmd[0]} could not run: {type(e).__name__}: {e}") from e
+    try:
+        out, err = h.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        h.kill()
+        h.communicate()
+        raise ScanError(f"{cmd[0]} timed out") from e
+    return h.returncode, out, err, h.pid
+
+
+def process_table():
+    """{pid: (ppid, pgid, stat, start)} of every process (ps: Linux procps and macOS alike) but the ps that listed
+    them; start (lstart) tells a reused pid from the process first seen under it. ScanError when ps cannot run,
+    fails, or does not list itself (no answer is not "no processes": ChatGPT, 22.11, P1)."""
+    code, out, err, me = _helper(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="])
+    if code != 0:
+        raise ScanError(f"ps exited with {code}: {err.strip()[-200:]}")
     procs = {}
     for line in out.splitlines():
         parts = line.split(None, 4)
-        if len(parts) == 5 and parts[0].isdigit():
+        if len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
             procs[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3], parts[4].strip())
-    if not procs:
-        raise ScanError("ps listed no process")
+    if me not in procs:
+        raise ScanError("ps did not list itself: unreadable output")
+    del procs[me]
     return procs
 
 
@@ -744,56 +756,65 @@ def tagged_pids(tag):
     """Processes of this user whose environment carries the run's tag (SWARMSCOPE_RUN_TAG): a background command
     that detached (setsid, double fork) keeps it unless it cleared its environment. (pids, method)."""
     if sys.platform.startswith("linux"):
+        try:
+            os.stat("/proc/self/environ")                  # readable at all, or the scan cannot work
+            entries = [d for d in Path("/proc").iterdir() if d.name.isdigit()]
+        except OSError as e:
+            raise ScanError(f"/proc unreadable: {e}") from e
         pids = set()
-        for d in Path("/proc").iterdir():
-            if not d.name.isdigit():
-                continue
+        for d in entries:
             try:
                 if d.stat().st_uid == os.getuid() and tag.encode() in (d / "environ").read_bytes():
                     pids.add(int(d.name))
             except OSError:
                 pass
         return pids, "proc_environ"
-    try:
-        r = subprocess.run(["ps", "-wwEA", "-o", "pid=,command="], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise ScanError(f"ps -E could not run: {type(e).__name__}: {e}") from e
-    if r.returncode != 0 or not r.stdout.strip():
-        raise ScanError(f"ps -E exited with {r.returncode}: {r.stderr.strip()[-200:]}")
-    return {int(x.split(None, 1)[0]) for x in r.stdout.splitlines() if tag in x and x.split(None, 1)[0].isdigit()}, \
-        "ps_E"
+    code, out, err, me = _helper(["ps", "-wwEA", "-o", "pid=,command="])
+    rows = [x.split(None, 1) for x in out.splitlines() if x.strip()]
+    if code != 0 or not any(r[0] == str(me) for r in rows):
+        raise ScanError(f"ps -E exited with {code} or did not list itself: {err.strip()[-200:]}")
+    return {int(r[0]) for r in rows if r[0].isdigit() and len(r) > 1 and tag in r[1]}, "ps_E"
 
 
 def cwd_pids(root):
     """Processes of this user whose working directory lies in `root` (the run's working copy): a detached
-    command that kept the agent's folder as its cwd. Linux: /proc/*/cwd; macOS: lsof. ScanError on failure."""
+    command that kept the agent's folder as its cwd. Linux: /proc/*/cwd; macOS: lsof, which lists the cwd of
+    every process of this user and so at least its own: an empty or unreadable answer, whatever its exit code,
+    is a ScanError (PR #19 review, P2)."""
     root = os.path.realpath(root)
     found = set()
     if sys.platform.startswith("linux"):
-        for d in Path("/proc").iterdir():
-            if d.name.isdigit():
-                try:
-                    if d.stat().st_uid == os.getuid() and _within(os.readlink(d / "cwd"), root):
-                        found.add(int(d.name))
-                except OSError:
-                    pass
+        try:
+            os.readlink("/proc/self/cwd")
+            entries = [d for d in Path("/proc").iterdir() if d.name.isdigit()]
+        except OSError as e:
+            raise ScanError(f"/proc unreadable: {e}") from e
+        for d in entries:
+            try:
+                if d.stat().st_uid == os.getuid() and _within(os.readlink(d / "cwd"), root):
+                    found.add(int(d.name))
+            except OSError:
+                pass
         return found
     exe = shutil.which("lsof")
     if not exe:
         raise ScanError("lsof not found")
-    try:
-        r = subprocess.run([exe, "-a", "-d", "cwd", "-u", str(os.getuid()), "-Fpn"], capture_output=True, text=True,
-                           timeout=60)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise ScanError(f"lsof could not run: {type(e).__name__}: {e}") from e
-    if r.returncode not in (0, 1) or (r.returncode == 1 and r.stdout.strip() == "" and r.stderr.strip()):
-        raise ScanError(f"lsof exited with {r.returncode}: {r.stderr.strip()[-200:]}")
-    pid = None
-    for line in r.stdout.splitlines():
+    code, out, err, me = _helper([exe, "-a", "-d", "cwd", "-u", str(os.getuid()), "-Fpn"], timeout=60)
+    return parse_lsof_cwd(code, out, err, me, root)
+
+
+def parse_lsof_cwd(code, out, err, me, root):
+    if code not in (0, 1):
+        raise ScanError(f"lsof exited with {code}: {err.strip()[-200:]}")
+    found, seen, pid = set(), set(), None
+    for line in out.splitlines():
         if line.startswith("p") and line[1:].isdigit():
             pid = int(line[1:])
+            seen.add(pid)
         elif line.startswith("n") and pid is not None and _within(os.path.realpath(line[1:]), root):
             found.add(pid)
+    if me not in seen:
+        raise ScanError(f"lsof (exit {code}) did not list itself: empty or unreadable output")
     return found
 
 
@@ -818,6 +839,26 @@ def set_subreaper(on):
         return False
 
 
+def stop_guarantee(reaper):
+    """What the stop after a session can promise (ChatGPT, 22.11: to be named in declarations and the runner's
+    description). Linux with the subreaper: complete - every process the session started stays in reach.
+    macOS: incomplete - a process that clears its environment, leaves the working copy and detaches before the
+    next ~1 s scan (its parent gone) loses the tree, the tag and the cwd, and may stay invisible."""
+    if reaper:
+        return "complete (subreaper)"
+    return "incomplete (macOS: a fast detach that loses tree, tag and cwd may stay invisible)"
+
+
+def subreaper_check():
+    """Linux: the subreaper must be available before an agent starts (PR #19 review, P2). None or the reason."""
+    if not sys.platform.startswith("linux"):
+        return None
+    if not set_subreaper(True):
+        return "prctl PR_SET_CHILD_SUBREAPER failed"
+    set_subreaper(False)
+    return None
+
+
 def scan_check(work):
     """Before a session: every scan the stop relies on must work here (ps, the tag scan, the cwd scan)."""
     process_table()
@@ -830,9 +871,12 @@ class ProcTracker:
     descendant seen on a scan (a child with start_new_session/setsid leaves the group but not the tree while its
     parent lives) and every process carrying the run's tag. Scanned about once a second during the session and at
     its end; a pid counts only with the start time it was first seen with (ChatGPT, 22.11: P1)."""
-    def __init__(self, root, tag, work=None, reaper=False):
+    def __init__(self, root, tag, work=None, reaper=False, baseline=None):
         self.root, self.tag, self.seen, self.tag_method = root, tag, {}, None
-        self.work, self.reaper, self.helpers = work, reaper, set()
+        self.work, self.reaper = work, reaper
+        # the runner's children from before the agent started (caffeinate, anything else), with their start
+        # times: never taken for adopted orphans of the session (PR #19 review, P1)
+        self.baseline = dict(baseline or {})
 
     def scan(self, cwd=False):
         t = process_table()
@@ -851,7 +895,8 @@ class ProcTracker:
                 child = ppid in self.seen and t.get(ppid, (0, 0, "", None))[3] == self.seen[ppid]
                 # with the runner as subreaper (Linux) an orphan of the session is the runner's child; the runner's
                 # own short-lived helpers (ps, lsof) are children too, but are gone before any stop
-                orphan = self.reaper and ppid == me and pid != self.root
+                orphan = (self.reaper and ppid == me and pid != self.root
+                          and self.baseline.get(pid) != start)
                 if child or orphan or pgid == self.root or pid in tagged:
                     self.seen[pid] = start
                     grew = True
@@ -982,6 +1027,10 @@ def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks
     tag = "swarmscope-run-" + uuid.uuid4().hex
     env = dict(env, SWARMSCOPE_RUN_TAG=tag)
     reaper = set_subreaper(True)
+    if sys.platform.startswith("linux") and not reaper:
+        raise RuntimeError("subreaper unavailable (prctl PR_SET_CHILD_SUBREAPER failed): the stop cannot be complete")
+    me = os.getpid()
+    baseline = {pid: v[3] for pid, v in process_table().items() if v[0] == me}
     b0, m0, w0 = bclock(), mono(), wall()
     timed_out, stopped, survivors, kept, scan_error, code, tracker = False, [], [], set(), None, None, None
     try:
@@ -989,7 +1038,7 @@ def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks
             p = subprocess.Popen(cmd, cwd=work, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                  start_new_session=True, text=True)
             try:
-                tracker = ProcTracker(p.pid, tag, work=work, reaper=reaper)
+                tracker = ProcTracker(p.pid, tag, work=work, reaper=reaper, baseline=baseline)
                 p.stdin.write(prompt)
                 p.stdin.close()
                 while True:
@@ -1025,7 +1074,7 @@ def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks
             "budget_s": round(budget_s, 2), "monotonic_s": round(mono_s, 2),
             "host_slept": slept > sleep_tolerance_s, "slept_s_estimate": round(max(0.0, slept), 2),
             "budget_clock": bname, "sleep_tolerance_s": sleep_tolerance_s, "poll_s": poll_s,
-            "subreaper": reaper, "processes_tracked": len(tracker.seen) if tracker else 0,
+            "subreaper": reaper, "stop_guarantee": stop_guarantee(reaper), "processes_tracked": len(tracker.seen) if tracker else 0,
             "tag_scan": tracker.tag_method if tracker else None, "observers_kept": sorted(kept),
             "stopped_after_session": [x for x in stopped if x != p.pid],
             "background_left_running": bool([x for x in stopped if x != p.pid]), "stop_failed": survivors,
@@ -1817,6 +1866,9 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         scan_check(work)
     except ScanError as e:
         return stop(f"process scan unavailable, the session could not be stopped for sure: {e}")
+    why = subreaper_check()
+    if why:
+        return stop(f"subreaper unavailable, the session could not be stopped for sure: {why}")
     if after_settings:                          # probe: paths that appear after the settings were written
         after_settings(work)
     if problems:
