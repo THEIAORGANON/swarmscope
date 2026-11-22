@@ -714,15 +714,29 @@ def default_clocks():
     return {"budget": bc, "monotonic": time.monotonic, "wall": time.time}
 
 
+class ScanError(RuntimeError):
+    """The process scan failed: no answer is not "no processes" (ChatGPT, 22.11, P1)."""
+
+
 def process_table():
     """{pid: (ppid, pgid, stat, start)} of every process (ps: Linux procps and macOS alike); start (lstart) tells a
-    reused pid from the process first seen under it."""
-    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="], capture_output=True, text=True).stdout
+    reused pid from the process first seen under it. ScanError when ps cannot run, fails or lists nothing (it
+    always lists at least itself)."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="], capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ScanError(f"ps could not run: {type(e).__name__}: {e}") from e
+    if r.returncode != 0:
+        raise ScanError(f"ps exited with {r.returncode}: {r.stderr.strip()[-200:]}")
+    out = r.stdout
     procs = {}
     for line in out.splitlines():
         parts = line.split(None, 4)
         if len(parts) == 5 and parts[0].isdigit():
             procs[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3], parts[4].strip())
+    if not procs:
+        raise ScanError("ps listed no process")
     return procs
 
 
@@ -740,11 +754,75 @@ def tagged_pids(tag):
             except OSError:
                 pass
         return pids, "proc_environ"
-    r = subprocess.run(["ps", "-wwEA", "-o", "pid=,command="], capture_output=True, text=True)
-    if r.returncode != 0:
-        return set(), "unavailable"
+    try:
+        r = subprocess.run(["ps", "-wwEA", "-o", "pid=,command="], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ScanError(f"ps -E could not run: {type(e).__name__}: {e}") from e
+    if r.returncode != 0 or not r.stdout.strip():
+        raise ScanError(f"ps -E exited with {r.returncode}: {r.stderr.strip()[-200:]}")
     return {int(x.split(None, 1)[0]) for x in r.stdout.splitlines() if tag in x and x.split(None, 1)[0].isdigit()}, \
         "ps_E"
+
+
+def cwd_pids(root):
+    """Processes of this user whose working directory lies in `root` (the run's working copy): a detached
+    command that kept the agent's folder as its cwd. Linux: /proc/*/cwd; macOS: lsof. ScanError on failure."""
+    root = os.path.realpath(root)
+    found = set()
+    if sys.platform.startswith("linux"):
+        for d in Path("/proc").iterdir():
+            if d.name.isdigit():
+                try:
+                    if d.stat().st_uid == os.getuid() and _within(os.readlink(d / "cwd"), root):
+                        found.add(int(d.name))
+                except OSError:
+                    pass
+        return found
+    exe = shutil.which("lsof")
+    if not exe:
+        raise ScanError("lsof not found")
+    try:
+        r = subprocess.run([exe, "-a", "-d", "cwd", "-u", str(os.getuid()), "-Fpn"], capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ScanError(f"lsof could not run: {type(e).__name__}: {e}") from e
+    if r.returncode not in (0, 1) or (r.returncode == 1 and r.stdout.strip() == "" and r.stderr.strip()):
+        raise ScanError(f"lsof exited with {r.returncode}: {r.stderr.strip()[-200:]}")
+    pid = None
+    for line in r.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None and _within(os.path.realpath(line[1:]), root):
+            found.add(pid)
+    return found
+
+
+def _within(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def set_subreaper(on):
+    """Linux: make the runner the reaper of the session's orphans (prctl PR_SET_CHILD_SUBREAPER), so a command that
+    detaches and whose parent exits becomes the runner's child, never pid 1's: the tree scan cannot miss it
+    (ChatGPT, 22.11, P1). macOS has no such mechanism for an unprivileged process. True when set."""
+    if not sys.platform.startswith("linux"):
+        return False
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(PR_SET_CHILD_SUBREAPER, 1 if on else 0, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def scan_check(work):
+    """Before a session: every scan the stop relies on must work here (ps, the tag scan, the cwd scan)."""
+    process_table()
+    tagged_pids("swarmscope-scan-check")
+    cwd_pids(work)
 
 
 class ProcTracker:
@@ -752,12 +830,16 @@ class ProcTracker:
     descendant seen on a scan (a child with start_new_session/setsid leaves the group but not the tree while its
     parent lives) and every process carrying the run's tag. Scanned about once a second during the session and at
     its end; a pid counts only with the start time it was first seen with (ChatGPT, 22.11: P1)."""
-    def __init__(self, root, tag):
+    def __init__(self, root, tag, work=None, reaper=False):
         self.root, self.tag, self.seen, self.tag_method = root, tag, {}, None
+        self.work, self.reaper, self.helpers = work, reaper, set()
 
-    def scan(self):
+    def scan(self, cwd=False):
         t = process_table()
         tagged, self.tag_method = tagged_pids(self.tag) if self.tag else (set(), None)
+        if cwd and self.work:
+            tagged = tagged | cwd_pids(self.work)
+        me = os.getpid()
         if self.root in t:
             self.seen.setdefault(self.root, t[self.root][3])
         grew = True
@@ -767,7 +849,10 @@ class ProcTracker:
                 if pid in self.seen or pid == os.getpid():
                     continue
                 child = ppid in self.seen and t.get(ppid, (0, 0, "", None))[3] == self.seen[ppid]
-                if child or pgid == self.root or pid in tagged:
+                # with the runner as subreaper (Linux) an orphan of the session is the runner's child; the runner's
+                # own short-lived helpers (ps, lsof) are children too, but are gone before any stop
+                orphan = self.reaper and ppid == me and pid != self.root
+                if child or orphan or pgid == self.root or pid in tagged:
                     self.seen[pid] = start
                     grew = True
         return t
@@ -798,11 +883,21 @@ def observer_pids(sw):
     return ok
 
 
+def reap(tracker):
+    """Collect the exit status of the session's orphans that the runner adopted as subreaper (Linux)."""
+    for pid in list(tracker.seen):
+        if pid != tracker.root:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
+
+
 def stop_tree(tracker, proc, clock, grace_s=15, exempt=frozenset()):
     """Stop everything the session started, then confirm it: SIGTERM to each live tracked process and its group,
     SIGKILL after grace_s on the budget clock (time.monotonic would stretch the wait over a sleep: ChatGPT, 22.11,
     P2). Returns (stopped, still_alive): pids found running, pids that survived."""
-    tracker.scan()
+    tracker.scan(cwd=True)
     proc.poll()
     exempt = set(exempt)
     found = [p for p in tracker.alive() if p != os.getpid() and p not in exempt]
@@ -828,6 +923,7 @@ def stop_tree(tracker, proc, clock, grace_s=15, exempt=frozenset()):
     left = found
     while clock() < end:
         proc.poll()
+        reap(tracker)
         tracker.scan()
         left = [p for p in tracker.alive() if p not in exempt]
         if not left:
@@ -838,11 +934,29 @@ def stop_tree(tracker, proc, clock, grace_s=15, exempt=frozenset()):
         end = clock() + 5
         while clock() < end:
             proc.poll()
+            reap(tracker)
             left = [p for p in tracker.alive() if p not in exempt]
             if not left:
                 break
             time.sleep(0.1)
+    reap(tracker)
     return found, left
+
+
+def emergency_stop(proc, tracker):
+    """The scan failed after the agent started: SIGKILL to the leader's group and every process already tracked,
+    without confirmation (that needs the scan). The run is invalid (scan_error)."""
+    pids = set(tracker.seen) | {proc.pid} if tracker else {proc.pid}
+    for pid in pids:
+        for fn, arg in ((os.kill, pid), (os.killpg, pid)):
+            try:
+                fn(arg, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks=None, poll_s=POLL_S,
@@ -853,50 +967,69 @@ def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks
     stop_failed and makes the run invalid), all on the budget clock. Only then are the clocks read for the last
     time: a gap between the budget clock and time.monotonic() beyond sleep_tolerance_s means the host slept
     (host_slept: an infrastructure invalidity, whatever the outcome) - a sleep during the cleanup included.
+    The scans are checked before the agent starts (scan_check: RuntimeError if one fails); a scan that fails after
+    it started kills what is known (emergency_stop) and is returned as scan_error, an invalidity.
     observers: a callable giving the pids to leave running (the runner's own Jev shadow workers, observer_pids)."""
     clocks = clocks or default_clocks()
     if not clocks.get("budget"):
         raise RuntimeError("no clock that counts the host's sleep (CLOCK_MONOTONIC_RAW / CLOCK_BOOTTIME)")
+    try:
+        scan_check(work)
+    except ScanError as e:
+        raise RuntimeError(f"process scan unavailable: {e}") from e
     bname, bclock = clocks["budget"]
     mono, wall = clocks["monotonic"], clocks["wall"]
     tag = "swarmscope-run-" + uuid.uuid4().hex
     env = dict(env, SWARMSCOPE_RUN_TAG=tag)
+    reaper = set_subreaper(True)
     b0, m0, w0 = bclock(), mono(), wall()
-    with open(stream_path, "w") as out, open(err_path, "w") as err:
-        p = subprocess.Popen(cmd, cwd=work, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
-                             start_new_session=True, text=True)
-        tracker = ProcTracker(p.pid, tag)
-        p.stdin.write(prompt)
-        p.stdin.close()
-        timed_out = False
-        while True:
-            tracker.scan()
-            if p.poll() is not None:
-                break
-            left = timeout_s - (bclock() - b0)
-            if left <= 0:
-                timed_out = True
-                break
+    timed_out, stopped, survivors, kept, scan_error, code, tracker = False, [], [], set(), None, None, None
+    try:
+        with open(stream_path, "w") as out, open(err_path, "w") as err:
+            p = subprocess.Popen(cmd, cwd=work, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                 start_new_session=True, text=True)
             try:
-                p.wait(timeout=max(0.01, min(poll_s, left)))
-            except subprocess.TimeoutExpired:
-                pass
-        kept = (observers or (lambda: set()))()
-        stopped, survivors = stop_tree(tracker, p, bclock, exempt=kept)
-        try:
-            code = p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            survivors = sorted(set(survivors) | {p.pid})
-            code = None
+                tracker = ProcTracker(p.pid, tag, work=work, reaper=reaper)
+                p.stdin.write(prompt)
+                p.stdin.close()
+                while True:
+                    tracker.scan()
+                    if p.poll() is not None:
+                        break
+                    left = timeout_s - (bclock() - b0)
+                    if left <= 0:
+                        timed_out = True
+                        break
+                    try:
+                        p.wait(timeout=max(0.01, min(poll_s, left)))
+                    except subprocess.TimeoutExpired:
+                        pass
+                kept = (observers or (lambda: set()))()
+                stopped, survivors = stop_tree(tracker, p, bclock, exempt=kept)
+                try:
+                    code = p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    survivors = sorted(set(survivors) | {p.pid})
+            except BaseException as e:                     # a scan (or anything else) failed with the agent running
+                scan_error = f"{type(e).__name__}: {e}"
+                emergency_stop(p, tracker)
+                code = p.poll()
+                if not isinstance(e, Exception):
+                    raise
+    finally:
+        if reaper:
+            set_subreaper(False)
     budget_s, mono_s, wall_s = bclock() - b0, mono() - m0, wall() - w0
     slept = budget_s - mono_s
     return {"exit_code": code, "timed_out": timed_out, "wall_s": round(wall_s, 2),
             "budget_s": round(budget_s, 2), "monotonic_s": round(mono_s, 2),
             "host_slept": slept > sleep_tolerance_s, "slept_s_estimate": round(max(0.0, slept), 2),
             "budget_clock": bname, "sleep_tolerance_s": sleep_tolerance_s, "poll_s": poll_s,
-            "processes_tracked": len(tracker.seen), "tag_scan": tracker.tag_method, "observers_kept": sorted(kept),
+            "subreaper": reaper, "processes_tracked": len(tracker.seen) if tracker else 0,
+            "tag_scan": tracker.tag_method if tracker else None, "observers_kept": sorted(kept),
             "stopped_after_session": [x for x in stopped if x != p.pid],
-            "background_left_running": bool([x for x in stopped if x != p.pid]), "stop_failed": survivors}
+            "background_left_running": bool([x for x in stopped if x != p.pid]), "stop_failed": survivors,
+            "scan_error": scan_error}
 
 
 def parse_stream(path):
@@ -1680,6 +1813,10 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
         return stop("keep-awake: " + str(rj["keep_awake"].get("reason") or "caffeinate is not running"))
     if not budget_clock():
         return stop("no clock that counts the host's sleep: the session budget cannot be kept")
+    try:
+        scan_check(work)
+    except ScanError as e:
+        return stop(f"process scan unavailable, the session could not be stopped for sure: {e}")
     if after_settings:                          # probe: paths that appear after the settings were written
         after_settings(work)
     if problems:
@@ -1692,6 +1829,8 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     rj["session"] = sess
     if after_session:                           # probe: undo what its steps changed before the audit reads paths
         after_session(work)
+    if sess.get("scan_error"):
+        problems.append(f"process scan failed with the session running (stop not confirmed): {sess['scan_error']}")
     if sess.get("stop_failed"):
         problems.append(f"processes of the session still running after the stop: {sess['stop_failed'][:10]}")
     if sess.get("host_slept"):

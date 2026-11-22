@@ -2201,13 +2201,13 @@ def test_a_missing_keep_awake_on_macos_stops_the_run(task, monkeypatch):
 # ChatGPT, 22.11 (P1): a background command that left the session's process group (start_new_session, setsid)
 # outlived the session and wrote after the snapshot had begun
 
-DETACH = ("import subprocess, sys, time; subprocess.Popen(['sh', '-c', 'sleep {wait}; touch {f}'], "
-          "start_new_session=True, env={env}); time.sleep({stay})")
+DETACH = ("import subprocess, sys, time; subprocess.Popen(['/bin/sh', '-c', 'sleep {wait}; touch {f}'], "
+          "start_new_session=True, env={env}, cwd={cwd!r}); time.sleep({stay})")
 
 
-def _detached(tmp_path, env="None", stay=0, wait=2):
+def _detached(tmp_path, env="None", stay=0, wait=2, cwd=None):
     f = tmp_path / "late-write"
-    return f, f"{sys.executable} -c \"{DETACH.format(f=f, env=env, stay=stay, wait=wait)}\""
+    return f, f"{sys.executable} -c \"{DETACH.format(f=f, env=env, stay=stay, wait=wait, cwd=cwd)}\""
 
 
 def _no_late_write(f, wait=3):
@@ -2231,14 +2231,95 @@ def test_a_detached_child_without_the_tag_is_caught_by_the_tree(tmp_path):
 
 
 def test_a_detached_child_by_the_tag_alone(tmp_path, monkeypatch):
-    # the tree is made blind (every process a child of pid 1 in a group of its own): the tag still finds the child
-    f, script = _detached(tmp_path)
+    # the tree is made blind (every process a child of pid 1 in a group of its own) and the child leaves the
+    # working copy: the tag still finds it (ps -E on macOS, /proc/*/environ on Linux: PR #19 review, P2)
+    f, script = _detached(tmp_path, cwd="/")
     real = lab.process_table
     monkeypatch.setattr(lab, "process_table", lambda: {pid: (1, pid, st, start)
                                                        for pid, (_, _, st, start) in real().items()})
     r = _session(tmp_path, script, 30, Clocks())
-    assert r["stopped_after_session"] and r["tag_scan"] == "proc_environ", r
+    assert r["stopped_after_session"], r
+    assert r["tag_scan"] == ("ps_E" if sys.platform == "darwin" else "proc_environ"), r
     assert _no_late_write(f)
+
+
+def test_a_fast_detach_with_a_clean_environment_in_the_working_copy(tmp_path):
+    # PR #19 review (P1): env cleared, own group, parent gone at once (stay=0) - no tag, no tree; the child kept
+    # the agent's folder as its cwd, which the final scan finds (Linux: also the subreaper)
+    f, script = _detached(tmp_path, env="{'PATH': '/usr/bin:/bin'}", stay=0)
+    r = _session(tmp_path, script, 30, Clocks())
+    assert r["stopped_after_session"] and r["stop_failed"] == [], r
+    assert _no_late_write(f)
+
+
+def test_a_fast_detach_that_also_leaves_the_working_copy(tmp_path):
+    # no tag, no tree, no cwd: only an adopting reaper sees it. Linux: the runner is subreaper (prctl), so the
+    # orphan is its child. macOS has no unprivileged equivalent: the known limit (PR #19, open decision)
+    if sys.platform == "darwin":
+        pytest.xfail("macOS: no unprivileged mechanism adopts an orphan that left the tree, tag and cwd")
+    f, script = _detached(tmp_path, env="{'PATH': '/usr/bin:/bin'}", stay=0, cwd="/")
+    r = _session(tmp_path, script, 30, Clocks())
+    assert r["subreaper"] is True and r["stopped_after_session"] and r["stop_failed"] == [], r
+    assert _no_late_write(f)
+
+
+def test_scans_fail_loudly(tmp_path, monkeypatch):
+    # PR #19 review (P1): ps failing or not starting is a scan error, never "no processes"
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ps").write_text("#!/bin/sh\nexit 1\n")
+    (bin_ / "ps").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    with pytest.raises(lab.ScanError):
+        lab.process_table()
+    (bin_ / "ps").write_text("#!/bin/sh\nexit 0\n")             # succeeds, lists nothing
+    with pytest.raises(lab.ScanError):
+        lab.process_table()
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing"))
+    with pytest.raises(lab.ScanError):
+        lab.process_table()
+
+
+def test_no_scan_no_session(tmp_path, monkeypatch):
+    def broken():
+        raise lab.ScanError("ps exited with 1")
+    monkeypatch.setattr(lab, "process_table", broken)
+    with pytest.raises(RuntimeError, match="process scan unavailable"):
+        _session(tmp_path, "touch started", 30, Clocks())
+    assert not (tmp_path / "started").exists()                   # the agent never started
+
+
+def test_a_scan_failure_with_the_session_running_kills_it_and_says_so(tmp_path, monkeypatch):
+    real, calls = lab.process_table, {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise lab.ScanError("ps could not run: OSError")
+        return real()
+    monkeypatch.setattr(lab, "process_table", flaky)
+    pidf = tmp_path / "pid"
+    t0 = time.monotonic()
+    r = _session(tmp_path, f"echo $$ > {pidf}; sleep 300", 600, Clocks())
+    assert r["scan_error"] and "ps could not run" in r["scan_error"] and time.monotonic() - t0 < 30, r
+    monkeypatch.undo()
+    assert _gone(int(pidf.read_text()))
+
+
+def test_a_scan_failure_makes_the_run_invalid(task, monkeypatch):
+    real = lab.run_session
+    monkeypatch.setattr(lab, "run_session", lambda *a, **k: dict(real(*a, **k), scan_error="ScanError: ps exited 1"))
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any("process scan failed" in p for p in r["integrity"])
+
+
+def test_an_unavailable_scan_stops_the_run_before_the_session(task, monkeypatch):
+    def broken(work):
+        raise lab.ScanError("lsof not found")
+    monkeypatch.setattr(lab, "scan_check", broken)
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and r["session_status"] == "not_started"
+    assert any("process scan unavailable" in p for p in r["integrity"])
 
 
 def test_a_child_that_cannot_be_stopped_is_reported(tmp_path, monkeypatch):
