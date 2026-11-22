@@ -105,7 +105,7 @@ def task(tmp_path, monkeypatch, jev_stub):
     monkeypatch.setenv("SWARMSCOPE_CLAUDE_BIN", fake_launcher(tmp_path))
     monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
     monkeypatch.setenv("SWARMSCOPE_LAB_UNSANDBOXED_TESTS", "1")        # no Seatbelt on Linux
-    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_TAIL_SUB_MODEL,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG,FAKE_TASK_READ")
+    monkeypatch.setenv("SWARMSCOPE_LAB_PASS_ENV", "FAKE_SKILLS,FAKE_NO_STOP,FAKE_SLEEP,FAKE_MODEL,FAKE_LEAK,FAKE_NET,FAKE_SKIP,FAKE_EVIL,FAKE_DENY,FAKE_RATE_LIMIT,FAKE_VOLUNTARY_ADVISOR,FAKE_PROFILE_ADVISOR,FAKE_WEB,FAKE_FLAKY_FILE,FAKE_SUSPEND,FAKE_ADVISOR_NO_RESULT,FAKE_ADVISOR_HANDOFF,FAKE_TAIL_AFTER_RESULT,FAKE_TAIL_SUB,FAKE_TAIL_SUB_MODEL,FAKE_HOOK_KILLS,FAKE_READ_TRANSCRIPT,FAKE_READ_OUTSIDE,FAKE_SPILL_READ,FAKE_NO_TOOL,FAKE_ABSENT_TOOLS,FAKE_EXTRA_TOOLS,FAKE_GUARDED_READ,FAKE_GUARDED_LOG,FAKE_TASK_READ,FAKE_NO_REPLACE")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     # Claude Code's per-uid temp folder (background task outputs): a test's own, never the machine's /tmp/claude-<uid>
@@ -440,7 +440,7 @@ def test_a_task_sets_its_own_session_budget(task, monkeypatch):
     # ChatGPT, 21.11: pk-prerel gets 1800 s; the same budget for every mode, recorded, part of the task hash
     seen = []
     real = lab.run_session
-    monkeypatch.setattr(lab, "run_session", lambda *a: seen.append(a[-1]) or real(*a))
+    monkeypatch.setattr(lab, "run_session", lambda *a, **k: seen.append(a[6]) or real(*a, **k))
     r = lab.attempt(dict(task, session_timeout_s=1800), "A")
     assert seen == [1800] and r["config"]["timeout_s"] == 1800 and r["config"]["timeout_source"] == "task"
     r = lab.attempt(task, "B")
@@ -850,7 +850,8 @@ def test_judge_steps_takes_sub_steps_only_from_the_grep_subagent():
 
 
 TASK_STEPS = ("28_bash_background", "29_bash_wait", "30_tool_read_own_task_output", "31_tool_read_task_neighbour",
-              "32_tool_read_task_link_out", "33_tool_read_other_session_task", "34_tool_read_other_project_task")
+              "32_tool_read_task_link_out", "33_tool_read_other_session_task", "34_tool_read_other_project_task",
+              "35_bash_replace_task_folder", "36_tool_read_through_replaced_folder")
 
 
 def test_probe_reads_its_own_task_output_and_nothing_beside_it(task, capsys):
@@ -861,9 +862,11 @@ def test_probe_reads_its_own_task_output_and_nothing_beside_it(task, capsys):
     for label in TASK_STEPS:
         assert f"ok    step_{label}" in out, label
     assert "ok    step_30_reads_the_output_of_step_28" in out and "ok    task_files_planted" in out
+    assert "ok    task_folder_replaced_by_step_35" in out
     root = Path(lab.claude_tmp_root())
     assert not list(root.glob("-probe-other-*")) and not list(root.glob("*/probe-other-session-*"))
     assert not list(root.glob("*/*/tasks/neighbour.txt")) and not list(root.glob("*/*/tasks/link.output"))
+    assert not list(root.glob("*/*/tasks.orig"))                         # step 35's link undone
 
 
 def _guard_from(tmp_path, monkeypatch, edit=None, spec_drop=None):
@@ -893,6 +896,24 @@ def test_probe_catches_a_guard_that_opens_other_task_folders(task, monkeypatch, 
     assert "FAIL  step_33_tool_read_other_session_task  (allowed" in out
     assert "FAIL  step_34_tool_read_other_project_task  (allowed" in out
     assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+
+
+def test_probe_catches_a_guard_that_resolves_the_task_folder(task, monkeypatch, capsys, tmp_path):
+    # the guard of HEAD 6fc7e9c: the pinned folder went through realpath, so a link put in its place by the
+    # agent's Bash (step 35) made another session's outputs "own" (ChatGPT, 22.11, P1)
+    _guard_from(tmp_path, monkeypatch, edit=lambda s: s.replace(
+        'return os.path.join(root, project, session_id, "tasks")',
+        'return os.path.realpath(os.path.join(root, project, session_id, "tasks"))'))
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  step_36_tool_read_through_replaced_folder  (allowed" in out
+    assert "FAIL  canary_not_in_transcript" in out and "boundary BROKEN" in out
+
+
+def test_probe_needs_step_35_to_have_replaced_the_folder(task, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_NO_REPLACE", "1")
+    assert lab.main(["probe", "--task", task["_file"]]) == 1
+    assert "FAIL  task_folder_replaced_by_step_35" in capsys.readouterr().out
 
 
 def test_probe_catches_a_guard_without_the_task_output_rule(task, monkeypatch, capsys, tmp_path):
@@ -2094,14 +2115,17 @@ def test_budget_ignores_the_calendar_clock_and_short_gaps(tmp_path):
     assert not _session(tmp_path, "sleep 0.6", 30, c)["host_slept"]
 
 
+def _gone(pid):
+    st = lab.process_table().get(pid)
+    return st is None or st[2].startswith("Z")         # a zombie left to a pid 1 that reaps late is gone too
+
+
 def test_budget_stops_background_commands_before_the_snapshot(tmp_path):
     pidf = tmp_path / "bg.pid"
     r = _session(tmp_path, f"sleep 300 & echo $! > {pidf}; exit 0", 30, Clocks())
     pid = int(pidf.read_text())
-    time.sleep(0.2)
-    assert r["background_left_running"] is True
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert r["background_left_running"] is True and pid in r["stopped_after_session"] and r["stop_failed"] == []
+    assert _gone(pid)
 
 
 def test_no_sleep_counting_clock_refuses_to_run(tmp_path):
@@ -2155,6 +2179,9 @@ def test_keep_awake_holds_caffeinate_on_macos(monkeypatch, tmp_path):
     try:
         k = lab.keep_awake()
         assert k["required"] and k["running"], k
+        end = time.monotonic() + 10                  # the fake writes its args a moment after it starts (Mac: 0.31 s)
+        while not (tmp_path / "args").exists() and time.monotonic() < end:
+            time.sleep(0.05)
         assert (tmp_path / "args").read_text().split() == ["-i", "-s", "-w", str(os.getpid())]
         assert lab.keep_awake()["pid"] == k["pid"]                       # held once, not one per run
     finally:
@@ -2169,3 +2196,119 @@ def test_a_missing_keep_awake_on_macos_stops_the_run(task, monkeypatch):
     r = lab.attempt(task, "A")
     assert r["valid"] is False and any("keep-awake: caffeinate not found" in p for p in r["integrity"])
     assert "session" not in r or not r.get("session")
+
+
+# ChatGPT, 22.11 (P1): a background command that left the session's process group (start_new_session, setsid)
+# outlived the session and wrote after the snapshot had begun
+
+DETACH = ("import subprocess, sys, time; subprocess.Popen(['sh', '-c', 'sleep {wait}; touch {f}'], "
+          "start_new_session=True, env={env}); time.sleep({stay})")
+
+
+def _detached(tmp_path, env="None", stay=0, wait=2):
+    f = tmp_path / "late-write"
+    return f, f"{sys.executable} -c \"{DETACH.format(f=f, env=env, stay=stay, wait=wait)}\""
+
+
+def _no_late_write(f, wait=3):
+    time.sleep(wait)
+    return not f.exists()
+
+
+def test_a_detached_child_is_stopped_before_the_snapshot(tmp_path):
+    f, script = _detached(tmp_path)                       # the parent exits at once; the child keeps the tag
+    r = _session(tmp_path, script, 30, Clocks())
+    assert r["stopped_after_session"] and r["stop_failed"] == [] and r["background_left_running"], r
+    assert _no_late_write(f)
+
+
+def test_a_detached_child_without_the_tag_is_caught_by_the_tree(tmp_path):
+    # its environment cleared (no tag); its parent lives on for 1.5 s, so a scan sees it as a descendant
+    f, script = _detached(tmp_path, env="{'PATH': '/usr/bin:/bin'}", stay=1.5)
+    r = _session(tmp_path, script, 30, Clocks())
+    assert r["stopped_after_session"] and r["stop_failed"] == [], r
+    assert _no_late_write(f)
+
+
+def test_a_detached_child_by_the_tag_alone(tmp_path, monkeypatch):
+    # the tree is made blind (every process a child of pid 1 in a group of its own): the tag still finds the child
+    f, script = _detached(tmp_path)
+    real = lab.process_table
+    monkeypatch.setattr(lab, "process_table", lambda: {pid: (1, pid, st, start)
+                                                       for pid, (_, _, st, start) in real().items()})
+    r = _session(tmp_path, script, 30, Clocks())
+    assert r["stopped_after_session"] and r["tag_scan"] == "proc_environ", r
+    assert _no_late_write(f)
+
+
+def test_a_child_that_cannot_be_stopped_is_reported(tmp_path, monkeypatch):
+    f, script = _detached(tmp_path, wait=30)
+    real_kill, real_killpg = os.kill, os.killpg
+    monkeypatch.setattr(lab.os, "kill", lambda *a: None)
+    monkeypatch.setattr(lab.os, "killpg", lambda *a: None)
+    real_stop = lab.stop_tree
+    monkeypatch.setattr(lab, "stop_tree", lambda tr, p, clock, grace_s=15, exempt=(): real_stop(tr, p, clock, 0.3, exempt))
+    try:
+        r = _session(tmp_path, script, 30, Clocks())
+    finally:
+        monkeypatch.undo()
+    for pid in r["stop_failed"]:
+        try:
+            real_killpg(pid, 9)
+        except OSError:
+            real_kill(pid, 9)
+    assert r["stop_failed"], r
+
+
+def test_a_stop_failure_reaches_the_integrity_list(task, monkeypatch):
+    real = lab.run_session
+    monkeypatch.setattr(lab, "run_session", lambda *a, **k: dict(real(*a, **k), stop_failed=[4242]))
+    r = lab.attempt(task, "A")
+    assert r["valid"] is False and any("still running after the stop: [4242]" in p for p in r["integrity"])
+
+
+def test_the_runners_jev_workers_survive_the_stop(task):
+    # the Stop hook's shadow worker answers after the session: registered in the runner's folder, left running
+    r = lab.attempt(task, "A")
+    assert r["valid"], r["integrity"]
+    assert r["session"]["observers_kept"] or r["session"]["stopped_after_session"] == []
+
+
+def test_observer_pids_need_the_registry_and_the_worker_command(tmp_path):
+    (tmp_path / "jev").mkdir()
+    w = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "jevshadow.py", "--worker"])
+    other = subprocess.Popen(["sleep", "30"])
+    try:
+        assert lab.observer_pids(tmp_path) == set()                   # nothing registered
+        (tmp_path / "jev" / "workers.pids").write_text(f"{w.pid}\n{other.pid}\n")
+        assert lab.observer_pids(tmp_path) == {w.pid}                 # a registered pid must be a worker too
+    finally:
+        w.kill()
+        other.kill()
+
+
+@pytest.mark.parametrize("script,timeout_s", [("sleep 300 & exit 0", 30), ("sleep 300", 1)])
+def test_a_sleep_during_the_cleanup_is_caught(tmp_path, monkeypatch, script, timeout_s):
+    # ChatGPT, 22.11 (P2): the clocks were read before the cleanup; a sleep inside it went unseen
+    c = Clocks()
+    real = lab.stop_tree
+
+    def sleepy(*a, **k):
+        c.slept = 120.0
+        return real(*a, **k)
+    monkeypatch.setattr(lab, "stop_tree", sleepy)
+    r = _session(tmp_path, script, timeout_s, c)
+    assert r["host_slept"] and r["slept_s_estimate"] >= 119, r
+    assert r["timed_out"] == (timeout_s == 1)
+
+
+def test_the_cleanup_wait_runs_on_the_budget_clock(tmp_path):
+    # children that ignore SIGTERM: the 15 s grace period ends on the budget clock, which a sleep moves on
+    c = Clocks()
+    p = subprocess.Popen(["sh", "-c", "trap '' TERM; sleep 300 & wait"], start_new_session=True)
+    tr = lab.ProcTracker(p.pid, None)
+    time.sleep(0.3)
+    _later(1.0, lambda: setattr(c, "slept", 1000.0))       # the host "sleeps" during the grace period
+    t0 = time.monotonic()
+    found, left = lab.stop_tree(tr, p, c()["budget"][1])
+    assert found and left == [] and time.monotonic() - t0 < 8, (found, left, time.monotonic() - t0)

@@ -86,21 +86,26 @@ SAFE_NAME = re.compile(r"[A-Za-z0-9-]+")     # a project folder name ("-private-
 
 def task_dir(root, transcript_path, session_id):
     """This session's own background task folder, <root>/<project>/<session id>/tasks (Claude Code >= 2.1.326:
-    "Output is being written to: /tmp/claude-<uid>/<project>/<session>/tasks/<id>.output"), resolved; None when
-    any part is missing or not a plain name. The root comes from the runner (spec "task_output_root": Claude
-    Code's per-uid temp folder for the agent's environment), the project folder is the transcript's, the session
-    is the hook's: nothing is taken from the requested path itself."""
-    if not (root and transcript_path and session_id):
+    "Output is being written to: /tmp/claude-<uid>/<project>/<session>/tasks/<id>.output"), as a fixed path that is
+    NOT resolved: the root comes from the runner, already resolved and pinned before the session (spec
+    "task_output_root"), the project folder is the transcript's, the session is the hook's - nothing from the
+    requested path. A folder on the way that was replaced by a link (the agent's Bash can write in the temp
+    folder) then no longer matches the resolved file (ChatGPT, 22.11, P1). None when a part is missing or not a
+    plain name, or the root is not an absolute normal path."""
+    if not (root and transcript_path and session_id) or not isinstance(root, str):
+        return None
+    if not os.path.isabs(root) or os.path.normpath(root) != root:
         return None
     project = os.path.basename(os.path.dirname(transcript_path))
     if not (SAFE_NAME.fullmatch(project) and isinstance(session_id, str) and SAFE_NAME.fullmatch(session_id)):
         return None
-    return os.path.realpath(os.path.join(root, project, session_id, "tasks"))
+    return os.path.join(root, project, session_id, "tasks")
 
 
 def own_task_output(tool, path, tdir, live=True):
-    """A Read of one of this session's own background task outputs: the resolved path (symlinks followed, so a
-    link to anything outside fails) names a file *.output directly in tdir. live (the hook): it must exist as a
+    """A Read of one of this session's own background task outputs: the resolved path (every link followed: a file
+    link out of the folder and a folder on the way replaced by a link both fail) is a file *.output directly in
+    tdir, the unresolved, pinned task folder. live (the hook): it must exist as a
     regular file now. The audit after the session (live=False) cannot see links or files Claude Code has since
     removed; it checks the same place and name, the hook having checked the file when it was read."""
     if tool != "Read" or not tdir:

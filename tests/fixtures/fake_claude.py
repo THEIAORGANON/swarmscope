@@ -162,6 +162,10 @@ def guard_spec():
 TASK_OUT = {}
 
 
+def NAME_OF(n):
+    return "Bash" if n in ("28", "29", "35") else "Read"
+
+
 def task_step(n, arg):
     """Probe steps 28-34 as Claude Code >= 2.1.326 runs them: a background command writes to
     <claude tmp>/<project>/<session>/tasks/<id>.output (the fake takes the root from the guard's spec); a Read goes
@@ -174,13 +178,22 @@ def task_step(n, arg):
         TASK_OUT["f"] = f
         inp, allowed = {"command": arg, "run_in_background": True, "description": "bg"}, True
         text = f"Command running in background with ID: bfake0001. Output is being written to: {f}. You will be notified."
+    elif n == "35":
+        # the agent's Bash replaces its own tasks folder by a link (the temp folder is writable for Bash)
+        f = TASK_OUT.get("f")
+        target = re.search(r"ln -s (\S+) S/tasks", prompt).group(1)          # the command is on the next line
+        S = f.parent.parent if f is not None else Path("/nonexistent")
+        inp, allowed, text = {"command": f"mv {S}/tasks {S}/tasks.orig && ln -s {target} {S}/tasks"}, True, ""
+        if os.environ.get("FAKE_NO_REPLACE") != "1" and f is not None:
+            os.rename(f.parent, str(f.parent) + ".orig")
+            os.symlink(target, f.parent)
     elif n == "29":
         time.sleep(1.0)                          # the probe plants its files once the tasks folder appears
         inp, allowed, text = {"command": arg}, True, ""
     else:
         f = TASK_OUT.get("f") or Path("/nonexistent/x.output")
         path = {"30": os.environ.get("FAKE_TASK_READ") or str(f), "31": str(f.parent / "neighbour.txt"),
-                "32": str(f.parent / "link.output")}.get(n, arg)
+                "32": str(f.parent / "link.output"), "36": str(f.parent / "x.output")}.get(n, arg)
         inp = {"file_path": path}
         res = hook("PreToolUse", tool_name="Read", tool_input=inp, tool_use_id=f"t{n}")
         denied = res and ((res.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
@@ -193,11 +206,11 @@ def task_step(n, arg):
             except OSError as e:
                 allowed, text = False, f"File does not exist: {e}"
     out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
-        {"type": "tool_use", "id": f"t{n}", "name": "Read" if n >= "30" else "Bash", "input": inp}]}})
+        {"type": "tool_use", "id": f"t{n}", "name": NAME_OF(n), "input": inp}]}})
     out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
         {"type": "tool_result", "tool_use_id": f"t{n}", "is_error": not allowed, "content": text}]}})
     use = {"type": "assistant", "timestamp": iso(), "message": {"id": f"mt{n}", "model": model, "content": [
-        {"type": "tool_use", "id": f"t{n}", "name": "Read" if n >= "30" else "Bash", "input": inp}],
+        {"type": "tool_use", "id": f"t{n}", "name": NAME_OF(n), "input": inp}],
         "usage": {"input_tokens": 0, "output_tokens": 0}}}
     tr(use)
     tr({"type": "user", "timestamp": iso(), "message": {"content": [
@@ -214,7 +227,7 @@ if "authorized test of the sandbox" in prompt:  # lab.py probe: a contained agen
             continue
         name = {"Bash": "Bash", "Read tool": "Read", "Write tool": "Write", "Glob tool": "Glob", "Grep tool": "Grep",
                 "Task tool": "Task", "Bash tool with run_in_background set to true": "Bash"}[tool]
-        if 28 <= int(n) <= 34:                   # background task outputs, in the main session
+        if 28 <= int(n) <= 36:                   # background task outputs, in the main session
             task_step(n, arg)
             continue
         if int(n) >= 21:                         # step 21 starts the grep subagent, 22-27 run inside it

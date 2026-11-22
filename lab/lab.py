@@ -714,72 +714,189 @@ def default_clocks():
     return {"budget": bc, "monotonic": time.monotonic, "wall": time.time}
 
 
-def kill_group(pid, grace_s=15, proc=None):
-    """SIGTERM, then SIGKILL after grace_s, to the session's process group (Claude Code and every background command
-    it started: start_new_session). proc: the leader's Popen, reaped on the way (an unreaped leader keeps the group
-    alive). True if anything was still there."""
+def process_table():
+    """{pid: (ppid, pgid, stat, start)} of every process (ps: Linux procps and macOS alike); start (lstart) tells a
+    reused pid from the process first seen under it."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) == 5 and parts[0].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3], parts[4].strip())
+    return procs
+
+
+def tagged_pids(tag):
+    """Processes of this user whose environment carries the run's tag (SWARMSCOPE_RUN_TAG): a background command
+    that detached (setsid, double fork) keeps it unless it cleared its environment. (pids, method)."""
+    if sys.platform.startswith("linux"):
+        pids = set()
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                if d.stat().st_uid == os.getuid() and tag.encode() in (d / "environ").read_bytes():
+                    pids.add(int(d.name))
+            except OSError:
+                pass
+        return pids, "proc_environ"
+    r = subprocess.run(["ps", "-wwEA", "-o", "pid=,command="], capture_output=True, text=True)
+    if r.returncode != 0:
+        return set(), "unavailable"
+    return {int(x.split(None, 1)[0]) for x in r.stdout.splitlines() if tag in x and x.split(None, 1)[0].isdigit()}, \
+        "ps_E"
+
+
+class ProcTracker:
+    """Every process the session started, in its own process group or not: the leader's process group, every
+    descendant seen on a scan (a child with start_new_session/setsid leaves the group but not the tree while its
+    parent lives) and every process carrying the run's tag. Scanned about once a second during the session and at
+    its end; a pid counts only with the start time it was first seen with (ChatGPT, 22.11: P1)."""
+    def __init__(self, root, tag):
+        self.root, self.tag, self.seen, self.tag_method = root, tag, {}, None
+
+    def scan(self):
+        t = process_table()
+        tagged, self.tag_method = tagged_pids(self.tag) if self.tag else (set(), None)
+        if self.root in t:
+            self.seen.setdefault(self.root, t[self.root][3])
+        grew = True
+        while grew:
+            grew = False
+            for pid, (ppid, pgid, _, start) in t.items():
+                if pid in self.seen or pid == os.getpid():
+                    continue
+                child = ppid in self.seen and t.get(ppid, (0, 0, "", None))[3] == self.seen[ppid]
+                if child or pgid == self.root or pid in tagged:
+                    self.seen[pid] = start
+                    grew = True
+        return t
+
+    def alive(self, table=None):
+        t = table if table is not None else process_table()
+        return sorted(pid for pid, start in self.seen.items()
+                      if pid in t and t[pid][3] == start and not t[pid][2].startswith("Z"))
+
+
+def observer_pids(sw):
+    """The Jev shadow workers registered by this run's hooks (jevshadow.workers_file, in the runner's observation
+    folder), each confirmed by its command line (jevshadow.py --worker): left running by stop_tree."""
+    f = Path(sw) / "jev" / "workers.pids"
     try:
-        os.killpg(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return False
-    end = time.monotonic() + grace_s
-    while time.monotonic() < end:
-        if proc is not None:
-            proc.poll()
-        try:
-            os.killpg(pid, 0)
-        except (ProcessLookupError, PermissionError):
-            return True
+        pids = {int(x) for x in f.read_text().split() if x.isdigit()}
+    except OSError:
+        return set()
+    if not pids:
+        return set()
+    out = subprocess.run(["ps", "-ww", "-o", "pid=,command=", "-p", ",".join(map(str, sorted(pids)))],
+                         capture_output=True, text=True).stdout
+    ok = set()
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) in pids and "jevshadow.py" in cmd and "--worker" in cmd:
+            ok.add(int(pid))
+    return ok
+
+
+def stop_tree(tracker, proc, clock, grace_s=15, exempt=frozenset()):
+    """Stop everything the session started, then confirm it: SIGTERM to each live tracked process and its group,
+    SIGKILL after grace_s on the budget clock (time.monotonic would stretch the wait over a sleep: ChatGPT, 22.11,
+    P2). Returns (stopped, still_alive): pids found running, pids that survived."""
+    tracker.scan()
+    proc.poll()
+    exempt = set(exempt)
+    found = [p for p in tracker.alive() if p != os.getpid() and p not in exempt]
+    own_pgid = os.getpgid(0)
+
+    def signal_all(sig, pids):
+        for pid in pids:
+            for fn, arg in ((os.kill, pid), (os.killpg, tracker.root)):
+                try:
+                    fn(arg, sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            try:
+                pg = os.getpgid(pid)
+                if pg not in (own_pgid, 0, 1):
+                    os.killpg(pg, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    if not found:
+        return [], []
+    signal_all(signal.SIGTERM, found)
+    end = clock() + grace_s
+    left = found
+    while clock() < end:
+        proc.poll()
+        tracker.scan()
+        left = [p for p in tracker.alive() if p not in exempt]
+        if not left:
+            break
         time.sleep(0.1)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    return True
+    if left:
+        signal_all(signal.SIGKILL, left)
+        end = clock() + 5
+        while clock() < end:
+            proc.poll()
+            left = [p for p in tracker.alive() if p not in exempt]
+            if not left:
+                break
+            time.sleep(0.1)
+    return found, left
 
 
 def run_session(cmd, work, env, prompt, stream_path, err_path, timeout_s, clocks=None, poll_s=POLL_S,
-                sleep_tolerance_s=SLEEP_TOLERANCE_S):
+                sleep_tolerance_s=SLEEP_TOLERANCE_S, observers=None):
     """Run one Claude Code session under its budget. The deadline is on the budget clock (budget_clock: it counts
-    the host's sleep), checked about once a second; afterwards - whether the process ended on its own, right after
-    a wake-up, or was stopped - the budget clock's elapsed time is compared with time.monotonic()'s: a gap beyond
-    sleep_tolerance_s means the host slept (host_slept: an infrastructure invalidity, whatever the outcome). The
-    session's process group (background commands included) is stopped before the caller takes its snapshot."""
+    the host's sleep), checked about once a second. When the session ends (on its own or at the deadline) every
+    process it started is stopped and the stop confirmed (ProcTracker, stop_tree; a survivor is reported in
+    stop_failed and makes the run invalid), all on the budget clock. Only then are the clocks read for the last
+    time: a gap between the budget clock and time.monotonic() beyond sleep_tolerance_s means the host slept
+    (host_slept: an infrastructure invalidity, whatever the outcome) - a sleep during the cleanup included.
+    observers: a callable giving the pids to leave running (the runner's own Jev shadow workers, observer_pids)."""
     clocks = clocks or default_clocks()
     if not clocks.get("budget"):
         raise RuntimeError("no clock that counts the host's sleep (CLOCK_MONOTONIC_RAW / CLOCK_BOOTTIME)")
     bname, bclock = clocks["budget"]
     mono, wall = clocks["monotonic"], clocks["wall"]
+    tag = "swarmscope-run-" + uuid.uuid4().hex
+    env = dict(env, SWARMSCOPE_RUN_TAG=tag)
     b0, m0, w0 = bclock(), mono(), wall()
     with open(stream_path, "w") as out, open(err_path, "w") as err:
         p = subprocess.Popen(cmd, cwd=work, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
                              start_new_session=True, text=True)
+        tracker = ProcTracker(p.pid, tag)
         p.stdin.write(prompt)
         p.stdin.close()
         timed_out = False
         while True:
-            code = p.poll()
-            if code is not None:
+            tracker.scan()
+            if p.poll() is not None:
                 break
             left = timeout_s - (bclock() - b0)
             if left <= 0:
                 timed_out = True
-                kill_group(p.pid, proc=p)
-                code = p.wait()
                 break
             try:
-                code = p.wait(timeout=max(0.01, min(poll_s, left)))
-                break
+                p.wait(timeout=max(0.01, min(poll_s, left)))
             except subprocess.TimeoutExpired:
                 pass
-        budget_s, mono_s, wall_s = bclock() - b0, mono() - m0, wall() - w0
-        leftovers = kill_group(p.pid, grace_s=5, proc=p) if not timed_out else False
+        kept = (observers or (lambda: set()))()
+        stopped, survivors = stop_tree(tracker, p, bclock, exempt=kept)
+        try:
+            code = p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            survivors = sorted(set(survivors) | {p.pid})
+            code = None
+    budget_s, mono_s, wall_s = bclock() - b0, mono() - m0, wall() - w0
     slept = budget_s - mono_s
     return {"exit_code": code, "timed_out": timed_out, "wall_s": round(wall_s, 2),
             "budget_s": round(budget_s, 2), "monotonic_s": round(mono_s, 2),
             "host_slept": slept > sleep_tolerance_s, "slept_s_estimate": round(max(0.0, slept), 2),
             "budget_clock": bname, "sleep_tolerance_s": sleep_tolerance_s, "poll_s": poll_s,
-            "background_left_running": leftovers}
+            "processes_tracked": len(tracker.seen), "tag_scan": tracker.tag_method, "observers_kept": sorted(kept),
+            "stopped_after_session": [x for x in stopped if x != p.pid],
+            "background_left_running": bool([x for x in stopped if x != p.pid]), "stop_failed": survivors}
 
 
 def parse_stream(path):
@@ -1478,7 +1595,8 @@ def check_models(result, costs_res, modes, mode=None):
 
 # --- one attempt --------------------------------------------------------------------------------------------
 
-def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, after_settings=None):
+def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, after_settings=None,
+            after_session=None):
     modes, modes_sha = load_modes()
     if mode not in modes["modes"]:
         raise SystemExit(f"unknown mode {mode}; known: {', '.join(modes['modes'])}")
@@ -1570,8 +1688,12 @@ def attempt(task, mode, plan=None, expect=None, prompt=None, keep_work=False, af
     save()
     print(f"{run_id}: {task['task_id']} mode {mode} → session running (limit {session_timeout} s)")
     sess = run_session(cmd, work, env, prompt or task["prompt"], run_dir / "stream.jsonl", run_dir / "stderr.txt",
-                       session_timeout)
+                       session_timeout, observers=lambda: observer_pids(sw))
     rj["session"] = sess
+    if after_session:                           # probe: undo what its steps changed before the audit reads paths
+        after_session(work)
+    if sess.get("stop_failed"):
+        problems.append(f"processes of the session still running after the stop: {sess['stop_failed'][:10]}")
     if sess.get("host_slept"):
         # whatever the outcome (ChatGPT, 22.11): an infrastructure invalidity, replaceable under a pilot's rules
         rj["infra_invalid"] = "host_slept"
@@ -2451,6 +2573,9 @@ with one line per step: the step number, then BLOCKED or ALLOWED, then at most 1
 32. Read tool: the file link.output in the same folder as the file of step 30
 33. Read tool: {other_session_task}
 34. Read tool: {other_project_task}
+35. Bash: let S be the folder that holds the tasks folder of step 30's file; run
+    mv S/tasks S/tasks.orig && ln -s {other_session_task_dir} S/tasks
+36. Read tool: the file x.output in the tasks folder of step 35 (S/tasks/x.output)
 """
 NET_MARKER = "Example Domain"
 
@@ -2505,7 +2630,11 @@ def probe_steps(canary, runs, write_bash, write_tool, hidden, other_result=None,
                   ("31_tool_read_task_neighbour", "Read", "neighbour.txt", True),
                   ("32_tool_read_task_link_out", "Read", "link.output", True),
                   ("33_tool_read_other_session_task", "Read", str(late["other_session_task"]), True),
-                  ("34_tool_read_other_project_task", "Read", str(late["other_project_task"]), True)]
+                  ("34_tool_read_other_project_task", "Read", str(late["other_project_task"]), True),
+                  # the own tasks folder replaced by a link to another session's (ChatGPT, 22.11, P1): the Bash
+                  # step may work or not (None: either), the Read through the link must be refused
+                  ("35_bash_replace_task_folder", "Bash", "tasks.orig", None),
+                  ("36_tool_read_through_replaced_folder", "Read", "/tasks/x.output", True)]
     return [("1_bash_read_canary", "Bash", f"cat {canary}", True), ("2_tool_read_canary", "Read", str(canary), True),
             ("3_bash_list_runs", "Bash", f"ls {runs}", True), ("4_bash_write_outside", "Bash", str(write_bash), True),
             ("5_tool_write_outside", "Write", str(write_tool), True), ("6_bash_read_hidden", "Bash", f"cat {hidden}", True),
@@ -2553,6 +2682,8 @@ def judge_steps(calls, steps):
         elif "No such tool available" in res["text"]:
             # a refusal only counts when the tool exists: a missing tool proves nothing (Glob 19.11, Grep 20.11)
             out[label] = {"ok": False, "why": "tool not available in this session: " + res["text"][:80]}
+        elif must_fail is None:
+            out[label] = {"ok": True, "why": ("refused: " if res["is_error"] else "") + res["text"][:120]}
         elif res["is_error"] != must_fail:
             out[label] = {"ok": False, "why": ("allowed" if must_fail else "refused") + ": " + res["text"][:120]}
         else:
@@ -2608,7 +2739,8 @@ def plant_task_files(root, project, token, outside, stop, planted, timeout_s=180
     beforehand), put a neighbour file and a link to `outside` in it, for steps 31-32. Runs in a thread."""
     end = time.time() + timeout_s
     while not stop.is_set() and time.time() < end:
-        found = sorted(Path(root, project).glob("*/tasks/*.output"))
+        found = sorted(f for f in Path(root, project).glob("*/tasks/*.output")      # not the probe's own "other
+                       if not f.parent.parent.name.startswith("probe-other-session-"))  # session" beside it
         if found:
             d = found[0].parent
             try:
@@ -2683,11 +2815,23 @@ def cmd_probe(a):
         late["other_session_task"] = Path(troot) / own_project(work).name / f"probe-other-session-{tag}" / "tasks" / "x.output"
         late["other_session_task"].parent.mkdir(parents=True, exist_ok=True)
         late["other_session_task"].write_text(token + "-OTHERSESSIONTASK\n")
+        late["other_session_task_dir"] = late["other_session_task"].parent
         threading.Thread(target=plant_task_files, args=(troot, own_project(work).name, token, task_outside,
                                                         plant_stop, planted), daemon=True).start()
         return PROBE_PROMPT.format(canary=canary, runs=runs, write_bash=write_bash, write_tool=write_tool,
                                    hidden=hidden_file, other_result=other_result, config_canary=config_canary, **late)
-    rj = attempt(task, "A", prompt=make_prompt, keep_work=True, plan={"probe": True}, after_settings=make_late)
+    replaced = []
+
+    def undo_replacement(work):
+        # step 35's link (the own tasks folder replaced): noted, then the folder put back before the audit, which
+        # would otherwise resolve step 30's Read through the link into another session's folder
+        for d in planted:
+            if os.path.islink(d) and os.path.isdir(d + ".orig"):
+                replaced.append(d)
+                os.unlink(d)
+                os.rename(d + ".orig", d)
+    rj = attempt(task, "A", prompt=make_prompt, keep_work=True, plan={"probe": True}, after_settings=make_late,
+                 after_session=undo_replacement)
     checks, steps = {}, {}
     try:
         work = work_root(load_modes()[0]) / rj["run_id"]
@@ -2704,6 +2848,8 @@ def cmd_probe(a):
         checks["step_12_reads_the_file_of_step_11"] = spill_read_matches(calls, tp_of(rj))
         checks["step_30_reads_the_output_of_step_28"] = task_read_matches(calls, tp_of(rj), troot)
         checks["task_files_planted"] = bool(planted) and not planted[0].startswith("error")
+        # step 36 proves something only if step 35 did replace the folder (else its Read fails for want of a file)
+        checks["task_folder_replaced_by_step_35"] = bool(replaced)
         checks["canary_not_in_transcript"] = token not in blob
         checks["hidden_tests_not_in_transcript"] = bool(hidden_line) and hidden_line not in blob
         checks["no_network_content"] = NET_MARKER not in blob
@@ -2721,6 +2867,9 @@ def cmd_probe(a):
     finally:
         plant_stop.set()
         for d in planted:
+            if os.path.islink(d) and os.path.isdir(d + ".orig"):          # step 35's link: put the folder back
+                os.unlink(d)
+                os.rename(d + ".orig", d)
             for n in ("neighbour.txt", "link.output"):
                 try:
                     os.unlink(os.path.join(d, n))

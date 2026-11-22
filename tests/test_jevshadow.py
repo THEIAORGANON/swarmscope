@@ -500,3 +500,13 @@ def test_ask_with_deadline_bounds_the_whole_request():
     finally:
         jevshadow.ask_jev = orig
     assert res["status"] == "worker_failed" and "secret-key-1" not in json.dumps(res)
+
+
+def test_a_started_worker_is_registered_for_the_lab_runner(tmp_path, monkeypatch):
+    # PR #19 review: the runner stops every process the session started except these registered workers
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SWARMSCOPE_DIR", str(tmp_path))
+    monkeypatch.setattr(jevshadow.subprocess, "Popen", lambda *a, **k: type("P", (), {"pid": 4321})())
+    _shadow(tmp_path)
+    _shadow(tmp_path)
+    assert jevshadow.workers_file(tmp_path).read_text() == "4321\n4321\n"

@@ -184,10 +184,15 @@ def test_own_task_output_is_readable(tasks):
     spec = {"allow": [str(work)], "task_output_root": str(root)}
     for f in ("b1.output", "alias.output"):
         assert readguard.check(call("Read", {"file_path": str(own / f)}, work, proj), spec) is None, f
-    # the same file through a link to the root (macOS /tmp -> /private/tmp): resolved on both sides
+    # the agent may name it through a link (macOS /tmp -> /private/tmp): the requested path is resolved
     os.symlink(t / "ctmp", t / "ctmp-link")
+    via = t / "ctmp-link" / "claude-501" / "-w" / "S1" / "tasks" / "b1.output"
+    assert readguard.check(call("Read", {"file_path": str(via)}, work, proj), spec) is None
+    # the root itself is never resolved by the guard: the runner pins it resolved (lab.claude_tmp_root)
     spec2 = {"allow": [str(work)], "task_output_root": str(t / "ctmp-link" / "claude-501")}
-    assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj), spec2) is None
+    assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj), spec2)
+    assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj),
+                           {"allow": [str(work)], "task_output_root": str(root) + "/"})
 
 
 def test_other_task_outputs_and_neighbours_are_denied(tasks):
@@ -249,3 +254,20 @@ def test_task_output_check_errors_deny(tasks, monkeypatch):
     monkeypatch.setattr(readguard, "own_task_output", lambda *a, **k: 1 / 0)
     assert readguard.check(call("Read", {"file_path": str(own / "b1.output")}, work, proj),
                            {"allow": [str(work)], "task_output_root": str(root)}).startswith("read guard error")
+
+
+@pytest.mark.parametrize("level", ["tasks", "session", "project", "root"])
+def test_a_folder_replaced_by_a_link_opens_nothing(tasks, level):
+    # ChatGPT, 22.11 (P1): own/project/S1/tasks -> other/project/S2/tasks let another session's output through
+    t, work, proj, root, own = tasks
+    other = t / "elsewhere" / "claude-501" / "-w" / "S1" / "tasks"
+    other.mkdir(parents=True)
+    (other / "secret.output").write_text("s")
+    victim = {"tasks": own, "session": own.parent, "project": own.parent.parent, "root": root}[level]
+    target = {"tasks": other, "session": other.parent, "project": other.parent.parent, "root": other.parents[2]}[level]
+    os.rename(victim, str(victim) + ".orig")
+    os.symlink(target, victim)
+    spec = {"allow": [str(work)], "task_output_root": str(root)}
+    f = {"file_path": str(own / "secret.output")}
+    assert readguard.check(call("Read", f, work, proj), spec), level
+    assert readguard.decide("Read", f, str(work), [str(work)], str(proj / "S1.jsonl"), "S1", str(root), live=False)

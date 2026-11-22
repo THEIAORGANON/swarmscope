@@ -203,3 +203,37 @@ def test_audit_flags_a_task_folder_neighbour_but_not_the_own_output(tmp_path, ot
     res = json.loads((tmp_path / "main_results.json").read_text())
     assert SECRET in res[3]["text"], res                                  # the neighbour is readable without the guard
     assert len(outside) == 1 and outside[0][2].endswith("/neighbour.txt"), outside
+
+
+def replace_calls():
+    # the agent's Bash replaces its own tasks folder by a link to another session's (ChatGPT, 22.11, P1)
+    setup = (f"sleep 3; mkdir -p {{TASK_PROJECT_DIR}}/other-session/tasks && "
+             f"echo {SECRET} > {{TASK_PROJECT_DIR}}/other-session/tasks/x.output && "
+             f"mv {{TASK_DIR}} {{TASK_DIR}}.orig && ln -s {{TASK_PROJECT_DIR}}/other-session/tasks {{TASK_DIR}} && echo replaced")
+    return [{"name": "Bash", "input": {"command": "echo OWN_BG_OUTPUT", "run_in_background": True, "description": "bg"}},
+            {"name": "Bash", "input": {"command": setup, "description": "replace"}},
+            {"name": "Read", "input": {"file_path": "{TASK_DIR}/x.output"}}]
+
+
+def test_a_task_folder_replaced_by_a_link_opens_nothing(tmp_path, other_project):
+    _, outside = session(tmp_path, [], main_calls=replace_calls())
+    res = json.loads((tmp_path / "main_results.json").read_text())
+    assert len(res) == 3 and "replaced" in res[1]["text"], res
+    assert res[2]["is_error"] and SECRET not in res[2]["text"], res[2]
+    assert outside == []
+
+
+def test_audit_flags_a_read_through_a_replaced_task_folder(tmp_path, other_project, monkeypatch):
+    sys.path.insert(0, str(REPO / "lab"))
+    import lab as L
+    monkeypatch.setattr(L, "read_guard_hook", lambda work, task: {"matcher": "^NoSuchTool$", "hooks": [
+        {"type": "command", "command": "true", "timeout": 5}]})
+    _, outside = session(tmp_path, [], main_calls=replace_calls())
+    res = json.loads((tmp_path / "main_results.json").read_text())
+    if "task output swap refused" in res[2]["text"]:
+        # Claude Code 2.1.330 refuses this itself ("task output swap refused (tasks dir moved or linked)"); the
+        # lab's guard must not rely on that (2.1.326 on the lab Mac): nothing got through, nothing to audit
+        assert SECRET not in res[2]["text"] and outside == []
+        pytest.skip("this binary refuses a swapped tasks folder on its own")
+    assert SECRET in res[2]["text"], res                                  # the bypass is real without the guard
+    assert len(outside) == 1 and "other-session/tasks/x.output" in outside[0][2], outside
