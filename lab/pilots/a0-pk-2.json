@@ -1,0 +1,53 @@
+{
+  "pilot": "a0-pk-2",
+  "kind": "diagnostic",
+  "status": "declared 2026-11-22 before any run",
+  "question": "The question of a0-pk-1, asked again under the corrected runner: does Sonnet 5.5 solve pk-prerel cleanly without the advisor (A0) 3/3?",
+  "not_asked": "The causal effect of the advisor. Earlier A runs (cand-1) and the two valid A0 successes of a0-pk-1 are a historical reference only; they are not pooled with these runs.",
+  "why_fresh": "PR #19 changed what the agent may do (its own background task outputs are readable) and how the budget is kept (a sleep-counting clock, host_slept, the stop of every process the session started) - and with them the experiment's version keys. Pooling two old successes with one new outcome as '3/3 under the same conditions' would be wrong (ChatGPT, 22.11).",
+  "previous": {
+    "pilot": "a0-pk-1",
+    "declaration_sha": "a80602d5a87f1ef7fa66a2af721cf7baa764e9d8",
+    "result": "incomplete: 2 valid successes, 1 invalid attempt, stopped"
+  },
+  "task": {
+    "id": "pk-prerel",
+    "manifest": "lab/tasks/pk-prerel.json (unchanged since a0-pk-1)",
+    "manifest_sha256": "7bf3bebafe5ec154bc4bc250554b066be7ae47cffb12f5c504e84b4d2e1d2214",
+    "hidden_tests": "as in a0-pk-1 (62511 on the Mac, 28 bug_tests)",
+    "session_timeout_s": 1800
+  },
+  "mode": {
+    "A0": "Sonnet 5.5, effort high, no advisor (an advisor call or any Opus use makes the run invalid); rules and Jev only record (observe)"
+  },
+  "code": "main after PR #19 is merged; the batch manifest records the code bundle sha",
+  "preconditions": [
+    "PR #19 merged and its files on the Mac (md5 checked)",
+    "pytest on the Mac with test_real_claude: all pass (the macOS xfail shown apart)",
+    "lab.py probe: boundary HOLDS, steps 1-36",
+    "the Mac on AC power, lid open; the runner holds caffeinate -i -s"
+  ],
+  "seed": 711,
+  "command": "lab.py batch --task pk-prerel --modes A0 --repeats 3 --seed 711 --pilot a0-pk-2",
+  "counted_outcomes": "exactly three. A budget timeout (timeout_class budget) is a failure and counts.",
+  "replacement": "only an attempt invalid for an infrastructure reason is replaced: api_interrupted (e.g. a rejected subscription rate limit), timeout_class infra_suspected, host_slept (infra_invalid), or an operator_reported failure under the cand-1 rule. A replacement runs in a new batch with seed 721, then 731. Any other invalid attempt (an advisor or Opus call in A0, a permission denial, a read outside, stop_failed, scan_error, a cost or integrity problem) stops the pilot for review.",
+  "known_limit": "On macOS the stop after a session is not a complete guarantee: a process that clears its environment, leaves the working copy and detaches before the next ~1 s scan can stay invisible (session.stop_guarantee; decision A, ChatGPT 22.11).",
+  "recorded_per_run": [
+    "success",
+    "hidden passed/expected",
+    "bug_tests passed",
+    "regressions",
+    "session_s",
+    "run_usd and run_usd_status",
+    "timeout_class if any",
+    "session.host_slept, stop_guarantee, stopped_after_session, stop_failed",
+    "R3 (observe) and Jev answers, apart"
+  ],
+  "decision_after": {
+    "A0 3/3 clean": "go to cand-1 option (1): larger cross-cutting tasks",
+    "A0 fails or regresses at least once": "a separate fresh paired A/A0 series with the order shuffled within pairs, declared apart; the cand-1 criterion is not changed after the fact"
+  },
+  "batches": [],
+  "deviations": [],
+  "result": null
+}
