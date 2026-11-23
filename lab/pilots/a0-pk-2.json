@@ -1,7 +1,7 @@
 {
   "pilot": "a0-pk-2",
   "kind": "diagnostic",
-  "status": "declared 2026-11-22 before any run",
+  "status": "stopped 2026-11-22 under its own rule (an invalid attempt that was not infrastructural); incomplete",
   "question": "The question of a0-pk-1, asked again under the corrected runner: does Sonnet 5.5 solve pk-prerel cleanly without the advisor (A0) 3/3?",
   "not_asked": "The causal effect of the advisor. Earlier A runs (cand-1) and the two valid A0 successes of a0-pk-1 are a historical reference only; they are not pooled with these runs.",
   "why_fresh": "PR #19 changed what the agent may do (its own background task outputs are readable) and how the budget is kept (a sleep-counting clock, host_slept, the stop of every process the session started) - and with them the experiment's version keys. Pooling two old successes with one new outcome as '3/3 under the same conditions' would be wrong (ChatGPT, 22.11).",
@@ -47,7 +47,76 @@
     "A0 3/3 clean": "go to cand-1 option (1): larger cross-cutting tasks",
     "A0 fails or regresses at least once": "a separate fresh paired A/A0 series with the order shuffled within pairs, declared apart; the cand-1 criterion is not changed after the fact"
   },
-  "batches": [],
-  "deviations": [],
-  "result": null
+  "batches": [
+    "20261122-044628-9ddd"
+  ],
+  "deviations": [
+    "attempt 3 invalid for a reason that is not infrastructural under the declaration (a permission denial): the pilot stopped for review (ChatGPT, 23.11)"
+  ],
+  "result": "Incomplete: two valid successes (A0, no advisor, 0 regressions, $1.661 and $1.672 confirmed) and one invalid attempt (its hidden tests passed); stopped by the declaration. Machine validity is not changed after the fact. No new A0 pilot is run for the post (ChatGPT, 23.11). Allowed descriptive summary: in two versions of the experiment, 2/2 and 2/2 valid A0 runs succeeded; two more attempts were excluded for read denials although their hidden tests passed. 4/4 may be called a summary of two pilots, with no estimate of a success probability. A0 is checked on pk-prerel only.",
+  "runs": [
+    {
+      "run_id": "4646cea722",
+      "repeat": 1,
+      "valid": true,
+      "success": true,
+      "hidden": "62511/62511",
+      "bug_tests": "28/28",
+      "regressions": 0,
+      "session_s": 1197,
+      "run_usd": 1.661,
+      "run_usd_status": "confirmed",
+      "advisor_calls": 0,
+      "R3_observe_triggered": 1,
+      "jev_p_consult": [
+        0.39
+      ],
+      "host_slept": false,
+      "stopped_after_session": []
+    },
+    {
+      "run_id": "3a038b5862",
+      "repeat": 2,
+      "valid": true,
+      "success": true,
+      "hidden": "62511/62511",
+      "bug_tests": "28/28",
+      "regressions": 0,
+      "session_s": 1100,
+      "run_usd": 1.672,
+      "run_usd_status": "confirmed",
+      "advisor_calls": 0,
+      "R3_observe_triggered": 2,
+      "jev_p_consult": [
+        0.48,
+        0.5
+      ],
+      "host_slept": false,
+      "stopped_after_session": []
+    },
+    {
+      "run_id": "f0714e1d50",
+      "repeat": 3,
+      "valid": false,
+      "success": false,
+      "hidden": "62511/62511",
+      "bug_tests": "28/28",
+      "regressions": 0,
+      "session_s": 1153,
+      "run_usd": 1.593,
+      "run_usd_status": "confirmed",
+      "advisor_calls": 0,
+      "R3_observe_triggered": 1,
+      "jev_p_consult": [
+        0.48
+      ],
+      "host_slept": false,
+      "stopped_after_session": [],
+      "machine_invalidity": "1 permission denial(s): Read - the only reason in the original run.json, which is kept unchanged",
+      "detail": "Read of /tmp/claude-501/full2.log: the session's own pytest log, written there by its Bash (Claude Code's sandbox sets TMPDIR=/tmp/claude-501); the guard allows only the own tasks/*.output there. The agent then read the same file with tail in Bash and finished."
+    }
+  ],
+  "limitations": [
+    "Claude Code's sandbox TMPDIR (/tmp/claude-<uid>) is shared by all runs and readable by the agent's Bash: in one early valid run the agent listed it. No explicit read of another run's content was found in the commands reviewed, but full independence of the sessions is not claimed (ChatGPT, 23.11). To fix: a per-run CLAUDE_CODE_TMPDIR."
+  ]
 }
