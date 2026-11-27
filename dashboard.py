@@ -31,11 +31,12 @@ from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
 ORANGE, BLUE, GREEN, PURPLE, RED = "#e8925a", "#7fb2f0", "#8fd19e", "#b59cf0", "#e06c75"
+TEAL = "#5dcaa5"                      # Jev: the external escalation judge
 DIM, FAINT, FG, WHITE = "#7d8590", "#3d434d", "#d7dae0", "#ffffff"
 SPIN = "◐◓◑◒"
 GLYPHS = "ｱｲｳｴｵｶｷｸｹｺ#%&@$01<>/\\=+*"
 KIND_COLOR = {"lead": ORANGE, "sub": BLUE, "adv": PURPLE, "err": RED, "user": FG,
-              "gate": PURPLE, "gate_miss": RED, "note": DIM}
+              "gate": PURPLE, "gate_miss": RED, "note": DIM, "jev": TEAL}
 LEFT_W = 26
 FPS = 10
 
@@ -455,6 +456,23 @@ def _timeline(st, a_times, width, now, now_ref, window, frame, roomy, fit):
         for ch, col in chars:
             t.append(ch, style=col)
         rows.append(t)
+    jv = st.get("jev") or []
+    if jv:
+        chars = [("┈", FAINT)] * cols
+        for j in jv:
+            x = cell(j["ts"] or j["asked"])
+            if not 0 <= x < cols:
+                continue
+            if j["ts"] is None:                         # asked, no answer yet
+                chars[x] = ("◌", TEAL if blink(frame, 2) else mix(TEAL, FAINT, 0.5))
+            elif j["status"] != "ok":
+                chars[x] = ("✕", DIM)
+            else:
+                chars[x] = ("●" if j["would"] else "○", fade(TEAL, now - j["ts"], 1.5))
+        t = Text(f"{'jev':<{label_w}} ", style=TEAL)
+        for ch, col in chars:
+            t.append(ch, style=col)
+        rows.append(t)
     if roomy and st["sub_order"] and not fit:
         sep = Text(f"{'swarm':<{label_w}} ", style=DIM)
         sep.append("┈" * cols, style=FAINT)
@@ -521,6 +539,8 @@ def code_panel(st, now, height, frame):
 
 
 def log_icon(tag, text, kind):
+    if kind == "jev":
+        return "●" if "→ consult" in text else ("◌" if text.startswith("asking") else "○")
     if kind == "adv":
         return "◆"
     if kind == "err":
@@ -898,6 +918,34 @@ def agents_panel(lead, adv, st, a, gates, frame, now, window, width, sub_model=N
         fmt_dur(sum(durs) / len(durs)) if durs else "—", otxt, osty, adv_age,
         usd(cost.get("advisor"), (cost.get("advisor") or {}).get("source") == "estimate"))
 
+    # jev: the judge asked on every Stop whether Opus is worth it now
+    jv = st.get("jev")
+    if jv is not None:
+        done = [j for j in jv if j["ts"] is not None]
+        last = done[-1] if done else None
+        asking = any(j["ts"] is None for j in jv)
+        jage = now - last["ts"] if last else 99
+        if asking:
+            jstate, jsty = "◌ judging", (f"bold {TEAL}" if blink(frame, 2) else TEAL)
+        elif last and last["status"] == "ok":
+            jstate = "● consult" if last["would"] else "○ no need"
+            jsty = (f"bold {WHITE}" if jage < 1.5 and blink(frame, 2) else (f"bold {TEAL}" if last["would"] else TEAL))
+        elif last:
+            jstate, jsty = "✕ " + last["status"][:8], DIM
+        else:
+            jstate, jsty = "watching", DIM
+        if last and last["status"] == "ok":
+            jtxt = (f"p {last['p']:.2f} {'≥' if last['would'] else '<'} {last['threshold']:.2f} · "
+                    + ("call opus" if last["would"] else "sonnet keeps going"))
+        else:
+            jtxt = "asks on every stop: is opus worth it now?"
+        lat = [j["latency"] for j in done if j.get("latency")]
+        jc = sum(j.get("cost") or 0 for j in done)
+        row("jev", TEAL, "", jstate, jsty, [j["ts"] for j in done], len(done),
+            (f"{sum(lat) / len(lat) / 1000:.1f}s" if sum(lat) / len(lat) < 9950 else fmt_dur(sum(lat) / len(lat) / 1000))
+            if lat else "—", jtxt, TEAL if last else DIM, jage,
+            Text("<$0.01" if done else "—", style=FG if done else FAINT) if jc < 0.005 else Text(f"${jc:.2f}", style=FG))
+
     # haiku swarm
     for k in st["sub_order"][-5:]:
         sa = st["subagents"][k]
@@ -1213,6 +1261,65 @@ def decision_entries(sid):
     return out
 
 
+def jev_data(sid, base=None):
+    """Jev's questions and answers for a session ($SWARMSCOPE_DIR/jev/<session>.jsonl, jevshadow.py): one item per
+    question, {asked, ts (answer time or None), p, would, status, threshold, latency (ms), cost, gating}."""
+    recs = rules.load_log(str((base or BASE) / "jev" / f"{sid}.jsonl"))
+    ctx, ans, order = {}, {}, []
+    for r in recs:
+        cid = r.get("ctx_id")
+        if not cid:
+            continue
+        if cid not in order:
+            order.append(cid)
+        if r.get("kind") == "context":
+            ctx[cid] = r
+        elif r.get("kind") == "jev" and not r.get("replay"):
+            ans[cid] = r
+    out = []
+    for cid in order:
+        c, a = ctx.get(cid) or {}, ans.get(cid)
+        thr = (c.get("jev") or {}).get("threshold") or (a or {}).get("threshold") or 0.5
+        asked = c.get("ts") or (a or {}).get("ts")
+        if asked is None:
+            continue
+        out.append({"asked": asked, "ts": (a or {}).get("ts"), "p": (a or {}).get("p_consult"),
+                    "would": bool((a or {}).get("would_consult")), "status": (a or {}).get("status", "pending"),
+                    "threshold": thr, "latency": (a or {}).get("latency_ms"),
+                    "cost": (a or {}).get("cost_usd") or (a or {}).get("cost_usd_est"),
+                    "gating": bool((a or {}).get("gating"))})
+    return sorted(out, key=lambda j: j["asked"])
+
+
+def jev_entries(jv):
+    """Session-log lines for Jev: the question when it is asked, the answer when it comes."""
+    out = []
+    for j in jv:
+        if j["ts"] is None:
+            out.append((j["asked"], "jev", "asking: is opus worth it now?", "jev"))
+        elif j["status"] == "ok":
+            verdict = "→ consult opus" if j["would"] else "→ no need, sonnet goes on"
+            out.append((j["ts"], "jev", f"p {j['p']:.2f} {verdict}" + (" · gate" if j["gating"] else ""), "jev"))
+        else:
+            out.append((j["ts"], "jev", f"no answer ({j['status']})", "note"))
+    return out
+
+
+def demo_jev(t0, now):
+    """The demo's Jev: asked at the two Stops-like moments of the scripted session."""
+    el = (now - t0) % DEMO_LOOP
+    base = now - el
+    out = []
+    for asked, lat, p in ((16.0, 0.6, 0.71), (40.0, 0.5, 0.22)):
+        if el < asked:
+            continue
+        done = el >= asked + lat
+        out.append({"asked": base + asked, "ts": base + asked + lat if done else None, "p": p if done else None,
+                    "would": done and p >= 0.5, "status": "ok" if done else "pending", "threshold": 0.5,
+                    "latency": lat * 1000, "cost": 0.00003, "gating": False})
+    return out
+
+
 def demo_costs(st, a):
     """Made-up but plausible per-model spend for the demo, growing with activity."""
     def b(usd):
@@ -1261,6 +1368,8 @@ def main():
             events, a = demo_events(t0, now)
             st = build_state(events)
             st["cost"] = demo_costs(st, a)
+            jv = demo_jev(t0, now)
+            st = dict(st, jev=jv, log=sorted(st["log"] + jev_entries(jv), key=lambda x: x[0]))
             return "sonnet 5.5", "opus 5.5", st, a
         sid = args.session or latest_session_id()
         key = None
@@ -1283,6 +1392,9 @@ def main():
         extra = decision_entries(sid) if sid else []
         if extra:
             st = dict(st, log=sorted(st["log"] + extra, key=lambda x: x[0]), policy_marks=policy_marks(sid))
+        jv = jev_data(sid) if sid else []
+        if jv:
+            st = dict(st, jev=jv, log=sorted(st["log"] + jev_entries(jv), key=lambda x: x[0]))
         gates_panel.policy = policy_summary(sid) if sid else None
         c = session_costs(cache["tp"], adv)
         st["cost"] = dict(c, cc_usd=meta.get("cost")) if c else ({"cc_usd": meta["cost"]} if meta.get("cost") is not None else {})
